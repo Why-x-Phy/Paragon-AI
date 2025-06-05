@@ -6,7 +6,8 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-vault_program = "8yjiGc8pZeEfmP3nxSwuj8pke9s57Rp4Jt68wxWna8V1"
+calvin_staking = "6VKBpGRJrhBKyCU5YgJmhHv6Jnr1GW9BzPfhE8P9FD2C"
+calvin_vault = "8yjiGc8pZeEfmP3nxSwuj8pke9s57Rp4Jt68wxWna8V1"
 
 [registry]
 url = "https://api.apr.dev"

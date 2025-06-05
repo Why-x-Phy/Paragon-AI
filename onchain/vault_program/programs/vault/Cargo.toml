@@ -1,0 +1,22 @@
+[package]
+name = "vault"
+version = "0.1.0"
+description = "CALVIN Vault Program - A secure on-chain USDC vault for qualified CALVIN holders"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "vault"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
+solana-program = "=1.18.8"
+pyth-sdk-solana = "0.8.0" 

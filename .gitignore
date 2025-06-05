@@ -1,0 +1,99 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+**/venv-py311/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment
+.venv
+env/
+ENV/
+
+# VS Code
+.vscode/
+
+# Logs
+logs/
+*.log
+
+# Data
+*.png
+*.csv
+*.db
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!jsconfig.json
+
+# Model checkpoints
+**/models/checkpoints/
+*.h5
+*.pt
+*.pth
+*.ckpt
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# CUDA
+*.i
+*.ii
+*.gpu
+*.ptx
+*.cubin
+*.fatbin
+cuda_11.8.0_520.61.05_linux.run
+
+# Data Lake / DuckDB / Parquet
+*.parquet
+**/lake/warehouse/migration.duckdb
+**/lake/warehouse/migration.duckdb.wal
+**/lake/warehouse/temp_parquet/
+
+# Frontend
+node_modules/
+.next/
+.nuxt/
+dist/
+out/
+.cache/
+.parcel-cache/
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+coverage/onchain/
+.cursor/
+calvin_1/data/*_with_social
+calvin_1/data/*.csv
+*.csv

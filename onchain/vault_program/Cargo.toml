@@ -1,6 +1,9 @@
 [workspace]
 members = [
-    "programs/*"
+    "programs/calvin-staking",
+    "programs/calvin-vault",
+    "programs/vault",
+    "programs/vault_program"
 ]
 resolver = "2"
 

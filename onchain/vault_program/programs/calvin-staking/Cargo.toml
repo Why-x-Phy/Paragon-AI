@@ -1,0 +1,21 @@
+[package]
+name = "calvin-staking"
+version = "0.1.0"
+description = "Calvin Staking Program - Manages CALVIN token staking and Vault Pass distribution"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "calvin_staking"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
+solana-program = "=1.18.8" 

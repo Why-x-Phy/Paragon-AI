@@ -5,10 +5,10 @@ use anchor_spl::associated_token::AssociatedToken;
 use crate::{constants::*, state::*};
 
 #[derive(Accounts)]
-#[instruction(per_nft_cap: u64, jupiter_program_id: Pubkey)]
+#[instruction(emergency_owner: Pubkey, calvin_authority: Pubkey, staking_program_id: Pubkey, per_nft_cap: u64, jupiter_program_id: Pubkey)]
 pub struct Initialize<'info> {
     #[account(mut)]
-    pub owner: Signer<'info>,
+    pub initializer: Signer<'info>,
     
     /// The USDC mint
     pub usdc_mint: Account<'info, Mint>,
@@ -19,7 +19,7 @@ pub struct Initialize<'info> {
     /// The vault account that holds the state
     #[account(
         init,
-        payer = owner,
+        payer = initializer,
         space = Vault::SIZE,
         seeds = [VAULT_PDA_SEED],
         bump
@@ -29,7 +29,7 @@ pub struct Initialize<'info> {
     /// The vault's token account for holding USDC
     #[account(
         init_if_needed,
-        payer = owner,
+        payer = initializer,
         associated_token::mint = usdc_mint,
         associated_token::authority = vault_authority,
     )]
@@ -46,9 +46,10 @@ pub struct Initialize<'info> {
     /// The mint for share tokens
     #[account(
         init,
-        payer = owner,
+        payer = initializer,
         mint::decimals = usdc_mint.decimals,
         mint::authority = vault_authority,
+        mint::freeze_authority = vault_authority,
         seeds = [SHARES_MINT_PDA_SEED],
         bump
     )]
@@ -66,13 +67,18 @@ pub struct Initialize<'info> {
 
 pub fn initialize(
     ctx: Context<Initialize>,
+    emergency_owner: Pubkey,
+    calvin_authority: Pubkey,
+    staking_program_id: Pubkey,
     per_nft_cap: u64,
     jupiter_program_id: Pubkey,
 ) -> Result<()> {
     let vault = &mut ctx.accounts.vault;
     
-    // Initialize vault state
-    vault.owner = ctx.accounts.owner.key();
+    // Initialize vault state with separate authorities
+    vault.emergency_owner = emergency_owner;
+    vault.calvin_authority = calvin_authority;
+    vault.staking_program_id = staking_program_id;
     vault.shares_mint = ctx.accounts.shares_mint.key();
     vault.usdc_mint = ctx.accounts.usdc_mint.key();
     vault.usdc_vault = ctx.accounts.usdc_vault.key();
@@ -90,7 +96,11 @@ pub fn initialize(
     vault.shares_mint_bump = *ctx.bumps.get("shares_mint").unwrap();
     vault.authority_bump = *ctx.bumps.get("vault_authority").unwrap();
     
-    msg!("Vault initialized with per_nft_cap: {}", per_nft_cap);
+    msg!("Vault initialized:");
+    msg!("  Emergency owner: {}", emergency_owner);
+    msg!("  Calvin authority: {}", calvin_authority);
+    msg!("  Staking program: {}", staking_program_id);
+    msg!("  Per NFT cap: {}", per_nft_cap);
     
     Ok(())
 } 

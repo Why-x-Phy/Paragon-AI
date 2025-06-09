@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, MintTo, Transfer};
+use anchor_spl::token::{self, Mint, Token, TokenAccount, MintTo, Transfer, FreezeAccount};
+use anchor_spl::associated_token::AssociatedToken;
 
 use crate::{constants::*, state::*, utils, ErrorCode};
 
@@ -16,15 +17,15 @@ pub struct Deposit<'info> {
     )]
     pub vault: Account<'info, Vault>,
     
-    /// The user's staker account
+    /// User's vault position account (tracks deposits for tier caps)
     #[account(
-        mut,
-        seeds = [STAKER_PDA_SEED, user.key().as_ref(), vault.key().as_ref()],
-        bump = staker.bump,
-        constraint = staker.user == user.key(),
-        constraint = staker.vault == vault.key(),
+        init_if_needed,
+        payer = user,
+        space = UserPosition::SIZE,
+        seeds = [USER_POSITION_PDA_SEED, user.key().as_ref(), vault.key().as_ref()],
+        bump
     )]
-    pub staker: Account<'info, Staker>,
+    pub user_position: Account<'info, UserPosition>,
     
     /// The user's USDC token account
     #[account(
@@ -57,11 +58,12 @@ pub struct Deposit<'info> {
     )]
     pub shares_mint: Account<'info, Mint>,
     
-    /// The user's share token account
+    /// The user's share token account (will be frozen after minting)
     #[account(
-        mut,
-        constraint = user_shares_token.mint == vault.shares_mint,
-        constraint = user_shares_token.owner == user.key(),
+        init_if_needed,
+        payer = user,
+        associated_token::mint = shares_mint,
+        associated_token::authority = user,
     )]
     pub user_shares_token: Account<'info, TokenAccount>,
     
@@ -73,17 +75,40 @@ pub struct Deposit<'info> {
     )]
     pub vault_authority: UncheckedAccount<'info>,
     
+    /// Staking program for CPI tier verification
+    /// CHECK: This should be the Calvin staking program ID
+    pub staking_program: UncheckedAccount<'info>,
+    
+    pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
     // Get accounts
     let vault = &mut ctx.accounts.vault;
-    let staker = &mut ctx.accounts.staker;
+    let user_position = &mut ctx.accounts.user_position;
     let user = &ctx.accounts.user;
     
-    // Check that the user meets the deposit cap requirements
-    utils::check_tier_cap(staker, vault, amount)?;
+    // Initialize user position if it's new
+    if user_position.user_authority == Pubkey::default() {
+        user_position.user_authority = user.key();
+        user_position.vault = vault.key();
+        user_position.total_deposits_usdc = 0;
+        user_position.last_deposit_timestamp = Clock::get()?.unix_timestamp;
+        user_position.bump = *ctx.bumps.get("user_position").unwrap();
+    }
+    
+    // Verify user's tier and check deposit caps via staking program
+    utils::verify_tier_and_check_cap(
+        &ctx.accounts.staking_program.to_account_info(),
+        &user.key(),
+        user_position.total_deposits_usdc,
+        amount,
+        vault,
+        &ctx.remaining_accounts,
+    )?;
     
     // Calculate deposit fee
     let deposit_fee = utils::calculate_deposit_fee(amount)?;
@@ -151,15 +176,29 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         shares_to_mint,
     )?;
     
+    // 🔒 CRITICAL: Freeze user's share token account to make shares non-transferable
+    token::freeze_account(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            FreezeAccount {
+                account: ctx.accounts.user_shares_token.to_account_info(),
+                mint: ctx.accounts.shares_mint.to_account_info(),
+                authority: ctx.accounts.vault_authority.to_account_info(),
+            },
+            &[vault_authority_seeds],
+        ),
+    )?;
+    
     // Update vault state
     vault.total_shares = vault.total_shares
         .checked_add(shares_to_mint)
         .ok_or(error!(ErrorCode::ArithmeticError))?;
     
-    // Update staker's total deposits
-    staker.total_deposits = staker.total_deposits
+    // Update user position
+    user_position.total_deposits_usdc = user_position.total_deposits_usdc
         .checked_add(amount)
         .ok_or(error!(ErrorCode::ArithmeticError))?;
+    user_position.last_deposit_timestamp = Clock::get()?.unix_timestamp;
     
     // Emit deposit event
     emit!(state::Deposit {
@@ -170,7 +209,7 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
     });
     
     msg!(
-        "Deposited {} USDC with fee {}, minted {} shares. Total shares: {}",
+        "Deposited {} USDC with fee {}, minted {} shares (frozen). Total shares: {}",
         amount_after_fee,
         deposit_fee,
         shares_to_mint,

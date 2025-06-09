@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Burn, Transfer};
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Burn, Transfer, ThawAccount, FreezeAccount};
 
 use crate::{constants::*, state::*, utils, ErrorCode};
 
@@ -13,15 +13,15 @@ pub struct Withdraw<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     
-    /// The user's staker account
+    /// User's vault position account
     #[account(
         mut,
-        seeds = [STAKER_PDA_SEED, user.key().as_ref(), vault.key().as_ref()],
-        bump = staker.bump,
-        constraint = staker.user == user.key(),
-        constraint = staker.vault == vault.key(),
+        seeds = [USER_POSITION_PDA_SEED, user.key().as_ref(), vault.key().as_ref()],
+        bump = user_position.bump,
+        constraint = user_position.user_authority == user.key(),
+        constraint = user_position.vault == vault.key(),
     )]
-    pub staker: Account<'info, Staker>,
+    pub user_position: Account<'info, UserPosition>,
     
     /// The user's USDC token account
     #[account(
@@ -46,7 +46,7 @@ pub struct Withdraw<'info> {
     )]
     pub shares_mint: Account<'info, Mint>,
     
-    /// The user's share token account
+    /// The user's share token account (frozen, needs to be thawed for burning)
     #[account(
         mut,
         constraint = user_shares_token.mint == vault.shares_mint,
@@ -69,7 +69,7 @@ pub struct Withdraw<'info> {
 pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()> {
     // Get accounts
     let vault = &mut ctx.accounts.vault;
-    let staker = &mut ctx.accounts.staker;
+    let user_position = &mut ctx.accounts.user_position;
     let user = &ctx.accounts.user;
     
     // Get current NAV (for calculating withdrawal amount)
@@ -94,24 +94,52 @@ pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()> {
         return Err(error!(ErrorCode::InsufficientLiquidity));
     }
     
-    // Burn share tokens
     let vault_authority_seeds = &[
         &VAULT_AUTHORITY_PDA_SEED[..],
         &[vault.authority_bump],
     ];
     
-    token::burn(
+    // Thaw the user's share account temporarily to allow burning
+    token::thaw_account(
         CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            ThawAccount {
+                account: ctx.accounts.user_shares_token.to_account_info(),
+                mint: ctx.accounts.shares_mint.to_account_info(),
+                authority: ctx.accounts.vault_authority.to_account_info(),
+            },
+            &[vault_authority_seeds],
+        ),
+    )?;
+    
+    // Burn share tokens
+    token::burn(
+        CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Burn {
                 mint: ctx.accounts.shares_mint.to_account_info(),
                 from: ctx.accounts.user_shares_token.to_account_info(),
                 authority: ctx.accounts.user.to_account_info(),
             },
-            &[],
         ),
         shares,
     )?;
+    
+    // Re-freeze the account if there are remaining shares
+    let remaining_shares = ctx.accounts.user_shares_token.amount - shares;
+    if remaining_shares > 0 {
+        token::freeze_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                FreezeAccount {
+                    account: ctx.accounts.user_shares_token.to_account_info(),
+                    mint: ctx.accounts.shares_mint.to_account_info(),
+                    authority: ctx.accounts.vault_authority.to_account_info(),
+                },
+                &[vault_authority_seeds],
+            ),
+        )?;
+    }
     
     // Transfer USDC from vault to user
     token::transfer(
@@ -131,6 +159,13 @@ pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()> {
     vault.total_shares = vault.total_shares
         .checked_sub(shares)
         .ok_or(error!(ErrorCode::ArithmeticError))?;
+    
+    // Update user position to reflect partial withdrawal
+    let usdc_withdrawn_ratio = shares as f64 / (ctx.accounts.user_shares_token.amount as f64);
+    let deposits_to_reduce = (user_position.total_deposits_usdc as f64 * usdc_withdrawn_ratio) as u64;
+    user_position.total_deposits_usdc = user_position.total_deposits_usdc
+        .checked_sub(deposits_to_reduce)
+        .unwrap_or(0);
     
     // Emit withdraw event
     emit!(state::Withdraw {

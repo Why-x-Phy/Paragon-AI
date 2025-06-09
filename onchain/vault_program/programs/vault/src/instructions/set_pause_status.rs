@@ -4,14 +4,14 @@ use crate::{constants::*, state::*, ErrorCode};
 
 #[derive(Accounts)]
 pub struct SetPauseStatus<'info> {
-    /// Only the vault owner can pause/unpause the vault
+    /// Only the emergency owner can pause/unpause the vault
     #[account(mut)]
     pub authority: Signer<'info>,
     
     /// The vault account
     #[account(
         mut,
-        constraint = vault.owner == authority.key() @ ErrorCode::UnauthorizedOwner,
+        constraint = vault.emergency_owner == authority.key() @ ErrorCode::UnauthorizedOwner,
     )]
     pub vault: Account<'info, Vault>,
 }

@@ -4,8 +4,14 @@ use anchor_spl::token::TokenAccount;
 /// The main vault account
 #[account]
 pub struct Vault {
-    /// The owner/admin of the vault
-    pub owner: Pubkey,
+    /// Emergency owner (project founder) - can pause, update config, emergency controls
+    pub emergency_owner: Pubkey,
+    
+    /// Calvin AI trading authority - only entity that can execute trades
+    pub calvin_authority: Pubkey,
+    
+    /// Staking program ID for CPI calls
+    pub staking_program_id: Pubkey,
     
     /// The mint for share tokens
     pub shares_mint: Pubkey,
@@ -55,7 +61,9 @@ pub struct Vault {
 
 impl Vault {
     pub const SIZE: usize = 8 + // discriminator
-        32 + // owner
+        32 + // emergency_owner
+        32 + // calvin_authority
+        32 + // staking_program_id
         32 + // shares_mint
         32 + // usdc_mint
         32 + // usdc_vault
@@ -73,52 +81,36 @@ impl Vault {
         64; // reserved
 }
 
-/// A staker account representing a user who has staked CALVIN tokens
+/// User's vault position tracking
 #[account]
-pub struct Staker {
-    /// The user this staker account belongs to
-    pub user: Pubkey,
+pub struct UserPosition {
+    /// The user this position belongs to
+    pub user_authority: Pubkey,
     
-    /// The vault this staker is associated with
+    /// The vault this position is associated with
     pub vault: Pubkey,
     
-    /// The amount of CALVIN tokens staked
-    pub staked_amount: u64,
+    /// Total USDC deposits made by this user (for tier cap calculations)
+    pub total_deposits_usdc: u64,
     
-    /// The number of Calvin NFTs owned by the staker (verified at stake time)
-    pub nft_count: u8,
+    /// Timestamp of last deposit
+    pub last_deposit_timestamp: i64,
     
-    /// Bump seed for the staker account
+    /// Bump seed for this account
     pub bump: u8,
     
-    /// The user's share token account
-    pub shares_account: Pubkey,
-    
-    /// The user's USDC token account
-    pub usdc_account: Pubkey,
-    
-    /// Total deposits in USDC (used for calculating max withdrawal amounts)
-    pub total_deposits: u64,
-
-    /// The user's stake account for CALVIN tokens
-    pub stake_account: Pubkey,
-    
     /// Reserved space for future upgrades
-    pub reserved: [u8; 32],
+    pub reserved: [u8; 64],
 }
 
-impl Staker {
+impl UserPosition {
     pub const SIZE: usize = 8 + // discriminator
-        32 + // user
+        32 + // user_authority
         32 + // vault
-        8 + // staked_amount
-        1 + // nft_count
+        8 + // total_deposits_usdc
+        8 + // last_deposit_timestamp
         1 + // bump
-        32 + // shares_account
-        32 + // usdc_account
-        8 + // total_deposits
-        32 + // stake_account
-        32; // reserved
+        64; // reserved
 }
 
 /// Event emitted when the vault needs liquidity

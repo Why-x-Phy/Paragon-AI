@@ -21,19 +21,13 @@ pub mod vault {
     /// Initialize a new vault
     pub fn initialize(
         ctx: Context<Initialize>,
+        emergency_owner: Pubkey,
+        calvin_authority: Pubkey,
+        staking_program_id: Pubkey,
         per_nft_cap: u64,
         jupiter_program_id: Pubkey,
     ) -> Result<()> {
-        instructions::initialize(ctx, per_nft_cap, jupiter_program_id)
-    }
-
-    /// Stake CALVIN tokens to qualify for deposits
-    pub fn stake(
-        ctx: Context<Stake>,
-        amount: u64,
-        nft_count: u8,
-    ) -> Result<()> {
-        instructions::stake(ctx, amount, nft_count)
+        instructions::initialize(ctx, emergency_owner, calvin_authority, staking_program_id, per_nft_cap, jupiter_program_id)
     }
 
     /// Deposit USDC into the vault
@@ -84,6 +78,13 @@ pub mod vault {
         new_per_nft_cap: Option<u64>,
     ) -> Result<()> {
         instructions::update_config(ctx, new_treasury, new_jupiter_program_id, new_per_nft_cap)
+    }
+
+    /// Get user's vault share balance (CPI-callable from staking program)
+    pub fn get_user_vault_shares(
+        ctx: Context<GetUserVaultShares>,
+    ) -> Result<u64> {
+        instructions::get_user_vault_shares(ctx)
     }
 }
 

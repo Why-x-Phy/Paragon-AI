@@ -81,9 +81,7 @@ pub fn trade(ctx: Context<Trade>, data: Vec<u8>) -> Result<()> {
     let vault = &mut ctx.accounts.vault;
     
     // Only Calvin AI can execute trades
-    // In a production environment, you would have a more robust verification
-    // This is a simplified implementation for demonstration
-    if ctx.accounts.authority.key() != vault.owner {
+    if ctx.accounts.authority.key() != vault.calvin_authority {
         return Err(error!(ErrorCode::UnauthorizedCalvin));
     }
     

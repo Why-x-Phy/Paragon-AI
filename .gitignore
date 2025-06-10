@@ -97,3 +97,36 @@ coverage/onchain/
 calvin_1/data/*_with_social
 calvin_1/data/*.csv
 *.csv
+
+# Rust/Cargo build artifacts
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Anchor build artifacts
+.anchor/
+target/
+test-ledger/
+.DS_Store
+
+# IDL files (generated)
+target/idl/
+target/types/
+
+# Solana artifacts
+test-ledger/
+validator-stdout.txt
+
+# Node modules (if using TypeScript tests)
+node_modules/
+dist/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Temporary files
+*.tmp
+*.temp

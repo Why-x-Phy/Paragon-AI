@@ -145,7 +145,7 @@ pub fn trade(ctx: Context<Trade>, data: Vec<u8>) -> Result<()> {
     utils::after_trade(vault, new_nav)?;
     
     // Emit trade event
-    emit!(state::Trade {
+    emit!(crate::state::Trade {
         vault: vault.key(),
         source_mint: ctx.accounts.source_mint.key(),
         destination_mint: ctx.accounts.destination_mint.key(),

@@ -83,7 +83,9 @@ pub fn current_nav_usdc<'info>(
         
         // Parse the price account
         let price_account_info = &price_accounts[i];
-        let price_feed = match pyth_sdk_solana::state::load_price_account(&price_account_info.data.borrow()) {
+        // Borrow the account data separately so the reference lives long enough
+        let price_data = price_account_info.data.borrow();
+        let price_feed = match pyth_sdk_solana::state::load_price_account(&price_data) {
             Ok(feed) => feed,
             Err(_) => {
                 // Skip invalid price feeds
@@ -113,7 +115,7 @@ pub fn current_nav_usdc<'info>(
         // Convert price to USDC terms (Pyth prices are in USD, assuming 1 USDC = $1)
         // Pyth prices are in the format 10^(exponent), so we need to adjust
         let price_in_usdc = price
-            .checked_mul(10i64.pow(price_feed.agg.expo.unsigned_abs()))
+            .checked_mul(10i64.pow(price_feed.expo.unsigned_abs()))
             .ok_or(error!(ErrorCode::ArithmeticError))?;
         
         // Calculate token value in USDC
@@ -247,9 +249,9 @@ pub fn forward_jupiter<'info>(
     data: Vec<u8>,
     signer_seeds: &[&[&[u8]]],
 ) -> Result<()> {
-    let ix = solana_program::instruction::Instruction {
+    let ix = anchor_lang::solana_program::instruction::Instruction {
         program_id: jupiter_program.key(),
-        accounts: accounts.iter().map(|a| solana_program::instruction::AccountMeta {
+        accounts: accounts.iter().map(|a| anchor_lang::solana_program::instruction::AccountMeta {
             pubkey: *a.key,
             is_signer: a.is_signer,
             is_writable: a.is_writable,
@@ -257,7 +259,7 @@ pub fn forward_jupiter<'info>(
         data,
     };
     
-    solana_program::program::invoke_signed(
+    anchor_lang::solana_program::program::invoke_signed(
         &ix,
         accounts,
         signer_seeds,

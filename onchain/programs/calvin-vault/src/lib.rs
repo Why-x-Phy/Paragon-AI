@@ -9,7 +9,6 @@ pub mod instructions;
 pub mod errors;
 
 use instructions::*;
-use state::*;
 
 // This should be replaced with the actual program ID during deployment
 declare_id!("8yjiGc8pZeEfmP3nxSwuj8pke9s57Rp4Jt68wxWna8V1");
@@ -21,7 +20,7 @@ pub mod vault {
 
     /// Initialize a new vault
     pub fn initialize(
-        ctx: Context<instructions::initialize::Initialize>,
+        ctx: Context<Initialize>,
         emergency_owner: Pubkey,
         calvin_authority: Pubkey,
         staking_program_id: Pubkey,
@@ -33,7 +32,7 @@ pub mod vault {
 
     /// Deposit USDC into the vault
     pub fn deposit(
-        ctx: Context<instructions::deposit::Deposit>,
+        ctx: Context<Deposit>,
         amount: u64,
     ) -> Result<()> {
         instructions::deposit(ctx, amount)
@@ -41,7 +40,7 @@ pub mod vault {
 
     /// Withdraw USDC from the vault
     pub fn withdraw(
-        ctx: Context<instructions::withdraw::Withdraw>,
+        ctx: Context<Withdraw>,
         shares: u64,
     ) -> Result<()> {
         instructions::withdraw(ctx, shares)
@@ -49,7 +48,7 @@ pub mod vault {
 
     /// Execute a trade using Jupiter
     pub fn trade(
-        ctx: Context<instructions::trade::Trade>,
+        ctx: Context<Trade>,
         data: Vec<u8>,
     ) -> Result<()> {
         instructions::trade(ctx, data)
@@ -57,7 +56,7 @@ pub mod vault {
 
     /// Liquidate a position to cover withdrawal liquidity needs
     pub fn liquidate_to_cover(
-        ctx: Context<instructions::trade::Trade>, // Using Trade context for liquidation
+        ctx: Context<LiquidateToCover>,
         data: Vec<u8>,
     ) -> Result<()> {
         instructions::liquidate_to_cover(ctx, data)
@@ -65,7 +64,7 @@ pub mod vault {
 
     /// Pause or unpause the vault
     pub fn set_pause_status(
-        ctx: Context<instructions::set_pause_status::SetPauseStatus>,
+        ctx: Context<SetPauseStatus>,
         paused: bool,
     ) -> Result<()> {
         instructions::set_pause_status(ctx, paused)
@@ -73,7 +72,7 @@ pub mod vault {
 
     /// Update vault configuration
     pub fn update_config(
-        ctx: Context<instructions::update_config::UpdateConfig>,
+        ctx: Context<UpdateConfig>,
         new_treasury: Option<Pubkey>,
         new_jupiter_program_id: Option<Pubkey>,
         new_per_nft_cap: Option<u64>,
@@ -83,7 +82,7 @@ pub mod vault {
 
     /// Get user's vault share balance (CPI-callable from staking program)
     pub fn get_user_vault_shares(
-        ctx: Context<instructions::get_user_vault_shares::GetUserVaultShares>,
+        ctx: Context<GetUserVaultShares>,
     ) -> Result<u64> {
         instructions::get_user_vault_shares(ctx)
     }

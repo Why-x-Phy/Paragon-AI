@@ -168,7 +168,7 @@ pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()> {
         .unwrap_or(0);
     
     // Emit withdraw event
-    emit!(state::Withdraw {
+    emit!(crate::state::Withdraw {
         user: user.key(),
         amount: usdc_amount,
         shares,

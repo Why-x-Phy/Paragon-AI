@@ -201,7 +201,7 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
     user_position.last_deposit_timestamp = Clock::get()?.unix_timestamp;
     
     // Emit deposit event
-    emit!(state::Deposit {
+    emit!(crate::state::Deposit {
         user: user.key(),
         amount,
         shares: shares_to_mint,

@@ -53,6 +53,7 @@ pub struct LiquidateToCover<'info> {
     pub rent: Sysvar<'info, Rent>,
 
     /// Additional accounts forwarded to Jupiter
+    /// CHECK: Accounts are forwarded to Jupiter program and validated by Jupiter's CPI constraints
     #[account(mut)]
     pub remaining_accounts: UncheckedAccount<'info>,
 }
@@ -82,7 +83,9 @@ pub fn liquidate_to_cover(ctx: Context<LiquidateToCover>, data: Vec<u8>) -> Resu
         &accounts,
         data,
         &[signer_seeds],
+        &ctx.accounts.vault_authority.key(),  // ✅ FIXED: Pass vault authority key
     )?;
 
     Ok(())
 }
+ 

@@ -11,7 +11,7 @@ pub mod errors;
 use instructions::*;
 
 // This should be replaced with the actual program ID during deployment
-declare_id!("8yjiGc8pZeEfmP3nxSwuj8pke9s57Rp4Jt68wxWna8V1");
+declare_id!("Eehx8tDgRctoJbTEdXRp85hCW55nH62g5Eiy7yAn7KDg");
 
 /// The main vault program
 #[program]
@@ -126,4 +126,7 @@ pub enum ErrorCode {
 
     #[msg("Only Calvin AI can perform this action")]
     UnauthorizedCalvin,
+
+    #[msg("Insufficient accounts provided for Jupiter swap")]
+    InsufficientAccounts,
 } 

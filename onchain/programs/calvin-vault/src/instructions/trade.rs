@@ -117,6 +117,7 @@ pub fn trade(ctx: Context<Trade>, data: Vec<u8>) -> Result<()> {
         &accounts,
         data,
         &[vault_authority_seeds],
+        &ctx.accounts.vault_authority.key(),  // ✅ FIXED: Pass vault authority key
     )?;
     
     // Calculate amount received (reload the account to get updated balance)

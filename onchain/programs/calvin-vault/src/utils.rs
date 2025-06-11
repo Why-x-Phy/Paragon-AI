@@ -13,12 +13,45 @@ pub fn verify_tier_and_check_cap(
     vault: &Vault,
     remaining_accounts: &[AccountInfo],
 ) -> Result<()> {
-    // TODO: Implement actual CPI call to staking program's verify_tier instruction
-    // For now, we'll do a simplified check that allows all deposits
-    // This should be replaced with proper CPI integration
+    // Get user's tier by reading their stake account directly
+    // We expect remaining_accounts to contain:
+    // [0] stake_config - the staking configuration account
+    // [1] user_stake - the user's stake account
     
-    // Placeholder: assume user is tier 3 for now
-    let user_tier = TIER_3;
+    let user_tier = if remaining_accounts.len() >= 2 {
+        let stake_config_account = &remaining_accounts[0];
+        let user_stake_account = &remaining_accounts[1];
+        
+        // Verify the accounts are owned by the staking program
+        if *stake_config_account.owner != staking_program.key() || 
+           *user_stake_account.owner != staking_program.key() {
+            msg!("Invalid staking program account ownership");
+            // Assume lowest tier for safety
+            DEFAULT_TIER
+        } else {
+            // Parse the user_stake account to get the tier
+            match user_stake_account.try_borrow_data() {
+                Ok(data) => {
+                    // UserStake structure: [user_authority(32), total_staked(8), tier(1), ...]
+                    if data.len() >= 41 {
+                        // Read the tier field (byte 40)
+                        data[40]
+                    } else {
+                        msg!("Invalid user stake account size");
+                        DEFAULT_TIER
+                    }
+                }
+                Err(_) => {
+                    msg!("Failed to read user stake account");
+                    DEFAULT_TIER
+                }
+            }
+        }
+    } else {
+        msg!("Insufficient remaining accounts for tier verification");
+        // Assume lowest tier for safety
+        DEFAULT_TIER
+    };
     
     let total_deposits_after = current_deposits
         .checked_add(new_deposit)
@@ -248,22 +281,52 @@ pub fn forward_jupiter<'info>(
     accounts: &[AccountInfo<'info>],
     data: Vec<u8>,
     signer_seeds: &[&[&[u8]]],
+    vault_authority_key: &Pubkey,
 ) -> Result<()> {
-    let ix = anchor_lang::solana_program::instruction::Instruction {
+    // Validate minimum required accounts
+    if accounts.len() < 3 {
+        return Err(error!(ErrorCode::InsufficientAccounts));
+    }
+    
+    // Build AccountMeta array with proper authority handling
+    let mut account_metas = Vec::new();
+    
+    for account in accounts.iter() {
+        let account_meta = if account.key == vault_authority_key {
+            // Vault authority will be the signer via PDA seeds
+            anchor_lang::solana_program::instruction::AccountMeta {
+                pubkey: *account.key,
+                is_signer: true,   // ✅ FIXED: Vault authority signs via CPI
+                is_writable: account.is_writable,
+            }
+        } else {
+            // All other accounts are not signers in CPI context
+            anchor_lang::solana_program::instruction::AccountMeta {
+                pubkey: *account.key,
+                is_signer: false,  // ✅ FIXED: Other accounts don't sign in CPI
+                is_writable: account.is_writable,
+            }
+        };
+        account_metas.push(account_meta);
+    }
+    
+    // Create Jupiter instruction
+    let jupiter_ix = anchor_lang::solana_program::instruction::Instruction {
         program_id: jupiter_program.key(),
-        accounts: accounts.iter().map(|a| anchor_lang::solana_program::instruction::AccountMeta {
-            pubkey: *a.key,
-            is_signer: a.is_signer,
-            is_writable: a.is_writable,
-        }).collect(),
+        accounts: account_metas,
         data,
     };
     
+    // Execute CPI with proper error handling
     anchor_lang::solana_program::program::invoke_signed(
-        &ix,
+        &jupiter_ix,
         accounts,
         signer_seeds,
-    ).map_err(|_| error!(ErrorCode::JupiterSwapFailed))
+    ).map_err(|e| {
+        // ✅ FIXED: Preserve actual error information
+        msg!("Jupiter CPI failed: {:?}", e);
+        error!(ErrorCode::JupiterSwapFailed)
+    })
 }
 
 /// Check Pyth price feed staleness

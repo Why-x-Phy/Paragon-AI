@@ -12,7 +12,7 @@ use state::*;
 use errors::*;
 
 // Program ID will be set during deployment
-declare_id!("6VKBpGRJrhBKyCU5YgJmhHv6Jnr1GW9BzPfhE8P9FD2C");
+declare_id!("qUKhRct5LW3e9Zwn1e7DvKscsSwVv2S952D7nx39Ach");
 
 /// Calvin Staking Program
 /// Manages CALVIN token staking and non-transferable Vault Pass token distribution

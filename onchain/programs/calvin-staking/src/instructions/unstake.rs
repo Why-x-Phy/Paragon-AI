@@ -140,20 +140,15 @@ pub fn unstake_calvin(ctx: Context<UnstakeCalvin>, amount: u64) -> Result<()> {
         .ok_or(StakingError::ArithmeticError)?;
 
     // Burn corresponding Vault Pass tokens
-    let stake_config_seeds = &[
-        STAKE_CONFIG_SEED,
-        &[stake_config.bump],
-    ];
-
+    // The user is the owner of their token account, so they must authorize the burn
     token::burn(
-        CpiContext::new_with_signer(
+        CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Burn {
                 mint: ctx.accounts.user_vault_pass_mint.to_account_info(),
                 from: ctx.accounts.user_vault_pass_token.to_account_info(),
-                authority: ctx.accounts.stake_config.to_account_info(),
+                authority: ctx.accounts.user.to_account_info(), // User owns the token account
             },
-            &[stake_config_seeds],
         ),
         amount,
     )?;
@@ -196,35 +191,50 @@ fn get_user_vault_shares_cpi(
     user: &Pubkey,
     remaining_accounts: &[AccountInfo],
 ) -> Result<u64> {
-    // This would make a CPI call to the vault program's get_user_vault_shares instruction
-    // For now, we'll implement a simplified version that checks if the user has any vault accounts
+    // We expect the remaining accounts to contain:
+    // [0] vault - the vault account
+    // [1] shares_mint - the vault shares mint
+    // [2] user_shares_token - the user's share token account
     
-    // In the full implementation, this would:
-    // 1. Call vault_program::get_user_vault_shares(user) via CPI
-    // 2. Return the actual share balance
-    // 3. If CPI fails, assume user has shares (fail-safe approach)
+    if remaining_accounts.len() < 3 {
+        msg!("Insufficient remaining accounts for vault CPI call");
+        // Fail-safe: assume user has shares to prevent unstaking
+        return Ok(1);
+    }
     
-    // For security, we'll check if any of the remaining accounts are vault share accounts
-    // owned by the user. If any exist with non-zero balance, prevent unstaking.
+    let vault_account = &remaining_accounts[0];
+    let shares_mint = &remaining_accounts[1]; 
+    let user_shares_token = &remaining_accounts[2];
     
-    for account in remaining_accounts {
-        // This is a simplified check - in production, we would need to:
-        // 1. Verify the account is a valid vault share token account
-        // 2. Verify it belongs to the user
-        // 3. Check its balance
-        
-        // For now, we'll do a basic ownership check
-        if account.owner == user && account.lamports() > 0 {
-            // If user owns any accounts with lamports, they might have vault shares
-            // In production, this would be a proper CPI call to the vault program
-            msg!("Warning: User may have vault shares - CPI check required");
+    // Verify the accounts are owned by the correct programs
+    if *vault_account.owner != vault_program.key() {
+        msg!("Invalid vault account owner");
+        return Ok(1); // Fail-safe
+    }
+    
+    // Parse the user's share token account to get the balance directly
+    // This is more efficient than a full CPI call for a simple balance check
+    match user_shares_token.try_borrow_data() {
+        Ok(data) => {
+            // SPL Token account structure: [mint(32), owner(32), amount(8), ...]
+            if data.len() >= 72 && user_shares_token.owner == &anchor_spl::token::ID {
+                // Read the amount field (bytes 64-72)
+                let amount_bytes: [u8; 8] = data[64..72].try_into().unwrap_or([0; 8]);
+                let share_balance = u64::from_le_bytes(amount_bytes);
+                
+                msg!("User {} has {} vault shares", user, share_balance);
+                return Ok(share_balance);
+        }
+    }
+        Err(_) => {
+            msg!("Failed to read user shares token account");
+            return Ok(1); // Fail-safe: assume user has shares
         }
     }
     
-    // TODO: Replace with actual CPI call to vault program
-    // For now, return 0 to allow unstaking (this should be fixed in production)
-    msg!("CPI call to vault program not fully implemented - allowing unstake");
-    Ok(0)
+    // If we can't determine the balance, fail-safe to prevent unstaking
+    msg!("Could not determine vault share balance - assuming user has shares");
+    Ok(1)
 }
 
 /// Calculate tier based on staked amount

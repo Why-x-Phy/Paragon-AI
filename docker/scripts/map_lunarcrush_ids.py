@@ -10,7 +10,7 @@ This script:
 4. Enables accurate social data fetching without symbol conflicts
 
 Usage:
-    python map_lunarcrush_ids.py [--dry-run] [--verbose]
+    python map_lunarcrush_ids.py --dry-run --verbose
 """
 
 import os

@@ -3,7 +3,7 @@
 Script to fetch social data for tokens from LunarCrush API
 
 Usage:
-    python src/scripts/fetch_social_data.py --days 90
+    python src/scripts/fetch_social_data.py --days 100
     python src/scripts/fetch_social_data.py --schedule <minutes>
 """
 import os

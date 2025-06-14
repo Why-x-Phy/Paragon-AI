@@ -6,7 +6,7 @@ import BalanceSection from './BalanceSection';
 
 const Main = () => {
   return (
-    <div className="w-full max-w-7xl mx-auto bg-black/85 py-8 px-8 rounded-lg relative">
+    <div className="w-full max-w-7xl mx-auto bg-black/85 py-8 px-8 rounded-lg relative min-h-[600px] overflow-visible">
       <Navbar />
       <div className="flex flex-col my-8">
         <p className='text-white text-[20px]'>
@@ -16,8 +16,8 @@ const Main = () => {
       <ActionButtons />
       <BalanceSection />
       
-      {/* Calvin Character */}
-      <div className="absolute bottom-0 -right-20 md:-bottom-20 md:-right-30 translate-x-8 translate-y-8">
+      {/* Calvin Character - Hidden on mobile, visible on larger screens */}
+      <div className="hidden lg:block fixed bottom-0 right-8 z-10">
         <Image 
           src="/calvin.png" 
           alt="Calvin Character" 

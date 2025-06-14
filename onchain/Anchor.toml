@@ -6,15 +6,26 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-calvin_staking = "qUKhRct5LW3e9Zwn1e7DvKscsSwVv2S952D7nx39Ach"
-calvin_vault = "Eehx8tDgRctoJbTEdXRp85hCW55nH62g5Eiy7yAn7KDg"
+calvin_staking = "BMeQT4VD9X4RFYT8MAmofKJk14dFyFrBWqJJzTeNgGtW"
+calvin_vault = "7rky4NGhHtUREVJLKnAKwapDBmzCMbEno6VDcFZXyWxA"
+
+[programs.devnet]
+calvin_staking = "BMeQT4VD9X4RFYT8MAmofKJk14dFyFrBWqJJzTeNgGtW"
+calvin_vault = "7rky4NGhHtUREVJLKnAKwapDBmzCMbEno6VDcFZXyWxA"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "localnet"
-wallet = "~/.config/solana/id.json"
+cluster = "devnet"
+wallet = "./devnet-test.json"
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+
+# Calvin AI Configuration
+[env]
+# Calvin AI Trading Authority (generated)
+CALVIN_AI_AUTHORITY = "AfN21qjyWjn8NtNoXMWKmxRwKnyfsaRJRK8KQz7p1Q1g"
+# Emergency Owner (your wallet)
+EMERGENCY_OWNER = "5TxXR173F6VzPSuuyKd57U3ff6dRL5JK7TL6ZPgSjE5D"

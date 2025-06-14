@@ -1,3 +1,5 @@
+# This file makes database a proper Python package
+
 from .db import (
     Token, 
     OHLCV, 

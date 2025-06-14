@@ -21,3 +21,5 @@ def get_config():
     
     # Return config dictionary with all environment variables
     return dict(os.environ)
+
+# This file makes config a proper Python package

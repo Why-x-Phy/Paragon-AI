@@ -40,11 +40,11 @@ except ImportError:
     tf = None
 
 # Local imports
-from src.config.config import config
-from src.utils.logger import log
-from src.inference.model_registry import get_model_registry, ModelMetadata
-from src.data.data_processor import DataProcessor
-from src.database.production_db import get_db_manager
+from ..config.config import config
+from ..utils.logger import log
+from .model_registry import get_model_registry, ModelMetadata
+from ..data.data_processor import DataProcessor
+from ..database.production_db import get_db_manager
 
 logger = log
 
@@ -93,7 +93,7 @@ class StrategyConfig:
     # Strategy settings
     default_buy_threshold: float = 0.02  # 2%
     default_sell_threshold: float = 0.03  # 3%
-    default_confidence_threshold: float = 0.70  # 70%
+    default_confidence_threshold: float = 0.10  # 10% (minimal threshold - strategy thresholds are primary)
     position_size_pct: float = 0.10  # 10% of available cash
     transaction_cost_pct: float = 0.001  # 0.1% fee
     

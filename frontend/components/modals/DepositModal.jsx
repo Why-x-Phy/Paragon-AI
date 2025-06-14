@@ -1,9 +1,9 @@
 'use client';
 
 import { useState } from 'react';
-import Modal from '@/components/ui/Modal';
+import Modal from '@/components/UI/Modal';
 import BalanceCard from '@/components/BalanceCard';
-import Button from '@/components/ui/Button';
+import Button from '@/components/UI/Button';
 import { useVaultData } from '@/hooks/useVaultData';
 
 export default function DepositModal({ isOpen, onClose }) {

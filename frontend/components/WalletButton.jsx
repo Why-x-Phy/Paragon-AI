@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useWalletModal } from '@solana/wallet-adapter-react-ui';
-import Button from '@/components/ui/Button';
+import Button from '@/components/UI/Button';
 import { useClickOutside } from '@/hooks/useClickOutside';
 
 require('@solana/wallet-adapter-react-ui/styles.css');

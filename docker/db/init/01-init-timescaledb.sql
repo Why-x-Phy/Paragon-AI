@@ -301,6 +301,20 @@ CREATE TABLE IF NOT EXISTS trades (
     execution_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     processing_time_ms INTEGER,                   -- Time to execute trade
     
+    -- Vault-specific fields (Phase 3.2 enhancement)
+    signal_confidence DECIMAL(5,2),               -- Model confidence score (0-100)
+    model_version VARCHAR(50),                    -- Model version used for signal
+    signal_strength VARCHAR(20),                  -- 'STRONG', 'MODERATE', 'WEAK'
+    predicted_change_pct DECIMAL(8,4),            -- Predicted price change %
+    cycle_timestamp TIMESTAMPTZ,                  -- Portfolio cycle timestamp
+    jupiter_operation_id INTEGER,                 -- Link to jupiter_operations table
+    
+    -- Trade verification fields (Phase 3.3 enhancement)
+    execution_status VARCHAR(20) DEFAULT 'pending', -- 'pending', 'confirmed', 'failed', 'timeout'
+    confirmed_at TIMESTAMPTZ,                     -- When trade was verified on-chain
+    actual_output_amount DECIMAL(20,8),           -- Actual amount received from swap
+    execution_error TEXT,                         -- Error details if verification failed
+    
     -- Metadata
     created_at TIMESTAMPTZ DEFAULT NOW(),
     
@@ -308,7 +322,10 @@ CREATE TABLE IF NOT EXISTS trades (
     CONSTRAINT fk_trades_position FOREIGN KEY (position_id) REFERENCES positions(position_id),
     CONSTRAINT fk_trades_token FOREIGN KEY (token_id) REFERENCES tokens(token_id),
     CONSTRAINT check_trade_type CHECK (trade_type IN ('buy', 'sell')),
-    CONSTRAINT check_trade_amounts CHECK (price > 0 AND quantity > 0 AND value_usdc > 0)
+    CONSTRAINT check_trade_amounts CHECK (price > 0 AND quantity > 0 AND value_usdc > 0),
+    CONSTRAINT check_signal_confidence CHECK (signal_confidence IS NULL OR (signal_confidence >= 0 AND signal_confidence <= 100)),
+    CONSTRAINT check_signal_strength CHECK (signal_strength IS NULL OR signal_strength IN ('STRONG', 'MODERATE', 'WEAK')),
+    CONSTRAINT check_execution_status CHECK (execution_status IN ('pending', 'confirmed', 'failed', 'timeout'))
 );
 
 -- Create indexes for trades
@@ -316,6 +333,14 @@ CREATE INDEX IF NOT EXISTS idx_trades_token_time ON trades(token_id, execution_t
 CREATE INDEX IF NOT EXISTS idx_trades_position ON trades(position_id);
 CREATE INDEX IF NOT EXISTS idx_trades_tx_hash ON trades(tx_hash);
 CREATE INDEX IF NOT EXISTS idx_trades_execution_time ON trades(execution_time DESC);
+-- Vault-specific indexes
+CREATE INDEX IF NOT EXISTS idx_trades_cycle_timestamp ON trades(cycle_timestamp DESC) WHERE cycle_timestamp IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_trades_model_version ON trades(model_version) WHERE model_version IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_trades_signal_confidence ON trades(signal_confidence DESC) WHERE signal_confidence IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_trades_jupiter_operation ON trades(jupiter_operation_id) WHERE jupiter_operation_id IS NOT NULL;
+-- Trade verification indexes
+CREATE INDEX IF NOT EXISTS idx_trades_execution_status ON trades(execution_status, execution_time DESC);
+CREATE INDEX IF NOT EXISTS idx_trades_pending_verification ON trades(execution_time DESC) WHERE execution_status = 'pending' OR execution_status IS NULL;
 
 -- ===========================================================================
 -- MODEL PREDICTIONS TABLE
@@ -509,6 +534,195 @@ SELECT add_compression_policy('system_health', INTERVAL '1 day', if_not_exists =
 SELECT add_retention_policy('system_health', INTERVAL '30 days', if_not_exists => TRUE);
 
 -- ===========================================================================
+-- VAULT TRADING TABLES (Phase 3.2 Enhancement)
+-- ===========================================================================
+
+-- Portfolio Cycles Table - Track hourly trading cycles
+CREATE TABLE IF NOT EXISTS portfolio_cycles (
+    cycle_id SERIAL,
+    cycle_timestamp TIMESTAMPTZ NOT NULL,         -- Cycle start time (partitioning column)
+    
+    -- Composite primary key including partitioning column for TimescaleDB
+    PRIMARY KEY (cycle_id, cycle_timestamp),
+    
+    -- Cycle metrics
+    tokens_analyzed INTEGER NOT NULL DEFAULT 0,   -- Number of tokens analyzed
+    signals_generated INTEGER NOT NULL DEFAULT 0, -- Total signals generated
+    buy_signals INTEGER NOT NULL DEFAULT 0,       -- Buy signals count
+    sell_signals INTEGER NOT NULL DEFAULT 0,      -- Sell signals count
+    trades_executed INTEGER NOT NULL DEFAULT 0,   -- Actual trades executed
+    
+    -- Portfolio risk assessment
+    portfolio_risk_score DECIMAL(5,2),            -- Overall portfolio risk (0-100)
+    max_position_size_pct DECIMAL(5,2),           -- Largest position as % of portfolio
+    diversification_score DECIMAL(5,2),           -- Portfolio diversification (0-100)
+    correlation_risk DECIMAL(5,2),                -- Asset correlation risk (0-100)
+    
+    -- Performance metrics
+    total_portfolio_value_usdc DECIMAL(20,8),     -- Total portfolio value at cycle start
+    available_cash_usdc DECIMAL(20,8),            -- Available cash for trading
+    execution_priority VARCHAR(20),               -- 'HIGH', 'MEDIUM', 'LOW'
+    
+    -- Execution timing
+    data_fetch_duration_ms INTEGER,               -- Time to fetch and process data
+    inference_duration_ms INTEGER,                -- Time for LSTM inference
+    signal_processing_duration_ms INTEGER,        -- Time for signal processing
+    trade_execution_duration_ms INTEGER,          -- Time for trade execution
+    total_cycle_duration_ms INTEGER,              -- Total cycle time
+    
+    -- Status and metadata
+    cycle_status VARCHAR(20) NOT NULL DEFAULT 'completed', -- 'running', 'completed', 'failed'
+    error_message TEXT,                           -- Error details if failed
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    -- Constraints
+    CONSTRAINT check_cycle_status CHECK (cycle_status IN ('running', 'completed', 'failed')),
+    CONSTRAINT check_execution_priority CHECK (execution_priority IS NULL OR execution_priority IN ('HIGH', 'MEDIUM', 'LOW')),
+    CONSTRAINT check_signal_counts CHECK (signals_generated >= buy_signals + sell_signals)
+);
+
+-- Convert to hypertable for time-series optimization
+SELECT create_hypertable('portfolio_cycles', 'cycle_timestamp', chunk_time_interval => INTERVAL '1 week', if_not_exists => TRUE);
+
+-- Create indexes for portfolio cycles
+CREATE INDEX IF NOT EXISTS idx_portfolio_cycles_timestamp ON portfolio_cycles(cycle_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_portfolio_cycles_status ON portfolio_cycles(cycle_status, cycle_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_portfolio_cycles_risk_score ON portfolio_cycles(portfolio_risk_score DESC) WHERE portfolio_risk_score IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_portfolio_cycles_execution_priority ON portfolio_cycles(execution_priority, cycle_timestamp DESC) WHERE execution_priority IS NOT NULL;
+
+-- Enable compression for older portfolio cycle data
+ALTER TABLE portfolio_cycles SET (
+    timescaledb.compress = true,
+    timescaledb.compress_segmentby = 'cycle_status,execution_priority',
+    timescaledb.compress_orderby = 'cycle_timestamp DESC'
+);
+SELECT add_compression_policy('portfolio_cycles', INTERVAL '30 days', if_not_exists => TRUE);
+
+-- Jupiter Operations Table - Track DEX interactions
+CREATE TABLE IF NOT EXISTS jupiter_operations (
+    operation_id SERIAL,
+    operation_timestamp TIMESTAMPTZ NOT NULL,     -- Operation time (partitioning column)
+    
+    -- Composite primary key including partitioning column for TimescaleDB
+    PRIMARY KEY (operation_id, operation_timestamp),
+    
+    -- Operation details
+    operation_type VARCHAR(20) NOT NULL,          -- 'quote', 'swap', 'route_discovery'
+    input_mint VARCHAR(44) NOT NULL,              -- Input token mint address
+    output_mint VARCHAR(44) NOT NULL,             -- Output token mint address
+    
+    -- Trade amounts
+    input_amount BIGINT NOT NULL,                 -- Input amount (in token's smallest unit)
+    output_amount BIGINT,                         -- Expected/actual output amount
+    slippage_bps INTEGER NOT NULL,                -- Slippage tolerance in basis points
+    
+    -- Execution results
+    actual_output_amount BIGINT,                  -- Actual amount received (for swaps)
+    price_impact_pct DECIMAL(8,4),                -- Price impact percentage
+    fee_amount BIGINT,                            -- Fee paid (in input token)
+    fee_mint VARCHAR(44),                         -- Fee token mint
+    
+    -- Route information
+    route_plan JSONB,                             -- Jupiter route plan (AMMs used)
+    market_infos JSONB,                           -- Market information from Jupiter
+    
+    -- Execution details
+    tx_hash VARCHAR(88),                          -- Transaction hash (for swaps)
+    success BOOLEAN DEFAULT NULL,                 -- Operation success (NULL for quotes)
+    error_message TEXT,                           -- Error details if failed
+    
+    -- Performance metrics
+    quote_response_time_ms INTEGER,               -- Time to get quote
+    swap_execution_time_ms INTEGER,               -- Time to execute swap
+    
+    -- Metadata
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    -- Constraints
+    CONSTRAINT check_operation_type CHECK (operation_type IN ('quote', 'swap', 'route_discovery')),
+    CONSTRAINT check_amounts CHECK (input_amount > 0 AND (output_amount IS NULL OR output_amount > 0)),
+    CONSTRAINT check_slippage CHECK (slippage_bps >= 0 AND slippage_bps <= 10000) -- Max 100% slippage
+);
+
+-- Convert to hypertable for time-series optimization
+SELECT create_hypertable('jupiter_operations', 'operation_timestamp', chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE);
+
+-- Create indexes for jupiter operations
+CREATE INDEX IF NOT EXISTS idx_jupiter_operations_timestamp ON jupiter_operations(operation_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_jupiter_operations_type ON jupiter_operations(operation_type, operation_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_jupiter_operations_input_mint ON jupiter_operations(input_mint, operation_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_jupiter_operations_output_mint ON jupiter_operations(output_mint, operation_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_jupiter_operations_success ON jupiter_operations(success, operation_timestamp DESC) WHERE success IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_jupiter_operations_tx_hash ON jupiter_operations(tx_hash) WHERE tx_hash IS NOT NULL;
+
+-- Enable compression for older Jupiter operations
+ALTER TABLE jupiter_operations SET (
+    timescaledb.compress = true,
+    timescaledb.compress_segmentby = 'operation_type,input_mint,output_mint',
+    timescaledb.compress_orderby = 'operation_timestamp DESC'
+);
+SELECT add_compression_policy('jupiter_operations', INTERVAL '7 days', if_not_exists => TRUE);
+
+-- Emergency Events Table - Track risk management events
+CREATE TABLE IF NOT EXISTS emergency_events (
+    event_id SERIAL,
+    event_timestamp TIMESTAMPTZ NOT NULL,         -- Event time (partitioning column)
+    
+    -- Composite primary key including partitioning column for TimescaleDB
+    PRIMARY KEY (event_id, event_timestamp),
+    
+    -- Event classification
+    event_type VARCHAR(30) NOT NULL,              -- 'stop_loss', 'portfolio_stop', 'volatility_halt', etc.
+    severity VARCHAR(20) NOT NULL,                -- 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'
+    token_id INTEGER,                             -- Affected token (NULL for portfolio-wide events)
+    
+    -- Trigger conditions
+    trigger_condition JSONB NOT NULL,             -- Condition that triggered the event
+    current_metrics JSONB,                        -- Current portfolio/position metrics
+    threshold_breached JSONB,                     -- Threshold values that were breached
+    
+    -- Response actions
+    action_taken VARCHAR(50),                     -- 'position_exit', 'trading_halt', 'alert_only', etc.
+    positions_affected INTEGER DEFAULT 0,         -- Number of positions affected
+    total_value_affected_usdc DECIMAL(20,8),      -- Total value of affected positions
+    
+    -- Execution results
+    action_successful BOOLEAN,                    -- Whether the response action succeeded
+    execution_time_ms INTEGER,                    -- Time to execute response
+    tx_hashes TEXT[],                             -- Transaction hashes (if trades executed)
+    
+    -- Recovery information
+    resolved_timestamp TIMESTAMPTZ,               -- When the emergency condition was resolved
+    resolution_method VARCHAR(50),                -- How the emergency was resolved
+    
+    -- Metadata
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    -- Constraints
+    CONSTRAINT fk_emergency_events_token FOREIGN KEY (token_id) REFERENCES tokens(token_id),
+    CONSTRAINT check_event_severity CHECK (severity IN ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL')),
+    CONSTRAINT check_positions_affected CHECK (positions_affected >= 0)
+);
+
+-- Convert to hypertable for time-series optimization
+SELECT create_hypertable('emergency_events', 'event_timestamp', chunk_time_interval => INTERVAL '1 week', if_not_exists => TRUE);
+
+-- Create indexes for emergency events
+CREATE INDEX IF NOT EXISTS idx_emergency_events_timestamp ON emergency_events(event_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_emergency_events_type ON emergency_events(event_type, event_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_emergency_events_severity ON emergency_events(severity, event_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_emergency_events_token ON emergency_events(token_id, event_timestamp DESC) WHERE token_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_emergency_events_unresolved ON emergency_events(event_timestamp DESC) WHERE resolved_timestamp IS NULL;
+
+-- Enable compression for older emergency events
+ALTER TABLE emergency_events SET (
+    timescaledb.compress = true,
+    timescaledb.compress_segmentby = 'event_type,severity',
+    timescaledb.compress_orderby = 'event_timestamp DESC'
+);
+SELECT add_compression_policy('emergency_events', INTERVAL '90 days', if_not_exists => TRUE);
+
+-- ===========================================================================
 -- VALIDATION TRIGGERS (Create after all tables exist)
 -- ===========================================================================
 
@@ -535,6 +749,11 @@ CREATE TRIGGER validate_market_events_token
 
 CREATE TRIGGER validate_social_data_token 
     BEFORE INSERT OR UPDATE ON social_data
+    FOR EACH ROW EXECUTE FUNCTION validate_token_reference();
+
+-- Validation triggers for new vault trading tables
+CREATE TRIGGER validate_emergency_events_token 
+    BEFORE INSERT OR UPDATE ON emergency_events
     FOR EACH ROW EXECUTE FUNCTION validate_token_reference();
 
 -- ===========================================================================
@@ -587,6 +806,77 @@ SELECT add_continuous_aggregate_policy('market_events_hourly',
     schedule_interval => INTERVAL '1 hour',
     if_not_exists => TRUE);
 
+-- Vault Trading Performance Hourly View (regular materialized view since trades is not a hypertable)
+CREATE MATERIALIZED VIEW IF NOT EXISTS trading_performance_hourly AS
+SELECT 
+    date_trunc('hour', t.execution_time) AS hour,
+    t.token_id,
+    tk.symbol,
+    count(*) as trade_count,
+    sum(CASE WHEN t.trade_type = 'buy' THEN 1 ELSE 0 END) as buy_count,
+    sum(CASE WHEN t.trade_type = 'sell' THEN 1 ELSE 0 END) as sell_count,
+    sum(t.value_usdc) as total_volume_usdc,
+    avg(t.signal_confidence) as avg_confidence,
+    avg(t.slippage_bps) as avg_slippage_bps,
+    avg(t.processing_time_ms) as avg_execution_time_ms,
+    count(DISTINCT t.cycle_timestamp) as unique_cycles
+FROM trades t
+JOIN tokens tk ON t.token_id = tk.token_id
+WHERE t.cycle_timestamp IS NOT NULL  -- Only vault trades
+  AND t.execution_time >= NOW() - INTERVAL '7 days'  -- Last 7 days only
+GROUP BY date_trunc('hour', t.execution_time), t.token_id, tk.symbol
+ORDER BY hour DESC;
+
+-- Create index for performance
+CREATE INDEX IF NOT EXISTS idx_trading_performance_hourly_hour ON trading_performance_hourly(hour DESC);
+
+-- Portfolio Risk Hourly View
+CREATE MATERIALIZED VIEW IF NOT EXISTS portfolio_risk_hourly
+WITH (timescaledb.continuous) AS
+SELECT 
+    time_bucket('1 hour', cycle_timestamp) AS hour,
+    count(*) as cycle_count,
+    avg(portfolio_risk_score) as avg_risk_score,
+    max(portfolio_risk_score) as max_risk_score,
+    avg(diversification_score) as avg_diversification,
+    avg(correlation_risk) as avg_correlation_risk,
+    avg(total_portfolio_value_usdc) as avg_portfolio_value,
+    avg(total_cycle_duration_ms) as avg_cycle_duration_ms,
+    sum(trades_executed) as total_trades_executed,
+    count(CASE WHEN cycle_status = 'failed' THEN 1 END) as failed_cycles
+FROM portfolio_cycles
+GROUP BY hour;
+
+-- Auto-refresh portfolio risk view
+SELECT add_continuous_aggregate_policy('portfolio_risk_hourly',
+    start_offset => INTERVAL '3 hours',
+    end_offset => INTERVAL '1 hour',
+    schedule_interval => INTERVAL '1 hour',
+    if_not_exists => TRUE);
+
+-- Emergency Events Daily View
+CREATE MATERIALIZED VIEW IF NOT EXISTS emergency_events_daily
+WITH (timescaledb.continuous) AS
+SELECT 
+    time_bucket('1 day', event_timestamp) AS day,
+    event_type,
+    severity,
+    count(*) as event_count,
+    sum(positions_affected) as total_positions_affected,
+    sum(total_value_affected_usdc) as total_value_affected,
+    count(CASE WHEN action_successful = true THEN 1 END) as successful_responses,
+    count(CASE WHEN resolved_timestamp IS NULL THEN 1 END) as unresolved_events,
+    avg(execution_time_ms) as avg_response_time_ms
+FROM emergency_events
+GROUP BY day, event_type, severity;
+
+-- Auto-refresh emergency events view (increased window size)
+SELECT add_continuous_aggregate_policy('emergency_events_daily',
+    start_offset => INTERVAL '7 days',
+    end_offset => INTERVAL '1 day',
+    schedule_interval => INTERVAL '1 day',
+    if_not_exists => TRUE);
+
 -- ===========================================================================
 -- FUNCTIONS AND TRIGGERS
 -- ===========================================================================
@@ -636,6 +926,127 @@ BEGIN
     ELSE
         RETURN (position_row.entry_price - current_price) * position_row.entry_quantity;
     END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ===========================================================================
+-- VAULT TRADING HELPER FUNCTIONS (Phase 3.2 Enhancement)
+-- ===========================================================================
+
+-- Function to get portfolio performance summary
+CREATE OR REPLACE FUNCTION get_portfolio_performance_summary(
+    p_hours_back INTEGER DEFAULT 24
+) RETURNS JSONB AS $$
+DECLARE
+    result JSONB;
+    start_time TIMESTAMPTZ;
+BEGIN
+    start_time := NOW() - (p_hours_back || ' hours')::INTERVAL;
+    
+    SELECT jsonb_build_object(
+        'period_hours', p_hours_back,
+        'start_time', start_time,
+        'end_time', NOW(),
+        'cycles', jsonb_build_object(
+            'total_cycles', COALESCE(COUNT(*), 0),
+            'successful_cycles', COALESCE(COUNT(*) FILTER (WHERE cycle_status = 'completed'), 0),
+            'failed_cycles', COALESCE(COUNT(*) FILTER (WHERE cycle_status = 'failed'), 0),
+            'avg_cycle_duration_ms', COALESCE(AVG(total_cycle_duration_ms), 0),
+            'avg_risk_score', COALESCE(AVG(portfolio_risk_score), 0)
+        ),
+        'trading', jsonb_build_object(
+            'total_trades', COALESCE(SUM(trades_executed), 0),
+            'total_signals', COALESCE(SUM(signals_generated), 0),
+            'signal_execution_rate', CASE 
+                WHEN SUM(signals_generated) > 0 THEN 
+                    ROUND((SUM(trades_executed)::DECIMAL / SUM(signals_generated)) * 100, 2)
+                ELSE 0 
+            END
+        ),
+        'portfolio_metrics', jsonb_build_object(
+            'avg_portfolio_value', COALESCE(AVG(total_portfolio_value_usdc), 0),
+            'avg_available_cash', COALESCE(AVG(available_cash_usdc), 0),
+            'avg_diversification', COALESCE(AVG(diversification_score), 0),
+            'max_correlation_risk', COALESCE(MAX(correlation_risk), 0)
+        )
+    ) INTO result
+    FROM portfolio_cycles
+    WHERE cycle_timestamp >= start_time;
+    
+    RETURN result;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to get trading performance by token
+CREATE OR REPLACE FUNCTION get_trading_performance_by_token(
+    p_hours_back INTEGER DEFAULT 24
+) RETURNS TABLE (
+    symbol VARCHAR(20),
+    trade_count BIGINT,
+    total_volume_usdc DECIMAL(20,8),
+    avg_confidence DECIMAL(5,2),
+    avg_slippage_bps DECIMAL(8,2),
+    avg_execution_time_ms DECIMAL(8,2),
+    unique_cycles BIGINT
+) AS $$
+DECLARE
+    start_time TIMESTAMPTZ;
+BEGIN
+    start_time := NOW() - (p_hours_back || ' hours')::INTERVAL;
+    
+    RETURN QUERY
+    SELECT 
+        tk.symbol,
+        COUNT(t.trade_id) as trade_count,
+        COALESCE(SUM(t.value_usdc), 0) as total_volume_usdc,
+        COALESCE(AVG(t.signal_confidence), 0) as avg_confidence,
+        COALESCE(AVG(t.slippage_bps), 0) as avg_slippage_bps,
+        COALESCE(AVG(t.processing_time_ms), 0) as avg_execution_time_ms,
+        COUNT(DISTINCT t.cycle_timestamp) as unique_cycles
+    FROM trades t
+    JOIN tokens tk ON t.token_id = tk.token_id
+    WHERE t.execution_time >= start_time
+      AND t.cycle_timestamp IS NOT NULL  -- Only vault trades
+    GROUP BY tk.symbol
+    ORDER BY total_volume_usdc DESC;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to get emergency events summary
+CREATE OR REPLACE FUNCTION get_emergency_events_summary(
+    p_days_back INTEGER DEFAULT 7
+) RETURNS JSONB AS $$
+DECLARE
+    result JSONB;
+    start_time TIMESTAMPTZ;
+BEGIN
+    start_time := NOW() - (p_days_back || ' days')::INTERVAL;
+    
+    SELECT jsonb_build_object(
+        'period_days', p_days_back,
+        'start_time', start_time,
+        'end_time', NOW(),
+        'total_events', COALESCE(COUNT(*), 0),
+        'by_severity', jsonb_object_agg(
+            severity, 
+            COUNT(*)
+        ),
+        'by_type', jsonb_object_agg(
+            event_type,
+            COUNT(*)
+        ),
+        'response_metrics', jsonb_build_object(
+            'successful_responses', COALESCE(COUNT(*) FILTER (WHERE action_successful = true), 0),
+            'failed_responses', COALESCE(COUNT(*) FILTER (WHERE action_successful = false), 0),
+            'avg_response_time_ms', COALESCE(AVG(execution_time_ms), 0),
+            'total_value_affected', COALESCE(SUM(total_value_affected_usdc), 0)
+        ),
+        'unresolved_events', COALESCE(COUNT(*) FILTER (WHERE resolved_timestamp IS NULL), 0)
+    ) INTO result
+    FROM emergency_events
+    WHERE event_timestamp >= start_time;
+    
+    RETURN result;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -813,6 +1224,11 @@ GRANT EXECUTE ON FUNCTION get_token_id_by_address(VARCHAR) TO calvin_dev;
 GRANT EXECUTE ON FUNCTION get_token_id_by_symbol(VARCHAR) TO calvin_dev;
 GRANT EXECUTE ON FUNCTION initialize_tracked_tokens() TO calvin_dev;
 
+-- Grant execute permissions on vault trading functions
+GRANT EXECUTE ON FUNCTION get_portfolio_performance_summary(INTEGER) TO calvin_dev;
+GRANT EXECUTE ON FUNCTION get_trading_performance_by_token(INTEGER) TO calvin_dev;
+GRANT EXECUTE ON FUNCTION get_emergency_events_summary(INTEGER) TO calvin_dev;
+
 -- ===========================================================================
 -- COMPLETION & SETUP INSTRUCTIONS
 -- ===========================================================================
@@ -823,17 +1239,28 @@ INSERT INTO system_health (check_time, component, status, details) VALUES (
     'database_init', 
     'healthy', 
     jsonb_build_object(
-        'message', 'Calvin AI database initialized successfully with dedicated social data table',
-        'tables_created', 9,
-        'views_created', 6,
-        'functions_created', 6,
-        'triggers_created', 6,
-        'hypertables', ARRAY['ohlcv', 'social_data', 'market_events', 'system_health'],
-        'features', ARRAY['auto_token_management', 'api_integration', 'cross_validation', 'metadata_sync', 'dedicated_social_table'],
+        'message', 'Calvin AI database initialized successfully with vault trading enhancements (Phase 3.2)',
+        'tables_created', 12,
+        'views_created', 9,
+        'functions_created', 9,
+        'triggers_created', 7,
+        'hypertables', ARRAY['ohlcv', 'social_data', 'market_events', 'system_health', 'portfolio_cycles', 'jupiter_operations', 'emergency_events'],
+        'vault_enhancements', jsonb_build_object(
+            'trades_table_enhanced', 'Added 6 vault-specific columns for signal tracking',
+            'portfolio_cycles', 'Complete hourly trading cycle tracking with performance metrics',
+            'jupiter_operations', 'DEX interaction tracking with route and execution details',
+            'emergency_events', 'Risk management event tracking with response actions',
+            'materialized_views', ARRAY['trading_performance_hourly', 'portfolio_risk_hourly', 'emergency_events_daily'],
+            'helper_functions', ARRAY['get_portfolio_performance_summary', 'get_trading_performance_by_token', 'get_emergency_events_summary']
+        ),
+        'features', ARRAY['auto_token_management', 'api_integration', 'cross_validation', 'metadata_sync', 'dedicated_social_table', 'vault_trading_tracking', 'portfolio_cycle_management', 'jupiter_integration', 'emergency_monitoring'],
         'data_separation', jsonb_build_object(
             'social_data', 'Weekly chunks for daily social metrics from LunarCrush',
             'market_events', 'Daily chunks for high-frequency transaction/orderbook data',
-            'ohlcv', 'Daily chunks for price/volume time series'
+            'ohlcv', 'Daily chunks for price/volume time series',
+            'portfolio_cycles', 'Weekly chunks for hourly trading cycles',
+            'jupiter_operations', 'Daily chunks for DEX operations',
+            'emergency_events', 'Weekly chunks for risk management events'
         )
     )
 );

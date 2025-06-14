@@ -4,7 +4,7 @@ from pathlib import Path
 from loguru import logger
 from datetime import datetime
 
-from src.config.config import config
+from ..config.config import config
 
 class Logger:
     def __init__(self):

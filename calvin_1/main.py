@@ -4,17 +4,17 @@ import sys
 import argparse
 import asyncio
 import json
+import signal
 from typing import Dict, Any
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pathlib import Path
 import pandas as pd
 
-# Add src directory to path for consistent imports
+# Add current directory to path for consistent src imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
-src_path = os.path.join(current_dir, 'src')
-if src_path not in sys.path:
-    sys.path.insert(0, src_path)
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
 
 # Find and load environment variables from .env file
 current_file = Path(__file__).resolve()
@@ -32,20 +32,182 @@ else:
         # Last resort, try default behavior
         load_dotenv()
 
-from data.data_processor import DataProcessor
-from model.ml_model import MLModel
-from trading.trading_strategy import TradingStrategy
-from trading.wallet import SolanaWallet
+from src.data.data_processor import DataProcessor
+from src.model.ml_model import MLModel
+from src.trading.trading_strategy import TradingStrategy
+from src.trading.wallet import SolanaWallet
 from src.config.config import config
-from utils.logger import log_manager, log
-from scripts.train_rl_model import train_rl_model
-from scripts.train_fast_rl import train_fast_rl_model
-from scripts.train_historical_rl import train_historical_rl
-from scripts.train_prediction_guided import train_prediction_guided_model
-from scripts.train_cross_token import train_cross_token_model
+from src.utils.logger import log_manager, log
+from src.scripts.train_rl_model import train_rl_model
+from src.scripts.train_fast_rl import train_fast_rl_model
+from src.scripts.train_historical_rl import train_historical_rl
+from src.scripts.train_prediction_guided import train_prediction_guided_model
+from src.scripts.train_cross_token import train_cross_token_model
+
+# NEW: Phase 3.2 imports
+from src.data.hourly_inference_scheduler import HourlyInferenceScheduler
+from src.database.production_db import get_db_manager
 
 # Initialize global logger
 logger = log
+
+
+class CalvinVaultSystem:
+    """
+    Calvin AI Vault Trading System - Main Orchestrator (Phase 3.2)
+    
+    Coordinates the complete Calvin AI trading system with vault integration.
+    """
+    
+    def __init__(self):
+        self.scheduler = None
+        self.running = False
+        
+        logger.info("Calvin Vault System initializing...")
+
+    async def initialize(self):
+        """Initialize all system components"""
+        try:
+            # Initialize database connection
+            db_manager = await get_db_manager()
+            await db_manager.health_check()
+            logger.info("✅ Database connection established")
+            
+            # Initialize inference scheduler with vault trading
+            self.scheduler = HourlyInferenceScheduler()
+            await self.scheduler.initialize()
+            logger.info("✅ Inference scheduler initialized")
+            
+            # Validate environment configuration
+            self._validate_configuration()
+            
+            logger.info("🎉 Calvin Vault System initialization complete")
+            
+        except Exception as e:
+            logger.error(f"❌ System initialization failed: {e}")
+            raise
+
+    def _validate_configuration(self):
+        """Validate required configuration"""
+        required_vars = [
+            'DATABASE_URL',
+            'REDIS_URL'
+        ]
+        
+        # Optional vault-specific variables (will use defaults if not set)
+        vault_vars = [
+            'CALVIN_AUTHORITY_PRIVATE_KEY',
+            'CALVIN_VAULT_PROGRAM_ID', 
+            'CALVIN_STAKING_PROGRAM_ID',
+            'SOLANA_RPC_URL'
+        ]
+        
+        missing = [var for var in required_vars if not config.get(var)]
+        if missing:
+            raise ValueError(f"Missing required environment variables: {missing}")
+        
+        missing_vault = [var for var in vault_vars if not config.get(var)]
+        if missing_vault:
+            logger.warning(f"⚠️ Vault variables not set (will run in simulation mode): {missing_vault}")
+        
+        logger.info("✅ Configuration validation passed")
+
+    async def start(self):
+        """Start the complete Calvin vault trading system"""
+        try:
+            await self.initialize()
+            
+            logger.info("🚀 Starting Calvin AI Vault Trading System")
+            logger.info(f"⏰ Inference + Trading Interval: {self.scheduler.config.ohlcv_interval_minutes} minutes")
+            logger.info(f"📊 Social Data Interval: {self.scheduler.config.social_interval_minutes} minutes (hourly for model features)")
+            logger.info(f"🔍 Health Check Interval: {self.scheduler.config.health_check_interval_minutes} minutes")
+            
+            self.running = True
+            
+            # Start inference and trading scheduler
+            await self.scheduler.start_async()
+            logger.info("✅ Enhanced inference scheduler started with vault trading")
+            
+            # Keep running
+            while self.running:
+                await asyncio.sleep(60)  # Check every minute
+                
+                # Periodic health checks and status reports
+                if datetime.now().minute == 0:  # Every hour
+                    await self._health_check()
+            
+        except Exception as e:
+            logger.error(f"❌ System startup failed: {e}")
+            await self.shutdown()
+            raise
+
+    async def _health_check(self):
+        """Periodic system health check"""
+        try:
+            # Check scheduler health
+            if not self.scheduler or not self.scheduler.is_running:
+                logger.warning("⚠️ Scheduler not running - attempting restart")
+                await self.scheduler.start_async()
+            
+            # Check database connectivity
+            db_manager = await get_db_manager()
+            await db_manager.health_check()
+            
+            # Log enhanced system stats
+            stats = self.scheduler.get_enhanced_statistics()
+            logger.info(f"📈 System Health Report:")
+            logger.info(f"   Inference cycles: {stats.get('vault_trading', {}).get('total_cycles', 0)}")
+            logger.info(f"   Vault trades: {stats.get('vault_trading', {}).get('total_trades', 0)}")
+            logger.info(f"   Success rate: {stats.get('vault_trading', {}).get('cycles_per_hour', 0):.1f} cycles/hour")
+            
+        except Exception as e:
+            logger.error(f"❌ Health check failed: {e}")
+
+    async def shutdown(self):
+        """Graceful system shutdown"""
+        logger.info("🛑 Shutting down Calvin Vault System...")
+        
+        self.running = False
+        
+        try:
+            # Stop scheduler
+            if self.scheduler:
+                await self.scheduler.stop_async()
+                logger.info("✅ Scheduler stopped")
+            
+            logger.info("🏁 Calvin Vault System shutdown complete")
+            
+        except Exception as e:
+            logger.error(f"❌ Shutdown error: {e}")
+
+    def signal_handler(self, signum, frame):
+        """Handle shutdown signals"""
+        logger.info(f"Received signal {signum} - initiating shutdown")
+        asyncio.create_task(self.shutdown())
+
+
+async def run_vault_system(args: Dict[str, Any]) -> None:
+    """
+    Run the Calvin AI Vault Trading System (Phase 3.2)
+    
+    This is the main entry point for the enhanced system with vault integration.
+    """
+    system = CalvinVaultSystem()
+    
+    # Set up signal handlers
+    signal.signal(signal.SIGINT, system.signal_handler)
+    signal.signal(signal.SIGTERM, system.signal_handler)
+    
+    try:
+        await system.start()
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received")
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}")
+        sys.exit(1)
+    finally:
+        await system.shutdown()
+
 
 async def train_model(args: Dict[str, Any]) -> None:
     """Train the ML model with historical data"""
@@ -107,7 +269,36 @@ async def train_model(args: Dict[str, Any]) -> None:
     # Train the model
     epochs = args.get('epochs', 100)
     batch_size = args.get('batch_size', 32)
-    model_name = args.get('model_name', f"{symbol}_{model_type}_{datetime.now().strftime('%Y%m%d')}")
+    
+    # Enhanced model naming with simple versioning
+    if not args.get('model_name'):
+        timestamp = datetime.now().strftime("%Y%m%d")
+        base_name = f"{symbol}_{model_type}"
+        version = "v1.0.0"
+        
+        # Check for existing models today and increment patch version
+        import glob
+        existing_models = glob.glob(f"models/{base_name}_v1.0.*_{timestamp}.h5")
+        if existing_models:
+            # Extract patch numbers and increment
+            patch_numbers = []
+            for model_path in existing_models:
+                try:
+                    # Extract patch number from filename like "symbol_lstm_v1.0.X_date.h5"
+                    parts = os.path.basename(model_path).split('_')
+                    version_part = [p for p in parts if p.startswith('v1.0.')][0]
+                    patch_num = int(version_part.split('.')[2])
+                    patch_numbers.append(patch_num)
+                except (IndexError, ValueError):
+                    continue
+            
+            if patch_numbers:
+                next_patch = max(patch_numbers) + 1
+                version = f"v1.0.{next_patch}"
+        
+        model_name = f"{base_name}_{version}_{timestamp}"
+    else:
+        model_name = args.get('model_name')
     
     history = ml_model.train(
         X_train, y_train,
@@ -123,7 +314,7 @@ async def train_model(args: Dict[str, Any]) -> None:
     
     # Plot results if requested
     if args.get('plot', False):
-        ml_model.plot_training_history(history, f"{model_name}_training.png")
+        ml_model.plot_training_history(history, f"{model_name}_training_history.png")
         
         # Make predictions and plot
         y_pred = ml_model.predict(X_test)
@@ -184,8 +375,9 @@ async def test_model(args: Dict[str, Any]) -> None:
         target_col='close',
         sequence_length=sequence_length,
         prediction_horizon=prediction_steps,
-        test_size=0.99,  # Use same test_size as optimization script for consistency
-        include_feature_names=False
+        test_size=0.2,  # Not used in test_mode, but keep for compatibility
+        include_feature_names=False,
+        test_mode=True  # Use test mode: fit scalers on entire dataset
     )
     
     # Evaluate model - get basic metrics only (no backtest)
@@ -210,7 +402,7 @@ async def test_model(args: Dict[str, Any]) -> None:
     logger.info("="*70)
 
     # Run ONLY our new simple backtest using the optimized strategy
-    from model.profit_functions import simple_backtest_strategy
+    from src.model.profit_functions import simple_backtest_strategy
     backtest_results = simple_backtest_strategy(
         prices=y_true_orig,
         predictions=y_pred_orig,
@@ -219,7 +411,7 @@ async def test_model(args: Dict[str, Any]) -> None:
         verbosity=1,
         resolution=resolution,
         buy_threshold=0.02,  # Buy when predicted increase >= 2%
-        sell_threshold=0.04  # Sell when predicted decrease >= 3%
+        sell_threshold=0.03  # Sell when predicted decrease >= 3%
     )
     
     # Log backtest results (only the new/correct ones)
@@ -234,22 +426,26 @@ async def test_model(args: Dict[str, Any]) -> None:
     
     # Plot if requested
     if args.get('plot', False):
+        # Create model-specific plot names
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        model_base_name = f"{symbol}_lstm_test_{timestamp}"
+        
         # Original prediction plots
         ml_model.plot_predictions(
             y_true_orig, 
             y_pred_orig, 
-            f"test_predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            f"{model_base_name}_predictions.png"
         )
         
         # Add the price comparison plot
         ml_model.plot_price_comparison(
             y_true_orig,
             y_pred_orig,
-            f"test_price_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            f"{model_base_name}_price_comparison.png"
         )
         
         # NEW: Plot backtest with signals using the improved function
-        from model.profit_functions import plot_backtest_with_signals
+        from src.model.profit_functions import plot_backtest_with_signals
         
         # Use the REAL OHLCV data we already fetched, not fake data
         # Get the test period OHLCV data that corresponds to our predictions
@@ -298,13 +494,16 @@ async def test_model(args: Dict[str, Any]) -> None:
                         logger.info("Created synthetic timestamp column from index")
             
             # Plot backtest with signals using REAL market data
-            plot_filename = f"test_backtest_signals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            plot_filename = f"{model_base_name}_backtest_signals.png"
+            # Save to plots/backtests directory
+            plots_dir = os.path.join(os.path.dirname(os.getcwd()), 'plots', 'backtests')
+            os.makedirs(plots_dir, exist_ok=True)
             plot_path = plot_backtest_with_signals(
                 ohlcv_data=real_ohlcv_df,
                 trades=backtest_results.get('trades', []),
                 filename=plot_filename,
                 title=f"{symbol} Backtest Results - {resolution} Resolution (Real OHLCV)",
-                output_dir="models"
+                output_dir=plots_dir
             )
             
             if plot_path:
@@ -375,8 +574,8 @@ async def get_token_info(args: Dict[str, Any]) -> None:
     """Get information about a token"""
     logger.info("Fetching token information")
     
-    from data.birdeye_api import BirdEyeAPI
-    from data.helius_api import HeliusAPI
+    from src.data.birdeye_api import BirdEyeAPI
+    from src.data.helius_api import HeliusAPI
     
     token_address = args.get('token_address')
     if not token_address:
@@ -627,7 +826,7 @@ async def test_fast_rl_agent_cmd(args: Dict[str, Any]) -> None:
     # Import the actual testing function from the script where it will be defined
     # We assume it will be in scripts/train_fast_rl.py for now
     try:
-        from scripts.train_fast_rl import test_fast_rl_agent # Assuming the test function is named this
+        from src.scripts.train_fast_rl import test_fast_rl_agent # Assuming the test function is named this
         
         # Convert Namespace to dict if necessary, or pass args directly
         args_dict = vars(args) if isinstance(args, argparse.Namespace) else args
@@ -648,7 +847,7 @@ async def continue_fast_rl_model_cmd(args: Dict[str, Any]) -> None:
     """Wrapper to call the Fast RL model continuing training logic."""
     logger.info(f"Starting continued training of Fast RL Agent for token {args['symbol']} ({args['token_address']})")
     try:
-        from scripts.train_fast_rl import main as train_fast_rl_main
+        from src.scripts.train_fast_rl import main as train_fast_rl_main
         
         # Convert Namespace to dict if necessary
         args_dict = vars(args) if isinstance(args, argparse.Namespace) else args
@@ -672,21 +871,28 @@ async def continue_fast_rl_model_cmd(args: Dict[str, Any]) -> None:
             argv.extend(['--day-offset', str(args_dict['day_offset'])])
             
         # Add the new epsilon parameters
-        if 'epsilon' in args_dict:
-            argv.extend(['--epsilon', str(args_dict['epsilon'])])
-            
-        if args_dict.get('reset_epsilon', False):
-            argv.append('--reset-epsilon')
-            
-        # Call the main function from train_fast_rl.py with our constructed arguments
-        import sys
-        original_argv = sys.argv
         try:
-            sys.argv = [sys.argv[0]] + argv
-            train_fast_rl_main()
-        finally:
-            sys.argv = original_argv
-            
+            if 'epsilon' in args_dict:
+                argv.extend(['--epsilon', str(args_dict['epsilon'])])
+                
+            if args_dict.get('reset_epsilon', False):
+                argv.append('--reset-epsilon')
+                
+            # Call the main function from train_fast_rl.py with our constructed arguments
+            import sys
+            original_argv = sys.argv
+            try:
+                sys.argv = [sys.argv[0]] + argv
+                train_fast_rl_main()
+            finally:
+                sys.argv = original_argv
+                
+        except Exception as e:
+            logger.error(f"Error continuing training of Fast RL agent: {e}")
+            # Print full traceback
+            import traceback
+            traceback.print_exc()
+        
     except Exception as e:
         logger.error(f"Error continuing training of Fast RL agent: {e}")
         # Print full traceback
@@ -871,6 +1077,15 @@ def parse_arguments():
     continue_rl_parser.add_argument('--reset-epsilon', action='store_true', help='Whether to reset epsilon to the specified value (default: keeps original epsilon)')
     continue_rl_parser.set_defaults(func=continue_fast_rl_model_cmd)
     
+    # NEW: Phase 3.2 - Vault Trading System command
+    vault_system_parser = subparsers.add_parser('run-vault-system', help='Run the Calvin AI Vault Trading System (Phase 3.2)')
+    vault_system_parser.add_argument('--config-file', type=str, help='Optional configuration file path')
+    vault_system_parser.add_argument('--log-level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
+    vault_system_parser.add_argument('--simulation-mode', action='store_true', help='Force simulation mode even if vault clients are available')
+    vault_system_parser.add_argument('--ohlcv-interval', type=int, default=60, help='OHLCV data fetch interval in minutes')
+    vault_system_parser.add_argument('--social-interval', type=int, default=60, help='Social data fetch interval in minutes (hourly for model features)')
+    vault_system_parser.add_argument('--min-viable-tokens', type=int, default=5, help='Minimum tokens ready for inference to trigger trading')
+    
     return parser.parse_args()
 
 def main():
@@ -911,19 +1126,16 @@ def main():
             asyncio.run(test_fast_rl_agent_cmd(args_dict))
         elif command == 'continue-fast-rl':
             asyncio.run(continue_fast_rl_model_cmd(args_dict))
+        elif command == 'run-vault-system':
+            asyncio.run(run_vault_system(args_dict))
         else:
             logger.error(f"Unknown command: {command}")
-            
+    except KeyboardInterrupt:
+        logger.info("Program interrupted by user")
     except Exception as e:
-        logger.error(f"Unhandled exception: {e}")
+        logger.error(f"Error running command {command}: {e}")
         import traceback
         traceback.print_exc()
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        logger.info("Program stopped by user")
-    except Exception as e:
-        logger.error(f"Unhandled exception: {e}", exc_info=True)
-        sys.exit(1)
+    main()

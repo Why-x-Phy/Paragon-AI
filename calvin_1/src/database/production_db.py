@@ -36,7 +36,7 @@ try:
     from ..config import get_config
 except ImportError:
     # Fallback for when running test scripts directly
-    from config import get_config
+    from ..config.config import config
 
 
 @dataclass
@@ -94,7 +94,8 @@ class PositionData:
 
 @dataclass
 class TradeData:
-    """Trade execution data structure"""
+    """Enhanced trade execution data structure for vault trading"""
+    # Existing fields
     token_id: int
     trade_type: str  # 'buy' or 'sell'
     price: float
@@ -109,6 +110,14 @@ class TradeData:
     dex_name: Optional[str] = None
     block_number: Optional[int] = None
     processing_time_ms: Optional[int] = None
+    
+    # NEW: Vault-specific fields
+    signal_confidence: Optional[float] = None
+    model_version: Optional[str] = None
+    signal_strength: Optional[str] = None  # 'STRONG', 'MODERATE', 'WEAK'
+    predicted_change_pct: Optional[float] = None
+    cycle_timestamp: Optional[datetime] = None
+    jupiter_operation_id: Optional[int] = None
 
 
 @dataclass
@@ -139,6 +148,90 @@ class ModelPredictionData:
     input_features: Optional[Dict] = None
     actual_outcome: Optional[str] = None
     outcome_accuracy: Optional[float] = None
+
+
+@dataclass
+class PortfolioCycleData:
+    """Portfolio cycle tracking data - EXACT MATCH TO MAIN SCHEMA"""
+    cycle_timestamp: datetime
+    # Cycle metrics
+    tokens_analyzed: int = 0
+    signals_generated: int = 0
+    buy_signals: int = 0
+    sell_signals: int = 0
+    trades_executed: int = 0
+    # Portfolio risk assessment
+    portfolio_risk_score: Optional[float] = None  # 0-100
+    max_position_size_pct: Optional[float] = None
+    diversification_score: Optional[float] = None  # 0-100
+    correlation_risk: Optional[float] = None  # 0-100
+    # Performance metrics
+    total_portfolio_value_usdc: Optional[float] = None
+    available_cash_usdc: Optional[float] = None
+    execution_priority: Optional[str] = None  # 'HIGH', 'MEDIUM', 'LOW'
+    # Execution timing
+    data_fetch_duration_ms: Optional[int] = None
+    inference_duration_ms: Optional[int] = None
+    signal_processing_duration_ms: Optional[int] = None
+    trade_execution_duration_ms: Optional[int] = None
+    total_cycle_duration_ms: Optional[int] = None
+    # Status and metadata
+    cycle_status: str = 'completed'  # 'running', 'completed', 'failed'
+    error_message: Optional[str] = None
+
+
+@dataclass
+class JupiterOperationData:
+    """Jupiter operation tracking data - EXACT MATCH TO MAIN SCHEMA"""
+    operation_timestamp: datetime
+    # Operation details
+    operation_type: str  # 'quote', 'swap', 'route_discovery'
+    input_mint: str
+    output_mint: str
+    # Trade amounts
+    input_amount: int  # Required in smallest units
+    output_amount: Optional[int] = None
+    slippage_bps: int = 0  # Required
+    # Execution results
+    actual_output_amount: Optional[int] = None
+    price_impact_pct: Optional[float] = None
+    fee_amount: Optional[int] = None
+    fee_mint: Optional[str] = None
+    # Route information
+    route_plan: Optional[Dict] = None
+    market_infos: Optional[Dict] = None
+    # Execution details
+    tx_hash: Optional[str] = None
+    success: Optional[bool] = None  # NULL for quotes
+    error_message: Optional[str] = None
+    # Performance metrics
+    quote_response_time_ms: Optional[int] = None
+    swap_execution_time_ms: Optional[int] = None
+
+
+@dataclass
+class EmergencyEventData:
+    """Emergency event tracking data - EXACT MATCH TO MAIN SCHEMA"""
+    event_timestamp: datetime
+    # Event classification
+    event_type: str  # 'stop_loss', 'portfolio_stop', 'volatility_halt', etc.
+    severity: str  # 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'
+    token_id: Optional[int] = None
+    # Trigger conditions
+    trigger_condition: Dict = None  # Required JSONB
+    current_metrics: Optional[Dict] = None
+    threshold_breached: Optional[Dict] = None
+    # Response actions
+    action_taken: Optional[str] = None  # 'position_exit', 'trading_halt', 'alert_only', etc.
+    positions_affected: int = 0
+    total_value_affected_usdc: Optional[float] = None
+    # Execution results
+    action_successful: Optional[bool] = None
+    execution_time_ms: Optional[int] = None
+    tx_hashes: Optional[List[str]] = None
+    # Recovery information
+    resolved_timestamp: Optional[datetime] = None
+    resolution_method: Optional[str] = None
 
 
 class DatabaseConnectionError(Exception):
@@ -502,6 +595,11 @@ class ProductionDBManager:
     async def add_token(self, address: str, symbol: str, name: str, decimals: int = 9) -> TokenInfo:
         """Add a new token to the database"""
         try:
+            # Trim all string inputs to prevent trailing spaces
+            address = address.strip() if address else address
+            symbol = symbol.strip() if symbol else symbol
+            name = name.strip() if name else name
+            
             query = """
                 INSERT INTO tokens (address, symbol, name, decimals)
                 VALUES ($1, $2, $3, $4)
@@ -845,13 +943,17 @@ class ProductionDBManager:
     # =========================================================================
     
     async def record_trade(self, trade: TradeData) -> int:
-        """Record a trade execution"""
+        """Record a trade execution with vault-specific fields"""
         try:
             query = """
-                INSERT INTO trades (position_id, token_id, trade_type, price, quantity, 
-                                  value_usdc, fee_usdc, slippage_bps, dex_name, tx_hash,
-                                  block_number, execution_time, processing_time_ms)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                INSERT INTO trades (
+                    position_id, token_id, trade_type, price, quantity, 
+                    value_usdc, fee_usdc, slippage_bps, dex_name, tx_hash,
+                    block_number, execution_time, processing_time_ms,
+                    signal_confidence, model_version, signal_strength,
+                    predicted_change_pct, cycle_timestamp, jupiter_operation_id
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
                 RETURNING trade_id
             """
             
@@ -861,17 +963,427 @@ class ProductionDBManager:
                     trade.position_id, trade.token_id, trade.trade_type, trade.price,
                     trade.quantity, trade.value_usdc, trade.fee_usdc, trade.slippage_bps,
                     trade.dex_name, trade.tx_hash, trade.block_number, trade.execution_time,
-                    trade.processing_time_ms
+                    trade.processing_time_ms,
+                    # NEW: Vault-specific fields
+                    trade.signal_confidence, trade.model_version, trade.signal_strength,
+                    trade.predicted_change_pct, trade.cycle_timestamp, trade.jupiter_operation_id
                 )
             
             trade_id = row['trade_id']
             
-            self.logger.info(f"Recorded trade {trade_id}: {trade.trade_type} {trade.quantity} tokens")
+            self.logger.info(f"Recorded vault trade {trade_id}: {trade.trade_type} {trade.quantity} tokens "
+                           f"(confidence: {trade.signal_confidence}, model: {trade.model_version})")
             return trade_id
             
         except Exception as e:
             self.logger.error(f"Failed to record trade: {e}")
             raise DatabaseOperationError(f"Failed to record trade: {e}")
+    
+    # =========================================================================
+    # PORTFOLIO CYCLE OPERATIONS
+    # =========================================================================
+    
+    async def record_portfolio_cycle(self, cycle: PortfolioCycleData) -> int:
+        """Record a portfolio trading cycle - EXACT MATCH TO MAIN SCHEMA"""
+        try:
+            query = """
+                INSERT INTO portfolio_cycles (
+                    cycle_timestamp, tokens_analyzed, signals_generated, buy_signals, sell_signals, trades_executed,
+                    portfolio_risk_score, max_position_size_pct, diversification_score, correlation_risk,
+                    total_portfolio_value_usdc, available_cash_usdc, execution_priority,
+                    data_fetch_duration_ms, inference_duration_ms, signal_processing_duration_ms,
+                    trade_execution_duration_ms, total_cycle_duration_ms,
+                    cycle_status, error_message
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                RETURNING cycle_id
+            """
+            
+            async with self.pg_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    query,
+                    cycle.cycle_timestamp, cycle.tokens_analyzed, cycle.signals_generated, 
+                    cycle.buy_signals, cycle.sell_signals, cycle.trades_executed,
+                    cycle.portfolio_risk_score, cycle.max_position_size_pct, cycle.diversification_score, cycle.correlation_risk,
+                    cycle.total_portfolio_value_usdc, cycle.available_cash_usdc, cycle.execution_priority,
+                    cycle.data_fetch_duration_ms, cycle.inference_duration_ms, cycle.signal_processing_duration_ms,
+                    cycle.trade_execution_duration_ms, cycle.total_cycle_duration_ms,
+                    cycle.cycle_status, cycle.error_message
+                )
+            
+            cycle_id = row['cycle_id']
+            self.logger.info(f"Recorded portfolio cycle {cycle_id}: {cycle.cycle_status} at {cycle.cycle_timestamp}")
+            return cycle_id
+            
+        except Exception as e:
+            self.logger.error(f"Failed to record portfolio cycle: {e}")
+            raise DatabaseOperationError(f"Failed to record portfolio cycle: {e}")
+    
+    async def update_portfolio_cycle(self, cycle_id: int, updates: Dict[str, Any]) -> bool:
+        """Update portfolio cycle with completion data"""
+        try:
+            if not updates:
+                return True
+            
+            # Build dynamic update query
+            set_clauses = []
+            params = []
+            param_count = 1
+            
+            for field, value in updates.items():
+                set_clauses.append(f"{field} = ${param_count}")
+                params.append(value)
+                param_count += 1
+            
+            query = f"""
+                UPDATE portfolio_cycles 
+                SET {', '.join(set_clauses)}, updated_at = NOW()
+                WHERE cycle_id = ${param_count}
+            """
+            params.append(cycle_id)
+            
+            async with self.pg_pool.acquire() as conn:
+                result = await conn.execute(query, *params)
+            
+            # Check if any rows were updated
+            rows_updated = int(result.split()[-1])
+            if rows_updated > 0:
+                self.logger.debug(f"Updated portfolio cycle {cycle_id} with {len(updates)} fields")
+                return True
+            else:
+                self.logger.warning(f"No portfolio cycle found with ID {cycle_id}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Failed to update portfolio cycle {cycle_id}: {e}")
+            raise DatabaseOperationError(f"Failed to update portfolio cycle: {e}")
+    
+    async def get_latest_portfolio_cycle(self) -> Optional[Dict[str, Any]]:
+        """Get the most recent portfolio cycle"""
+        try:
+            query = """
+                SELECT * FROM portfolio_cycles 
+                ORDER BY cycle_timestamp DESC 
+                LIMIT 1
+            """
+            
+            async with self.pg_pool.acquire() as conn:
+                row = await conn.fetchrow(query)
+            
+            if row:
+                return dict(row)
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get latest portfolio cycle: {e}")
+            raise DatabaseOperationError(f"Failed to get latest portfolio cycle: {e}")
+    
+    # =========================================================================
+    # JUPITER OPERATIONS
+    # =========================================================================
+    
+    async def record_jupiter_operation(self, operation: JupiterOperationData) -> int:
+        """Record Jupiter quote or swap operation - EXACT MATCH TO MAIN SCHEMA"""
+        try:
+            query = """
+                INSERT INTO jupiter_operations (
+                    operation_timestamp, operation_type, input_mint, output_mint,
+                    input_amount, output_amount, slippage_bps,
+                    actual_output_amount, price_impact_pct, fee_amount, fee_mint,
+                    route_plan, market_infos, tx_hash, success, error_message,
+                    quote_response_time_ms, swap_execution_time_ms
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                RETURNING operation_id
+            """
+            
+            async with self.pg_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    query,
+                    operation.operation_timestamp, operation.operation_type,
+                    operation.input_mint, operation.output_mint, operation.input_amount,
+                    operation.output_amount, operation.slippage_bps,
+                    operation.actual_output_amount, operation.price_impact_pct, operation.fee_amount, operation.fee_mint,
+                    json.dumps(operation.route_plan) if operation.route_plan else None,
+                    json.dumps(operation.market_infos) if operation.market_infos else None,
+                    operation.tx_hash, operation.success, operation.error_message,
+                    operation.quote_response_time_ms, operation.swap_execution_time_ms
+                )
+            
+            operation_id = row['operation_id']
+            self.logger.debug(f"Recorded Jupiter operation {operation_id}: {operation.operation_type} "
+                            f"({operation.input_mint[:8]}... → {operation.output_mint[:8]}...)")
+            return operation_id
+            
+        except Exception as e:
+            self.logger.error(f"Failed to record Jupiter operation: {e}")
+            raise DatabaseOperationError(f"Failed to record Jupiter operation: {e}")
+    
+    async def get_jupiter_operations_by_trade(self, trade_id: int) -> List[Dict[str, Any]]:
+        """Get all Jupiter operations for a specific trade - EXACT MATCH TO MAIN SCHEMA"""
+        try:
+            query = """
+                SELECT * FROM jupiter_operations 
+                WHERE operation_timestamp >= NOW() - INTERVAL '24 hours'
+                ORDER BY operation_timestamp ASC
+            """
+            
+            async with self.pg_pool.acquire() as conn:
+                rows = await conn.fetch(query)
+            
+            operations = []
+            for row in rows:
+                operation = dict(row)
+                # Parse JSON fields
+                if operation.get('route_plan'):
+                    operation['route_plan'] = json.loads(operation['route_plan'])
+                if operation.get('market_infos'):
+                    operation['market_infos'] = json.loads(operation['market_infos'])
+                operations.append(operation)
+            
+            return operations
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get Jupiter operations: {e}")
+            raise DatabaseOperationError(f"Failed to get Jupiter operations: {e}")
+    
+    # =========================================================================
+    # EMERGENCY EVENTS
+    # =========================================================================
+    
+    async def record_emergency_event(self, event: EmergencyEventData) -> int:
+        """Record emergency event - EXACT MATCH TO MAIN SCHEMA"""
+        try:
+            query = """
+                INSERT INTO emergency_events (
+                    event_timestamp, event_type, severity, token_id,
+                    trigger_condition, current_metrics, threshold_breached,
+                    action_taken, positions_affected, total_value_affected_usdc,
+                    action_successful, execution_time_ms, tx_hashes,
+                    resolved_timestamp, resolution_method
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                RETURNING event_id
+            """
+            
+            async with self.pg_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    query,
+                    event.event_timestamp, event.event_type, event.severity, event.token_id,
+                    json.dumps(event.trigger_condition) if event.trigger_condition else None,
+                    json.dumps(event.current_metrics) if event.current_metrics else None,
+                    json.dumps(event.threshold_breached) if event.threshold_breached else None,
+                    event.action_taken, event.positions_affected, event.total_value_affected_usdc,
+                    event.action_successful, event.execution_time_ms, event.tx_hashes,
+                    event.resolved_timestamp, event.resolution_method
+                )
+            
+            event_id = row['event_id']
+            self.logger.critical(f"Recorded emergency event {event_id}: {event.event_type} "
+                               f"(severity: {event.severity}, action: {event.action_taken})")
+            return event_id
+            
+        except Exception as e:
+            self.logger.error(f"Failed to record emergency event: {e}")
+            raise DatabaseOperationError(f"Failed to record emergency event: {e}")
+    
+    async def get_emergency_events_today(self) -> List[Dict[str, Any]]:
+        """Get all emergency events for today - EXACT MATCH TO MAIN SCHEMA"""
+        try:
+            query = """
+                SELECT * FROM emergency_events 
+                WHERE event_timestamp >= CURRENT_DATE 
+                ORDER BY event_timestamp DESC
+            """
+            
+            async with self.pg_pool.acquire() as conn:
+                rows = await conn.fetch(query)
+            
+            return [dict(row) for row in rows]
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get today's emergency events: {e}")
+            raise DatabaseOperationError(f"Failed to get emergency events: {e}")
+
+    async def get_recent_portfolio_cycles(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recent portfolio cycles - EXACT MATCH TO MAIN SCHEMA"""
+        try:
+            query = """
+                SELECT cycle_id, cycle_timestamp, tokens_analyzed, signals_generated,
+                       buy_signals, sell_signals, trades_executed, cycle_status,
+                       portfolio_risk_score, total_portfolio_value_usdc, execution_priority,
+                       max_position_size_pct, diversification_score, correlation_risk,
+                       total_cycle_duration_ms, error_message
+                FROM portfolio_cycles
+                ORDER BY cycle_timestamp DESC
+                LIMIT $1
+            """
+            
+            async with self.pg_pool.acquire() as conn:
+                rows = await conn.fetch(query, limit)
+                
+            return [dict(row) for row in rows]
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get recent portfolio cycles: {e}")
+            return []
+
+    async def get_recent_jupiter_operations(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recent Jupiter operations"""
+        try:
+            query = """
+                SELECT operation_id, operation_timestamp, operation_type, input_mint, output_mint,
+                       input_amount, output_amount, slippage_bps, price_impact_pct,
+                       success, error_message, quote_response_time_ms, swap_execution_time_ms, tx_hash
+                FROM jupiter_operations
+                ORDER BY operation_timestamp DESC
+                LIMIT $1
+            """
+            
+            async with self.pg_pool.acquire() as conn:
+                rows = await conn.fetch(query, limit)
+                
+            return [dict(row) for row in rows]
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get recent Jupiter operations: {e}")
+            return []
+
+    async def get_recent_emergency_events(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recent emergency events"""
+        try:
+            query = """
+                SELECT event_id, event_timestamp, event_type, severity, token_id,
+                       trigger_condition, action_taken, positions_affected,
+                       total_value_affected_usdc, action_successful, resolved_timestamp
+                FROM emergency_events
+                ORDER BY event_timestamp DESC
+                LIMIT $1
+            """
+            
+            async with self.pg_pool.acquire() as conn:
+                rows = await conn.fetch(query, limit)
+                
+            return [dict(row) for row in rows]
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get recent emergency events: {e}")
+            return []
+
+    async def get_trading_performance_summary(self, start_time: datetime, end_time: datetime) -> Dict[str, Any]:
+        """Get trading performance summary for a time period"""
+        try:
+            query = """
+                SELECT 
+                    COUNT(*) as total_trades,
+                    COUNT(CASE WHEN trade_type = 'buy' THEN 1 END) as buy_trades,
+                    COUNT(CASE WHEN trade_type = 'sell' THEN 1 END) as sell_trades,
+                    SUM(value_usdc) as total_volume_usdc,
+                    AVG(signal_confidence) as avg_confidence,
+                    AVG(slippage_bps) as avg_slippage_bps,
+                    AVG(processing_time_ms) as avg_execution_time_ms,
+                    COUNT(DISTINCT cycle_timestamp) as unique_cycles
+                FROM trades
+                WHERE execution_time >= $1 AND execution_time <= $2
+                  AND cycle_timestamp IS NOT NULL
+            """
+            
+            async with self.pg_pool.acquire() as conn:
+                row = await conn.fetchrow(query, start_time, end_time)
+                
+            return dict(row) if row else {}
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get trading performance summary: {e}")
+            return {}
+
+    async def get_pending_trades(self, hours_back: int = 1) -> List[Dict[str, Any]]:
+        """Get trades that need verification (pending status)"""
+        try:
+            cutoff_time = datetime.utcnow() - timedelta(hours=hours_back)
+            
+            query = """
+                SELECT trade_id, tx_hash, execution_time, token_id, trade_type, value_usdc
+                FROM trades 
+                WHERE execution_time >= $1 
+                  AND tx_hash IS NOT NULL 
+                  AND tx_hash != ''
+                  AND (
+                      -- No execution status recorded yet (assuming we add this column)
+                      execution_status IS NULL
+                      -- Or status is still pending
+                      OR execution_status = 'pending'
+                  )
+                ORDER BY execution_time DESC
+            """
+            
+            async with self.pg_pool.acquire() as conn:
+                rows = await conn.fetch(query, cutoff_time)
+                
+            return [dict(row) for row in rows]
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get pending trades: {e}")
+            return []
+
+    async def update_trade_status(self, trade_id: int, update_data: Dict[str, Any]) -> bool:
+        """Update trade status with verification results"""
+        try:
+            # Build dynamic update query
+            set_clauses = []
+            values = []
+            param_count = 1
+            
+            for key, value in update_data.items():
+                set_clauses.append(f"{key} = ${param_count}")
+                values.append(value)
+                param_count += 1
+            
+            if not set_clauses:
+                return False
+            
+            values.append(trade_id)  # For WHERE clause
+            
+            query = f"""
+                UPDATE trades 
+                SET {', '.join(set_clauses)}
+                WHERE trade_id = ${param_count}
+            """
+            
+            async with self.pg_pool.acquire() as conn:
+                result = await conn.execute(query, *values)
+                
+                # Check if any rows were updated
+                rows_affected = int(result.split()[-1]) if result and 'UPDATE' in result else 0
+                
+                if rows_affected > 0:
+                    self.logger.debug(f"✅ Updated trade {trade_id} with verification data")
+                    return True
+                else:
+                    self.logger.warning(f"⚠️ No rows updated for trade {trade_id}")
+                    return False
+                
+        except Exception as e:
+            self.logger.error(f"Failed to update trade status for {trade_id}: {e}")
+            return False
+
+    async def update_trade_jupiter_operation(self, trade_id: int, jupiter_operation_id: int) -> bool:
+        """Update trade with Jupiter operation ID"""
+        try:
+            query = """
+                UPDATE trades 
+                SET jupiter_operation_id = $2
+                WHERE trade_id = $1
+            """
+            
+            async with self.pg_pool.acquire() as conn:
+                result = await conn.execute(query, trade_id, jupiter_operation_id)
+                
+            return "UPDATE 1" in result
+            
+        except Exception as e:
+            self.logger.error(f"Failed to update trade {trade_id} with Jupiter operation {jupiter_operation_id}: {e}")
+            return False
     
     # =========================================================================
     # MODEL PREDICTION OPERATIONS
@@ -1129,6 +1641,23 @@ class ProductionDBManager:
         except Exception as e:
             self.logger.error(f"Failed to get social data by symbol {symbol}: {e}")
             return []
+    async def health_check(self) -> bool:
+        """Perform a health check on database connections"""
+        try:
+            # Test PostgreSQL connection
+            async with self.pg_pool.acquire() as conn:
+                result = await conn.fetchval("SELECT 1")
+                assert result == 1
+            
+            # Test Redis connection
+            await self.redis_client.ping()
+            
+            self.logger.debug("Database health check passed")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Database health check failed: {e}")
+            return False
     
     async def record_health_check(self, component: str, status: str, details: Dict = None):
         """Record system health check"""

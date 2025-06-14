@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from typing import List, Dict, Optional, Union, Any
 
 from .db import init_db, get_session, Token, OHLCV, Feature, TradeRecord, ModelPrediction, ModelEvaluation
-from src.utils.logger import log_manager
+from ..utils.logger import log_manager
 
 # Initialize logger
 logger = log_manager.get_logger("database_utils")

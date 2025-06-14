@@ -19,14 +19,14 @@ from decimal import Decimal, ROUND_HALF_UP
 import json
 from enum import Enum
 
-from src.database.production_db import (
+from ..database.production_db import (
     ProductionDBManager,
     PositionData,
     TradeData,
     get_db_manager
 )
-from src.data.realtime_storage import RealtimeDataStorage, PositionTrigger
-from src.config.config import config
+from ..data.realtime_storage import RealtimeDataStorage, PositionTrigger
+from ..config.config import config
 
 
 class PositionStatus(Enum):

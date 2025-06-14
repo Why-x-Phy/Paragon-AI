@@ -11,13 +11,13 @@ from enum import Enum
 import matplotlib.pyplot as plt
 import tensorflow as tf
 
-from src.data.birdeye_api import BirdEyeAPI
-from src.data.data_processor import DataProcessor
-from src.model.ml_model import MLModel
-from src.trading.wallet import SolanaWallet
-from src.config.config import config
-from src.utils.logger import log_manager
-from src.database.utils import (
+from ..data.birdeye_api import BirdEyeAPI
+from ..data.data_processor import DataProcessor
+from ..model.ml_model import MLModel
+from .wallet import SolanaWallet
+from ..config.config import config
+from ..utils.logger import log_manager
+from ..database.utils import (
     record_trade,
     record_prediction,
     update_prediction_actual_price,

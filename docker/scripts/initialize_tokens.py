@@ -10,6 +10,10 @@ import json
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
+
+# Load environment variables from .env.dev file
+load_dotenv('../.env.dev')
 
 def get_env_var(name, required=True):
     """Get environment variable with optional requirement check"""
@@ -57,21 +61,21 @@ def connect_to_database():
 def insert_token(cursor, address, token_data):
     """Insert or update a single token in the database"""
     try:
-        # Extract token fields
-        symbol = token_data.get('symbol', 'UNKNOWN')
-        name = token_data.get('name', 'Unknown Token')
+        # Extract token fields with proper string trimming
+        symbol = (token_data.get('symbol', 'UNKNOWN') or 'UNKNOWN').strip()
+        name = (token_data.get('name', 'Unknown Token') or 'Unknown Token').strip()
         decimals = token_data.get('decimals', 9)
         
-        # Extract extensions (metadata)
+        # Extract extensions (metadata) with proper string trimming
         extensions = token_data.get('extensions') or {}
-        coingecko_id = extensions.get('coingecko_id')
-        website = extensions.get('website')
-        twitter = extensions.get('twitter')
-        discord = extensions.get('discord')
-        telegram = extensions.get('telegram')
-        description = extensions.get('description')
+        coingecko_id = (extensions.get('coingecko_id') or '').strip() or None
+        website = (extensions.get('website') or '').strip() or None
+        twitter = (extensions.get('twitter') or '').strip() or None
+        discord = (extensions.get('discord') or '').strip() or None
+        telegram = (extensions.get('telegram') or '').strip() or None
+        description = (extensions.get('description') or '').strip() or None
         
-        logo_uri = token_data.get('logo_uri')
+        logo_uri = (token_data.get('logo_uri') or '').strip() or None
         
         # SQL INSERT with ON CONFLICT UPDATE
         sql = """

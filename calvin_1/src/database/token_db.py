@@ -11,7 +11,7 @@ import sqlite3
 from typing import Dict, Optional, List, Tuple
 import logging
 
-from src.utils.logger import log_manager
+from ..utils.logger import log_manager
 
 # Set up logger
 logger = log_manager.get_logger("token_db")

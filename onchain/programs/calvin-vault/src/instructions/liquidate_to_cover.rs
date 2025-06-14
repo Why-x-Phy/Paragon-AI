@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Token, TokenAccount, Mint};
 
-use crate::{state::*, constants::*, utils, ErrorCode};
+use crate::{state::*, constants::*, utils, errors::VaultError};
 
 #[derive(Accounts)]
 pub struct LiquidateToCover<'info> {
@@ -12,7 +12,7 @@ pub struct LiquidateToCover<'info> {
     /// The vault account
     #[account(
         mut,
-        constraint = !vault.paused @ ErrorCode::VaultPaused,
+        constraint = !vault.paused @ VaultError::VaultPaused,
     )]
     pub vault: Account<'info, Vault>,
 

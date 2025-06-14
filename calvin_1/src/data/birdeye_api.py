@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Union, Any
 import os
 
-from src.config.config import config
-from src.utils.logger import log_manager
+from ..config.config import config
+from ..utils.logger import log_manager
 
 logger = log_manager.get_logger("birdeye_api")
 

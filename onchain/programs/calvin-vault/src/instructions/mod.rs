@@ -7,6 +7,7 @@ pub mod liquidate_to_cover;
 pub mod set_pause_status;
 pub mod update_config;
 pub mod get_user_vault_shares;
+pub mod initialize_token_accounts;
 
 // Re-export everything from each module
 pub use initialize::*;
@@ -17,3 +18,4 @@ pub use liquidate_to_cover::*;
 pub use set_pause_status::*;
 pub use update_config::*;
 pub use get_user_vault_shares::*;
+pub use initialize_token_accounts::*;

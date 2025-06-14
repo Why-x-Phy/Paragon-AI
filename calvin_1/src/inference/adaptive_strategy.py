@@ -23,11 +23,11 @@ import os
 from collections import defaultdict, deque
 
 # Local imports
-from src.config.config import config
-from src.utils.logger import log
-from src.inference.strategy_engine import SimpleStrategyEngine, TradingSignal, SignalType, SignalStrength
-from src.inference.portfolio_coordinator import PortfolioCoordinator, get_portfolio_coordinator
-from src.database.production_db import get_db_manager
+from ..config.config import config
+from ..utils.logger import log
+from .strategy_engine import SimpleStrategyEngine, TradingSignal, SignalType, SignalStrength
+from .portfolio_coordinator import PortfolioCoordinator, get_portfolio_coordinator
+from ..database.production_db import get_db_manager
 import redis
 
 # Configure logging
@@ -60,7 +60,7 @@ class StrategyParameters:
     symbol: str
     buy_threshold: float = 2.0     # % predicted increase to trigger buy
     sell_threshold: float = 3.0    # % predicted decrease to trigger sell
-    confidence_threshold: float = 0.70  # Minimum prediction confidence
+    confidence_threshold: float = 0.10  # Minimal threshold - strategy thresholds are primary
     position_size_pct: float = 10.0     # Position size as % of portfolio
     
     # Adaptation ranges
@@ -68,8 +68,8 @@ class StrategyParameters:
     max_buy_threshold: float = 5.0
     min_sell_threshold: float = 1.0
     max_sell_threshold: float = 8.0
-    min_confidence: float = 0.50
-    max_confidence: float = 0.90
+    min_confidence: float = 0.05  # Very low minimum
+    max_confidence: float = 0.20  # Low maximum - strategy thresholds are primary
     
     # Performance tracking
     total_signals: int = 0

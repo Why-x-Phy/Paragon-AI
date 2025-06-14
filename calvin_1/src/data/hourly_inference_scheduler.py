@@ -1,11 +1,11 @@
 """
 Calvin AI Hourly Inference Data Scheduler
 
-Wraps existing data fetching scripts with cron job scheduling for model inference:
-- Leverages fetch_historical_data.py for OHLCV data
-- Leverages fetch_social_data.py for sentiment data  
-- Adds intelligent scheduling and coordination
-- Prepares data for FastDQN model inference
+Enhanced for Phase 3.2: Vault Trading Integration
+- Integrates existing data fetching with portfolio signal generation
+- Executes vault trades based on LSTM predictions and portfolio coordination
+- Stores vault trading cycle data in TimescaleDB for monitoring and analysis
+- Fetches social data hourly to maintain model feature consistency (~70 social features)
 """
 
 import asyncio
@@ -33,8 +33,8 @@ class InferenceScheduleConfig:
     ohlcv_lookback_hours: int = 24   # Get last 24 hours of data
     ohlcv_resolution: str = "1H"     # Hourly resolution for inference
     
-    # Social data settings  
-    social_interval_minutes: int = 180  # Fetch every 3 hours
+    # Social data settings - UPDATED for Phase 3.2
+    social_interval_minutes: int = 60   # CHANGED: Fetch every hour (was 180) for model feature consistency
     social_lookback_days: int = 7      # Get last week of social data
     social_resolution: str = "1d"      # Daily social data
     
@@ -45,17 +45,20 @@ class InferenceScheduleConfig:
     max_retries: int = 3
     retry_delay_minutes: int = 5
     health_check_interval_minutes: int = 15
+    
+    # NEW: Trading execution settings
+    min_viable_tokens: int = 5  # Minimum tokens ready for inference to trigger trading
 
 
 class HourlyInferenceScheduler:
     """
-    Coordinates scheduled data fetching for model inference
+    Enhanced Inference Scheduler with Vault Trading Integration (Phase 3.2)
     
-    Uses existing proven scripts:
-    - fetch_historical_data.py for OHLCV data
-    - fetch_social_data.py for sentiment data
-    
-    Adds scheduling, coordination, and error handling.
+    Coordinates scheduled data fetching for model inference AND executes vault trades:
+    - Uses existing proven scripts for data fetching
+    - Integrates with portfolio coordinator for signal generation  
+    - Executes trades through Calvin vault smart contracts
+    - Records all trading cycle data in TimescaleDB
     """
     
     def __init__(self, config: Optional[InferenceScheduleConfig] = None, db_manager: Optional[ProductionDBManager] = None):
@@ -79,13 +82,16 @@ class HourlyInferenceScheduler:
         self.scheduler_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         
-        # Statistics
+        # Statistics - ENHANCED for Phase 3.2
         self.stats = {
             'ohlcv_runs': 0,
             'social_runs': 0,
+            'inference_trading_cycles': 0,  # NEW: Track complete cycles
+            'vault_trades_executed': 0,     # NEW: Track vault trades
             'total_errors': 0,
             'last_ohlcv_run': None,
             'last_social_run': None,
+            'last_trading_cycle': None,     # NEW: Track last complete cycle
             'start_time': datetime.utcnow()
         }
         
@@ -129,7 +135,7 @@ class HourlyInferenceScheduler:
             ]
     
     def start_scheduler(self):
-        """Start the inference data scheduler"""
+        """Start the enhanced inference data scheduler with vault trading"""
         if self.is_running:
             self.logger.warning("Inference scheduler already running")
             return
@@ -138,33 +144,36 @@ class HourlyInferenceScheduler:
             self.is_running = True
             self.stop_event.clear()
             
-            # Schedule OHLCV data fetching
+            # UPDATED: Schedule complete inference + trading cycle instead of just OHLCV
             schedule.every(self.config.ohlcv_interval_minutes).minutes.do(
-                self._run_ohlcv_fetch
+                self._run_inference_and_trading_cycle_wrapper
             )
             
-            # Schedule social data fetching
+            # UPDATED: Social data now fetched every hour (same as OHLCV)
             schedule.every(self.config.social_interval_minutes).minutes.do(
                 self._run_social_fetch
             )
             
-            # Schedule health checks
+            # Health checks remain the same
             schedule.every(self.config.health_check_interval_minutes).minutes.do(
                 self._run_health_check
             )
             
-            # Run initial data fetch
-            self._run_ohlcv_fetch()
+            # Run initial cycle
+            self._run_inference_and_trading_cycle_wrapper()
             
             # Start scheduler thread
             self.scheduler_thread = threading.Thread(target=self._scheduler_loop)
             self.scheduler_thread.daemon = True
             self.scheduler_thread.start()
             
-            self.logger.info(f"Inference scheduler started (OHLCV: {self.config.ohlcv_interval_minutes}min, Social: {self.config.social_interval_minutes}min)")
+            self.logger.info(f"🚀 Enhanced inference scheduler started with vault trading")
+            self.logger.info(f"⏰ OHLCV + Trading: {self.config.ohlcv_interval_minutes}min")
+            self.logger.info(f"📊 Social data: {self.config.social_interval_minutes}min (hourly for model features)")
+            self.logger.info(f"🔍 Health checks: {self.config.health_check_interval_minutes}min")
             
         except Exception as e:
-            self.logger.error(f"Failed to start inference scheduler: {e}")
+            self.logger.error(f"Failed to start enhanced scheduler: {e}")
             self.is_running = False
             raise
     
@@ -867,6 +876,239 @@ class HourlyInferenceScheduler:
             'social_interval_minutes': self.config.social_interval_minutes,
             'is_running': self.is_running
         }
+
+    async def run_inference_and_trading_cycle(self):
+        """
+        Complete cycle: data → inference → vault execution (Phase 3.2)
+        
+        This is the main integration method that:
+        1. Prepares inference data using existing pipeline
+        2. Generates portfolio signals via portfolio coordinator
+        3. Executes vault trades based on signals
+        4. Records all data in TimescaleDB
+        """
+        cycle_start_time = datetime.utcnow()
+        
+        try:
+            self.logger.info("🚀 Starting inference and trading cycle")
+            
+            # 1. Prepare inference data (EXISTING FUNCTIONALITY)
+            self.logger.info("📊 Preparing batch inference data...")
+            inference_data = await self.prepare_batch_inference_data()
+            ready_tokens = [addr for addr, data in inference_data.items() 
+                           if data.get('ready_for_inference', False)]
+            
+            if len(ready_tokens) < self.config.min_viable_tokens:
+                self.logger.warning(f"⚠️ Insufficient tokens ready for inference: {len(ready_tokens)}/{self.config.min_viable_tokens}")
+                await self._record_vault_trading_cycle(None, [], "insufficient_tokens", cycle_start_time)
+                return
+            
+            self.logger.info(f"✅ {len(ready_tokens)} tokens ready for inference")
+            
+            # 2. Generate portfolio signals (EXISTING INTEGRATION)
+            self.logger.info("🧠 Generating portfolio signals...")
+            from ..inference.portfolio_coordinator import generate_portfolio_signals
+            portfolio_signals = await generate_portfolio_signals()
+            
+            if not portfolio_signals:
+                self.logger.info("📊 No portfolio signals generated")
+                await self._record_vault_trading_cycle(None, [], "no_signals", cycle_start_time)
+                return
+            
+            self.logger.info(f"📈 Portfolio signals generated: {len(portfolio_signals.buy_signals)} buy, {len(portfolio_signals.sell_signals)} sell")
+            
+            # 3. Execute vault trades (NEW FUNCTIONALITY)
+            trade_results = []
+            if portfolio_signals.buy_signals:
+                self.logger.info("💰 Executing vault trades...")
+                
+                try:
+                    from ..vault.trade_executor import VaultTradeExecutor
+                    executor = VaultTradeExecutor()
+                    await executor.initialize()
+                    
+                    trade_results = await executor.execute_portfolio_trades(portfolio_signals)
+                    
+                    self.logger.info(f"✅ Executed {len(trade_results)} vault trades")
+                    if trade_results:
+                        self.logger.info(f"🔗 Trade signatures: {trade_results[:3]}{'...' if len(trade_results) > 3 else ''}")
+                        
+                except ImportError:
+                    self.logger.warning("⚠️ VaultTradeExecutor not available - running in data-only mode")
+                    trade_results = []
+                except Exception as e:
+                    self.logger.error(f"❌ Vault trade execution failed: {e}")
+                    trade_results = []
+            else:
+                self.logger.info("📊 No buy signals to execute")
+            
+            # 4. Record successful trading cycle in database
+            await self._record_vault_trading_cycle(portfolio_signals, trade_results, "completed", cycle_start_time)
+            
+            # Update statistics
+            self.stats['inference_trading_cycles'] += 1
+            self.stats['vault_trades_executed'] += len(trade_results)
+            self.stats['last_trading_cycle'] = cycle_start_time
+            
+            cycle_duration = (datetime.utcnow() - cycle_start_time).total_seconds()
+            self.logger.info(f"🏁 Inference and trading cycle completed in {cycle_duration:.1f}s")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Inference and trading cycle failed: {e}")
+            
+            # Record error for monitoring
+            await self._record_health_check('trading_cycle', 'error', {'error': str(e)})
+            await self._record_vault_trading_cycle(None, [], "error", cycle_start_time, str(e))
+
+    async def _record_vault_trading_cycle(self, signals, results: List[str], status: str, 
+                                        cycle_start: datetime, error: str = None):
+        """
+        Record trading cycle results in TimescaleDB using enhanced portfolio_cycles table
+        
+        Args:
+            signals: PortfolioSignal object or None
+            results: List of transaction signatures
+            status: Cycle status ('completed', 'no_signals', 'insufficient_tokens', 'error')
+            cycle_start: Cycle start timestamp
+            error: Error message if status is 'error'
+        """
+        try:
+            # Create PortfolioCycleData object for database recording
+            from ..database.production_db import PortfolioCycleData
+            
+            cycle_duration = (datetime.utcnow() - cycle_start).total_seconds()
+            
+            # Extract portfolio metrics from signals if available
+            portfolio_risk_score = None
+            portfolio_value = None
+            diversification_score = None
+            max_position_pct = None
+            
+            if signals:
+                portfolio_risk_score = getattr(signals, 'portfolio_risk_score', None)
+                portfolio_value = getattr(signals, 'portfolio_value', None)
+                
+                # Calculate diversification metrics from asset allocations
+                if hasattr(signals, 'asset_allocations') and signals.asset_allocations:
+                    allocations = list(signals.asset_allocations.values())
+                    max_position_pct = max(alloc.target_exposure_pct for alloc in allocations) if allocations else None
+                    
+                    # Simple diversification score: inverse of concentration
+                    if len(allocations) > 1:
+                        concentration = sum(alloc.target_exposure_pct ** 2 for alloc in allocations) / 100
+                        diversification_score = max(0, 100 - concentration)
+            
+            portfolio_cycle = PortfolioCycleData(
+                cycle_timestamp=cycle_start,
+                # Cycle metrics - CORRECTED FIELD NAMES
+                tokens_analyzed=len(self.config.active_tokens) if hasattr(self, 'config') else 0,
+                signals_generated=len(signals.buy_signals + signals.sell_signals) if signals else 0,
+                buy_signals=len(signals.buy_signals) if signals else 0,
+                sell_signals=len(signals.sell_signals) if signals else 0,
+                trades_executed=len(results),
+                # Portfolio risk assessment - CORRECTED FIELD NAMES
+                portfolio_risk_score=portfolio_risk_score,
+                max_position_size_pct=max_position_pct,
+                diversification_score=diversification_score,
+                correlation_risk=None,  # TODO: Calculate correlation risk
+                # Performance metrics - CORRECTED FIELD NAMES
+                total_portfolio_value_usdc=portfolio_value,
+                available_cash_usdc=None,  # TODO: Get from vault state
+                execution_priority=getattr(signals, 'execution_priority', None) if signals else None,
+                # Execution timing - CORRECTED FIELD NAMES
+                data_fetch_duration_ms=None,  # TODO: Track timing
+                inference_duration_ms=None,   # TODO: Track timing
+                signal_processing_duration_ms=None,  # TODO: Track timing
+                trade_execution_duration_ms=None,    # TODO: Track timing
+                total_cycle_duration_ms=int(cycle_duration * 1000),  # Convert to milliseconds
+                # Status and metadata - CORRECTED FIELD NAMES
+                cycle_status=status,  # CORRECTED: was 'status'
+                error_message=error
+            )
+            
+            # Record in enhanced portfolio_cycles table
+            if self.db_manager:
+                cycle_id = await self.db_manager.record_portfolio_cycle(portfolio_cycle)
+                self.logger.debug(f"✅ Recorded portfolio cycle {cycle_id} in database")
+            
+            # Also record in system health for monitoring compatibility
+            cycle_summary = {
+                'cycle_id': getattr(portfolio_cycle, 'cycle_id', None),
+                'timestamp': cycle_start,
+                'duration_seconds': cycle_duration,
+                'status': status,
+                'signals_generated': portfolio_cycle.signals_generated,
+                'trades_executed': len(results),
+                'portfolio_risk_score': portfolio_risk_score,
+                'error_message': error
+            }
+            
+            await self._record_health_check('vault_trading_cycle', 
+                                           'healthy' if status == 'completed' else 'degraded', 
+                                           cycle_summary)
+            
+            # Record individual trade executions for monitoring
+            if results:
+                for i, tx_sig in enumerate(results):
+                    trade_data = {
+                        'cycle_timestamp': cycle_start,
+                        'trade_index': i,
+                        'transaction_signature': tx_sig,
+                        'status': 'executed'
+                    }
+                    await self._record_health_check('vault_trade_execution', 'healthy', trade_data)
+            
+        except Exception as e:
+            self.logger.error(f"❌ Failed to record trading cycle: {e}")
+            # Fallback to basic health check recording
+            try:
+                await self._record_health_check('vault_trading_cycle', 'error', {
+                    'timestamp': cycle_start,
+                    'status': status,
+                    'error': str(e),
+                    'original_error': error
+                })
+            except Exception as fallback_error:
+                self.logger.error(f"❌ Fallback recording also failed: {fallback_error}")
+
+    def _run_inference_and_trading_cycle_wrapper(self):
+        """Thread-safe wrapper for async trading cycle"""
+        try:
+            # Run the async method in the event loop
+            asyncio.create_task(self.run_inference_and_trading_cycle())
+        except Exception as e:
+            self.logger.error(f"Trading cycle wrapper error: {e}")
+
+    async def start_async(self):
+        """Async version of start_scheduler for integration"""
+        await self.initialize()
+        self.start_scheduler()
+
+    async def stop_async(self):
+        """Async version of stop_scheduler for integration"""
+        self.stop_scheduler()
+
+    def get_enhanced_statistics(self) -> Dict[str, Any]:
+        """Get enhanced statistics including vault trading metrics"""
+        base_stats = self.get_statistics()
+        
+        # Add vault trading metrics
+        base_stats.update({
+            'vault_trading': {
+                'total_cycles': self.stats['inference_trading_cycles'],
+                'total_trades': self.stats['vault_trades_executed'],
+                'last_cycle': self.stats['last_trading_cycle'].isoformat() if self.stats['last_trading_cycle'] else None,
+                'avg_trades_per_cycle': (
+                    self.stats['vault_trades_executed'] / max(1, self.stats['inference_trading_cycles'])
+                ),
+                'cycles_per_hour': (
+                    self.stats['inference_trading_cycles'] / 
+                    max(1, (datetime.utcnow() - self.stats['start_time']).total_seconds() / 3600)
+                )
+            }
+        })
+        
+        return base_stats
 
 
 # =============================================================================

@@ -41,10 +41,10 @@ except ImportError:
     tf = None
 
 # Local imports - leveraging existing components
-from src.config.config import config
-from src.utils.logger import log_manager, log
-from src.data.data_processor import DataProcessor
-from src.model.profit_functions import simple_backtest_strategy
+from ..config.config import config
+from ..utils.logger import log_manager, log
+from ..data.data_processor import DataProcessor
+from ..model.profit_functions import simple_backtest_strategy
 
 logger = log
 
@@ -56,10 +56,14 @@ class ModelMetadata:
     model_type: str
     created_at: datetime
     last_used: Optional[datetime]
-    version: str
+    version: str  # Date version (YYYYMMDD) - maintained for backward compatibility
     input_shape: Tuple[int, int]
     sequence_length: int
     prediction_horizon: int
+    
+    # Enhanced versioning
+    semantic_version: Optional[str] = None  # vMAJOR.MINOR.PATCH (e.g., "v1.0.0")
+    is_legacy: bool = True  # True for old naming format, False for new
     
     # Performance metrics
     mse: Optional[float] = None
@@ -70,7 +74,7 @@ class ModelMetadata:
     # Strategy parameters
     buy_threshold: float = 0.02  # Default 2%
     sell_threshold: float = 0.03  # Default 3%
-    confidence_threshold: float = 0.70
+    confidence_threshold: float = 0.10  # Minimal threshold
     
     # Model hash for integrity checking
     model_hash: Optional[str] = None
@@ -155,16 +159,98 @@ class LSTMModelRegistry:
         
         logger.info(f"Registry initialization complete. {len(self._metadata_cache)} models registered.")
 
+    def register_new_model(self, model_path: str, symbol: str, semantic_version: str, 
+                          model_type: str = "lstm", **kwargs) -> bool:
+        """
+        Register a newly trained model with semantic versioning
+        
+        Args:
+            model_path: Path to the .h5 model file
+            symbol: Token symbol
+            semantic_version: Semantic version (e.g., "v1.0.0")
+            model_type: Model type (default: "lstm")
+            **kwargs: Additional metadata fields
+            
+        Returns:
+            True if registration successful, False otherwise
+        """
+        if not HAS_TENSORFLOW:
+            logger.error("TensorFlow not available")
+            return False
+            
+        try:
+            model_path_obj = Path(model_path)
+            if not model_path_obj.exists():
+                logger.error(f"Model file not found: {model_path}")
+                return False
+            
+            # Load model to get input shape
+            model = tf.keras.models.load_model(str(model_path))
+            input_shape = model.input_shape[1:]  # Remove batch dimension
+            sequence_length = input_shape[0] if len(input_shape) > 0 else 0
+            
+            # Extract date from filename or use current date
+            filename = model_path_obj.stem
+            parsed = self._parse_model_filename(filename)
+            date_version = parsed['date_version'] if parsed else datetime.now().strftime('%Y%m%d')
+            
+            # Create metadata
+            metadata = ModelMetadata(
+                model_path=str(model_path),
+                symbol=symbol,
+                model_type=model_type,
+                created_at=datetime.fromtimestamp(model_path_obj.stat().st_mtime),
+                last_used=None,
+                version=date_version,
+                semantic_version=semantic_version,
+                is_legacy=False,  # New format
+                input_shape=input_shape,
+                sequence_length=sequence_length,
+                prediction_horizon=kwargs.get('prediction_horizon', 1),
+                mse=kwargs.get('mse'),
+                mae=kwargs.get('mae'),
+                rmse=kwargs.get('rmse'),
+                direction_accuracy=kwargs.get('direction_accuracy'),
+                model_hash=self._calculate_model_hash(model_path_obj),
+                buy_threshold=kwargs.get('buy_threshold', 0.02),
+                sell_threshold=kwargs.get('sell_threshold', 0.03),
+                confidence_threshold=kwargs.get('confidence_threshold', 0.10)
+            )
+            
+            # Create model key
+            model_key = f"{symbol}_{semantic_version}_{date_version}"
+            
+            # Store in cache
+            self._metadata_cache[model_key] = metadata
+            
+            # Save metadata to disk
+            metadata_file = self.registry_path / f"{model_key}_metadata.json"
+            with open(metadata_file, 'w') as f:
+                json.dump(self._serialize_metadata(metadata), f, indent=2)
+            
+            logger.info(f"Registered new model: {model_key} (semantic: {semantic_version})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to register new model {model_path}: {e}")
+            return False
+
     def _register_existing_model(self, model_path: Path):
         """Register an existing .h5 model file"""
         if not HAS_TENSORFLOW:
             logger.warning("TensorFlow not available, skipping model registration")
             return
             
-        # Extract symbol from filename (e.g., "Fartcoin_lstm_20250528.h5" -> "Fartcoin")
+        # Parse filename using enhanced parser
         filename = model_path.stem
-        parts = filename.split('_')
-        symbol = parts[0] if parts else filename
+        parsed = self._parse_model_filename(filename)
+        
+        if not parsed:
+            logger.warning(f"Could not parse model filename: {filename}")
+            return
+        
+        symbol = parsed['symbol']
+        model_type = parsed['model_type']
         
         # Load model to get input shape
         try:
@@ -179,14 +265,16 @@ class LSTMModelRegistry:
                 with open(metrics_file, 'r') as f:
                     metrics = json.load(f)
             
-            # Create metadata
+            # Create metadata with enhanced versioning
             metadata = ModelMetadata(
                 model_path=str(model_path),
                 symbol=symbol,
-                model_type="lstm",
+                model_type=model_type,
                 created_at=datetime.fromtimestamp(model_path.stat().st_mtime),
                 last_used=None,
-                version=self._extract_version_from_filename(filename),
+                version=parsed['date_version'],  # Date version for backward compatibility
+                semantic_version=parsed['semantic_version'],  # New semantic version
+                is_legacy=parsed['is_legacy'],  # Track format type
                 input_shape=input_shape,
                 sequence_length=sequence_length,
                 prediction_horizon=1,  # Default, can be updated
@@ -197,8 +285,14 @@ class LSTMModelRegistry:
                 model_hash=self._calculate_model_hash(model_path)
             )
             
+            # Create model key (maintain backward compatibility)
+            if parsed['is_legacy']:
+                model_key = f"{symbol}_{metadata.version}"
+            else:
+                # For new format, include semantic version in key for uniqueness
+                model_key = f"{symbol}_{metadata.semantic_version}_{metadata.version}"
+            
             # Store in cache
-            model_key = f"{symbol}_{metadata.version}"
             self._metadata_cache[model_key] = metadata
             
             # Save metadata to disk
@@ -206,15 +300,76 @@ class LSTMModelRegistry:
             with open(metadata_file, 'w') as f:
                 json.dump(self._serialize_metadata(metadata), f, indent=2)
             
-            logger.info(f"Registered model: {model_key} (symbol: {symbol})")
+            logger.info(f"Registered model: {model_key} (symbol: {symbol}, legacy: {parsed['is_legacy']})")
             
         except Exception as e:
             logger.error(f"Failed to load model {model_path}: {e}")
 
-    def _extract_version_from_filename(self, filename: str) -> str:
-        """Extract version/date from model filename"""
+    def _parse_model_filename(self, filename: str) -> Dict[str, Any]:
+        """
+        Parse both legacy and new model filename formats
+        
+        Supports:
+        - Legacy: symbol_modeltype_YYYYMMDD.h5 (e.g., "Fartcoin_lstm_20250614.h5")
+        - New: symbol_modeltype_vMAJOR.MINOR.PATCH_YYYYMMDD.h5 (e.g., "Fartcoin_lstm_v1.0.0_20250614.h5")
+        
+        Returns:
+            Dict with parsed components or None if invalid format
+        """
         parts = filename.split('_')
-        # Look for date pattern (YYYYMMDD)
+        
+        if len(parts) < 3:
+            return None
+        
+        symbol = parts[0]
+        model_type = parts[1]
+        
+        # Check for new format with semantic version
+        semantic_version = None
+        date_version = None
+        is_legacy = True
+        
+        # Look for semantic version pattern (vX.Y.Z)
+        for i, part in enumerate(parts[2:], 2):
+            if part.startswith('v') and '.' in part:
+                # Found semantic version
+                semantic_version = part
+                is_legacy = False
+                # Date should be the next part
+                if i + 1 < len(parts):
+                    date_candidate = parts[i + 1]
+                    if len(date_candidate) == 8 and date_candidate.isdigit():
+                        date_version = date_candidate
+                break
+        
+        # If no semantic version found, look for date in legacy format
+        if is_legacy:
+            for part in parts[2:]:
+                if len(part) == 8 and part.isdigit():
+                    date_version = part
+                    break
+        
+        # Default date if none found
+        if not date_version:
+            date_version = datetime.now().strftime('%Y%m%d')
+        
+        return {
+            'symbol': symbol,
+            'model_type': model_type,
+            'semantic_version': semantic_version,
+            'date_version': date_version,
+            'is_legacy': is_legacy,
+            'filename': filename
+        }
+
+    def _extract_version_from_filename(self, filename: str) -> str:
+        """Extract version/date from model filename (backward compatibility)"""
+        parsed = self._parse_model_filename(filename)
+        if parsed:
+            return parsed['date_version']
+        
+        # Fallback to original logic
+        parts = filename.split('_')
         for part in parts:
             if len(part) == 8 and part.isdigit():
                 return part
@@ -245,6 +400,13 @@ class LSTMModelRegistry:
             data['created_at'] = datetime.fromisoformat(data['created_at'])
         if data['last_used']:
             data['last_used'] = datetime.fromisoformat(data['last_used'])
+        
+        # Handle backward compatibility for models without new fields
+        if 'semantic_version' not in data:
+            data['semantic_version'] = None
+        if 'is_legacy' not in data:
+            data['is_legacy'] = True
+            
         return ModelMetadata(**data)
 
     def get_model(self, symbol: str, version: Optional[str] = None) -> Optional[tf.keras.Model]:
@@ -311,16 +473,45 @@ class LSTMModelRegistry:
     def _find_model_key(self, symbol: str, version: Optional[str] = None) -> Optional[str]:
         """Find the model key for a symbol and version"""
         if version:
+            # Try exact match first (backward compatibility)
             model_key = f"{symbol}_{version}"
             if model_key in self._metadata_cache:
                 return model_key
+            
+            # Try semantic version match
+            for key, metadata in self._metadata_cache.items():
+                if (metadata.symbol == symbol and 
+                    (metadata.version == version or metadata.semantic_version == version)):
+                    return key
         else:
             # Find latest version for symbol
-            symbol_models = [key for key in self._metadata_cache.keys() if key.startswith(f"{symbol}_")]
+            symbol_models = []
+            for key, metadata in self._metadata_cache.items():
+                if metadata.symbol == symbol:
+                    symbol_models.append((key, metadata))
+            
             if symbol_models:
-                # Sort by version (assuming YYYYMMDD format)
-                latest = max(symbol_models, key=lambda x: x.split('_')[-1])
-                return latest
+                # Sort by priority: new format > legacy format, then by date, then by semantic version
+                def sort_key(item):
+                    key, metadata = item
+                    # Priority: new format first, then date (newest first), then semantic version
+                    is_new = not metadata.is_legacy
+                    date_version = metadata.version
+                    semantic_parts = [0, 0, 0]  # Default for legacy
+                    
+                    if metadata.semantic_version:
+                        try:
+                            # Parse semantic version (e.g., "v1.0.2" -> [1, 0, 2])
+                            version_str = metadata.semantic_version[1:]  # Remove 'v'
+                            semantic_parts = [int(x) for x in version_str.split('.')]
+                        except (ValueError, IndexError):
+                            pass
+                    
+                    return (is_new, date_version, semantic_parts)
+                
+                # Get the highest priority model
+                latest_item = max(symbol_models, key=sort_key)
+                return latest_item[0]
         
         return None
 
@@ -419,6 +610,12 @@ class LSTMModelRegistry:
             return None
         return self._metadata_cache.get(model_key)
 
+    def get_display_version(self, metadata: ModelMetadata) -> str:
+        """Get the display version (semantic if available, otherwise date)"""
+        if metadata.semantic_version:
+            return f"{metadata.semantic_version} ({metadata.version})"
+        return metadata.version
+
     def list_models(self, symbol: Optional[str] = None) -> List[ModelMetadata]:
         """List all registered models, optionally filtered by symbol"""
         models = list(self._metadata_cache.values())
@@ -446,7 +643,7 @@ class LSTMModelRegistry:
         }
 
     def update_strategy_parameters(self, symbol: str, buy_threshold: float, 
-                                 sell_threshold: float, confidence_threshold: float = 0.70,
+                                 sell_threshold: float, confidence_threshold: float = 0.10,
                                  version: Optional[str] = None):
         """Update simple strategy parameters for a model"""
         model_key = self._find_model_key(symbol, version)
@@ -559,6 +756,10 @@ class LSTMModelRegistry:
         degraded_models = sum(1 for m in self._metadata_cache.values() 
                             if m.performance_degradation_count > 2)
         
+        # Count legacy vs new format models
+        legacy_models = sum(1 for m in self._metadata_cache.values() if m.is_legacy)
+        new_format_models = total_models - legacy_models
+        
         redis_status = "connected" if self.redis_client else "disconnected"
         try:
             if self.redis_client:
@@ -569,6 +770,8 @@ class LSTMModelRegistry:
         
         return {
             'total_models': total_models,
+            'legacy_format_models': legacy_models,
+            'new_format_models': new_format_models,
             'models_in_memory': models_in_memory,
             'degraded_models': degraded_models,
             'redis_status': redis_status,
@@ -602,3 +805,9 @@ def run_backtest(symbol: str, ohlcv_data: pd.DataFrame,
     """Convenience function to run backtest"""
     registry = get_model_registry()
     return registry.run_simple_backtest(symbol, ohlcv_data, version) 
+
+def register_model(model_path: str, symbol: str, semantic_version: str, 
+                  model_type: str = "lstm", **kwargs) -> bool:
+    """Convenience function to register a new model with semantic versioning"""
+    registry = get_model_registry()
+    return registry.register_new_model(model_path, symbol, semantic_version, model_type, **kwargs) 

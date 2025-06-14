@@ -2,8 +2,11 @@
 
 import { Check, ClipboardCopy } from "lucide-react";
 import React, { useState } from "react";
+import { motion } from 'framer-motion';
+import Image from 'next/image';
+import { X } from 'lucide-react';
 
-import { Button } from "@/components/ui/Button";
+import { Button } from "@/components/UI/Button";
 
 export function ToastContent({
   transactionSignature,

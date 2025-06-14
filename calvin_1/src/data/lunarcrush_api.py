@@ -4,8 +4,8 @@ import pandas as pd
 from typing import Dict, List, Optional, Union, Any
 from datetime import datetime, timedelta
 
-from src.config.config import config
-from src.utils.logger import log_manager
+from ..config.config import config
+from ..utils.logger import log_manager
 
 logger = log_manager.get_logger("lunarcrush_api")
 

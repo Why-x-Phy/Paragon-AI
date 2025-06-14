@@ -1,0 +1,1162 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Calvin AI Vault Trading System - Database Migration Plan
+
+## **✅ MIGRATION STATUS: COMPLETED** 
+**Completion Date**: January 11, 2025  
+**Migration Result**: All database schema enhancements successfully applied
+
+### **✅ COMPLETED ACHIEVEMENTS**
+- **Trades Table Enhanced**: Added 6 vault-specific columns with constraints and indexes
+- **Portfolio Cycles Table**: Created with TimescaleDB hypertable optimization
+- **Jupiter Operations Table**: Created with comprehensive DEX tracking
+- **Emergency Events Table**: Created with risk management event tracking
+- **Materialized Views**: 3 new views for live monitoring (trading_performance_hourly, portfolio_risk_hourly, emergency_events_daily)
+- **Helper Functions**: 3 new functions for performance summaries and analytics
+- **Database Schema Updated**: Both migration script and init schema updated for production deployment
+
+## **🔍 COMPREHENSIVE DATABASE SCHEMA ANALYSIS**
+
+### **✅ EXISTING TABLES (Well-Covered)**
+The current schema has excellent coverage for:
+- **Core Trading Data**: `tokens`, `ohlcv`, `positions`, `trades`
+- **Model Infrastructure**: `model_predictions` 
+- **Social Data**: `social_data` (comprehensive LunarCrush integration)
+- **Market Events**: `market_events` (transaction data from WebSocket)
+- **System Health**: `system_health` (basic health monitoring)
+
+### **❌ CRITICAL MISSING TABLES**
+
+## **1. TRADES TABLE ENHANCEMENTS**
+
+**Research Findings**: The existing `trades` table needs vault-specific enhancements to track all necessary information for vault trading operations.
+
+**Required Modifications**:
+```sql
+-- Add vault-specific columns to existing trades table
+ALTER TABLE trades 
+    ADD COLUMN IF NOT EXISTS signal_confidence DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS model_version VARCHAR(50),
+    ADD COLUMN IF NOT EXISTS signal_strength VARCHAR(10),
+    ADD COLUMN IF NOT EXISTS predicted_change_pct DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS cycle_timestamp TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS jupiter_operation_id INTEGER;
+
+-- Add constraints
+ALTER TABLE trades 
+    ADD CONSTRAINT check_signal_strength 
+    CHECK (signal_strength IN ('STRONG', 'MODERATE', 'WEAK'));
+
+-- Add indexes for vault trading queries
+CREATE INDEX IF NOT EXISTS idx_trades_cycle_time 
+    ON trades(cycle_timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_trades_model_version 
+    ON trades(model_version, cycle_timestamp DESC);
+```
+
+## **2. PORTFOLIO COORDINATION CYCLES TABLE**
+
+**Research Findings**: The `PortfolioCoordinator` generates comprehensive portfolio signals but these are only recorded in `system_health`. Need dedicated tracking.
+
+**Data Sources**:
+- `HourlyInferenceScheduler.run_inference_and_trading_cycle()`
+- Portfolio signals from `PortfolioCoordinator.generate_portfolio_signals()`
+
+**Required Fields**:
+```sql
+CREATE TABLE IF NOT EXISTS portfolio_cycles (
+    cycle_id SERIAL PRIMARY KEY,
+    cycle_timestamp TIMESTAMPTZ NOT NULL,        -- Cycle start time
+    cycle_duration_seconds DOUBLE PRECISION,     -- Total cycle time
+    status VARCHAR(20) NOT NULL,                  -- 'completed', 'failed', 'partial'
+    
+    -- Portfolio Metrics
+    signals_generated INTEGER DEFAULT 0,         -- Total signals generated
+    buy_signals INTEGER DEFAULT 0,               -- Number of buy signals
+    sell_signals INTEGER DEFAULT 0,              -- Number of sell signals
+    trades_executed INTEGER DEFAULT 0,           -- Actual trades executed
+    
+    -- Risk Assessment
+    portfolio_risk_score DOUBLE PRECISION,       -- Overall portfolio risk
+    portfolio_value DOUBLE PRECISION,            -- Total portfolio value
+    cash_allocation_pct DOUBLE PRECISION,        -- Cash allocation percentage
+    execution_priority VARCHAR(10),              -- 'HIGH', 'MEDIUM', 'LOW'
+    
+    -- Performance
+    total_exposure_pct DOUBLE PRECISION,         -- Total portfolio exposure
+    max_single_position_pct DOUBLE PRECISION,    -- Largest single position
+    diversification_score DOUBLE PRECISION,      -- Portfolio diversification
+    
+    -- Error Handling
+    error_message TEXT,                          -- Error if cycle failed
+    
+    -- Metadata
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    -- Constraints
+    CONSTRAINT check_portfolio_status CHECK (status IN ('completed', 'failed', 'partial')),
+    CONSTRAINT check_portfolio_execution_priority CHECK (execution_priority IN ('HIGH', 'MEDIUM', 'LOW'))
+);
+
+-- Create indexes for portfolio cycles
+CREATE INDEX IF NOT EXISTS idx_portfolio_cycles_time 
+    ON portfolio_cycles(cycle_timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_cycles_status 
+    ON portfolio_cycles(status, cycle_timestamp DESC);
+```
+
+## **3. JUPITER OPERATIONS TABLE**
+
+**Research Findings**: Jupiter integration exists in `VaultTradeExecutor.create_jupiter_trade()` and `JupiterV6Client`, but no dedicated tracking.
+
+**Data Sources**:
+- `VaultTradeExecutor.create_jupiter_trade()`
+- Jupiter quote and swap data
+
+**Required Fields**:
+```sql
+CREATE TABLE IF NOT EXISTS jupiter_operations (
+    jupiter_id SERIAL PRIMARY KEY,
+    trade_id INTEGER NOT NULL,                   -- Link to trades table
+    operation_time TIMESTAMPTZ NOT NULL,         -- Operation timestamp
+    operation_type VARCHAR(10) NOT NULL,         -- 'quote', 'swap'
+    
+    -- Trade Details
+    input_mint VARCHAR(44) NOT NULL,             -- Input token mint
+    output_mint VARCHAR(44) NOT NULL,            -- Output token mint
+    input_amount BIGINT,                         -- Input amount (smallest unit)
+    output_amount BIGINT,                        -- Output amount (smallest unit)
+    
+    -- Jupiter Metrics
+    slippage_bps INTEGER,                        -- Slippage in basis points
+    price_impact_pct DOUBLE PRECISION,           -- Price impact percentage
+    route_plan JSONB,                           -- Jupiter routing plan
+    
+    -- Execution Results
+    success BOOLEAN NOT NULL DEFAULT FALSE,      -- Operation success
+    error_message TEXT,                          -- Error if failed
+    execution_time_ms INTEGER,                   -- Execution time
+    
+    -- Transaction Details
+    tx_signature VARCHAR(88),                    -- Transaction signature
+    block_number BIGINT,                         -- Block number
+    
+    -- Metadata
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    -- Constraints
+    CONSTRAINT fk_jupiter_trade FOREIGN KEY (trade_id) REFERENCES trades(trade_id),
+    CONSTRAINT check_jupiter_operation_type CHECK (operation_type IN ('quote', 'swap'))
+);
+
+-- Create indexes for Jupiter operations
+CREATE INDEX IF NOT EXISTS idx_jupiter_trade 
+    ON jupiter_operations(trade_id);
+
+CREATE INDEX IF NOT EXISTS idx_jupiter_time 
+    ON jupiter_operations(operation_time DESC);
+```
+
+## **4. EMERGENCY MONITORING EVENTS TABLE**
+
+**Research Findings**: `EmergencyStopLossMonitor` records events in `system_health` table via `_record_emergency_event()`.
+
+**Data Sources**:
+- `EmergencyStopLossMonitor._record_emergency_event()`
+- Emergency exit executions
+
+**Required Fields**:
+```sql
+CREATE TABLE IF NOT EXISTS emergency_events (
+    event_id SERIAL PRIMARY KEY,
+    event_time TIMESTAMPTZ NOT NULL,             -- Event timestamp
+    event_type VARCHAR(20) NOT NULL,             -- 'stop_loss', 'portfolio_limit', 'volatility_spike'
+    
+    -- Position Details
+    token_id INTEGER,                            -- Token involved (nullable for portfolio events)
+    position_size DOUBLE PRECISION,              -- Position size at event
+    
+    -- Trigger Information
+    trigger_value DOUBLE PRECISION,              -- Value that triggered event
+    threshold_value DOUBLE PRECISION,            -- Threshold that was breached
+    trigger_type VARCHAR(20),                    -- 'price', 'pnl_pct', 'volatility'
+    
+    -- Action Taken
+    action_taken VARCHAR(20),                    -- 'exit_position', 'reduce_position', 'pause_trading'
+    tx_signature VARCHAR(88),                    -- Transaction if action executed
+    
+    -- Impact Assessment
+    portfolio_impact DOUBLE PRECISION,           -- Impact on portfolio value
+    position_pnl DOUBLE PRECISION,               -- P&L at exit
+    
+    -- Context
+    notes TEXT,                                  -- Additional context
+    
+    -- Metadata
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    -- Constraints
+    CONSTRAINT fk_emergency_token FOREIGN KEY (token_id) REFERENCES tokens(token_id),
+    CONSTRAINT check_emergency_event_type CHECK (event_type IN ('stop_loss', 'portfolio_limit', 'volatility_spike', 'manual_exit')),
+    CONSTRAINT check_emergency_action CHECK (action_taken IN ('exit_position', 'reduce_position', 'pause_trading', 'alert_only'))
+);
+
+-- Create indexes for emergency events
+CREATE INDEX IF NOT EXISTS idx_emergency_time 
+    ON emergency_events(event_time DESC);
+
+CREATE INDEX IF NOT EXISTS idx_emergency_type 
+    ON emergency_events(event_type, event_time DESC);
+```
+
+## **5. MATERIALIZED VIEWS FOR MONITORING**
+
+**Research Findings**: The schema needs monitoring-specific materialized views for efficient querying.
+
+**Required Views**:
+```sql
+-- Real-time trading performance view
+CREATE MATERIALIZED VIEW IF NOT EXISTS trading_performance_hourly
+WITH (timescaledb.continuous) AS
+SELECT 
+    time_bucket('1 hour', cycle_timestamp) AS hour,
+    COUNT(*) as total_trades,
+    COUNT(*) FILTER (WHERE signal_strength = 'STRONG') as strong_signals,
+    AVG(signal_confidence) as avg_confidence,
+    SUM(value_usdc) as total_volume_usdc,
+    AVG(processing_time_ms) as avg_processing_time_ms
+FROM trades
+GROUP BY hour;
+
+-- Portfolio risk monitoring view  
+CREATE MATERIALIZED VIEW IF NOT EXISTS portfolio_risk_hourly
+WITH (timescaledb.continuous) AS
+SELECT 
+    time_bucket('1 hour', cycle_timestamp) AS hour,
+    AVG(portfolio_risk_score) as avg_risk_score,
+    MAX(portfolio_risk_score) as max_risk_score,
+    AVG(total_exposure_pct) as avg_exposure_pct,
+    MAX(max_single_position_pct) as max_position_pct
+FROM portfolio_cycles
+WHERE status = 'completed'
+GROUP BY hour;
+
+-- Emergency events summary
+CREATE MATERIALIZED VIEW IF NOT EXISTS emergency_events_daily
+WITH (timescaledb.continuous) AS
+SELECT 
+    time_bucket('1 day', event_time) AS day,
+    event_type,
+    COUNT(*) as event_count,
+    AVG(portfolio_impact) as avg_portfolio_impact,
+    SUM(portfolio_impact) as total_portfolio_impact
+FROM emergency_events
+GROUP BY day, event_type;
+```
+
+## **CODE MODIFICATION REQUIREMENTS**
+
+### **1. Database Layer Updates (production_db.py)**
+
+#### **Enhanced TradeData Dataclass**
+```python
+@dataclass
+class TradeData:
+    """Enhanced trade execution data structure for vault trading"""
+    # Existing fields
+    token_id: int
+    trade_type: str  # 'buy' or 'sell'
+    price: float
+    quantity: float
+    value_usdc: float
+    fee_usdc: float
+    tx_hash: str
+    execution_time: datetime
+    trade_id: Optional[int] = None
+    position_id: Optional[int] = None
+    slippage_bps: Optional[int] = None
+    dex_name: Optional[str] = None
+    block_number: Optional[int] = None
+    processing_time_ms: Optional[int] = None
+    
+    # NEW: Vault-specific fields
+    signal_confidence: Optional[float] = None
+    model_version: Optional[str] = None
+    signal_strength: Optional[str] = None  # 'STRONG', 'MODERATE', 'WEAK'
+    predicted_change_pct: Optional[float] = None
+    cycle_timestamp: Optional[datetime] = None
+    jupiter_operation_id: Optional[int] = None
+```
+
+#### **New Dataclasses for Additional Tables**
+```python
+@dataclass
+class PortfolioCycleData:
+    """Portfolio cycle tracking data"""
+    cycle_timestamp: datetime
+    cycle_duration_seconds: Optional[float] = None
+    status: str = 'running'  # 'completed', 'failed', 'partial'
+    signals_generated: int = 0
+    buy_signals: int = 0
+    sell_signals: int = 0
+    trades_executed: int = 0
+    portfolio_risk_score: Optional[float] = None
+    portfolio_value: Optional[float] = None
+    cash_allocation_pct: Optional[float] = None
+    execution_priority: Optional[str] = None
+    total_exposure_pct: Optional[float] = None
+    max_single_position_pct: Optional[float] = None
+    diversification_score: Optional[float] = None
+    error_message: Optional[str] = None
+
+@dataclass
+class JupiterOperationData:
+    """Jupiter operation tracking data"""
+    trade_id: int
+    operation_time: datetime
+    operation_type: str  # 'quote', 'swap'
+    input_mint: str
+    output_mint: str
+    input_amount: Optional[int] = None
+    output_amount: Optional[int] = None
+    slippage_bps: Optional[int] = None
+    price_impact_pct: Optional[float] = None
+    route_plan: Optional[Dict] = None
+    success: bool = False
+    error_message: Optional[str] = None
+    execution_time_ms: Optional[int] = None
+    tx_signature: Optional[str] = None
+    block_number: Optional[int] = None
+
+@dataclass
+class EmergencyEventData:
+    """Emergency event tracking data"""
+    event_time: datetime
+    event_type: str  # 'stop_loss', 'portfolio_limit', 'volatility_spike'
+    token_id: Optional[int] = None
+    position_size: Optional[float] = None
+    trigger_value: Optional[float] = None
+    threshold_value: Optional[float] = None
+    trigger_type: Optional[str] = None
+    action_taken: Optional[str] = None
+    tx_signature: Optional[str] = None
+    portfolio_impact: Optional[float] = None
+    position_pnl: Optional[float] = None
+    notes: Optional[str] = None
+```
+
+#### **Enhanced Database Methods**
+```python
+# UPDATE: Enhanced record_trade method
+async def record_trade(self, trade: TradeData) -> int:
+    """Record a trade execution with vault-specific fields"""
+    query = """
+        INSERT INTO trades (
+            position_id, token_id, trade_type, price, quantity, 
+            value_usdc, fee_usdc, slippage_bps, dex_name, tx_hash,
+            block_number, execution_time, processing_time_ms,
+            signal_confidence, model_version, signal_strength,
+            predicted_change_pct, cycle_timestamp, jupiter_operation_id
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        RETURNING trade_id
+    """
+    # Implementation with all new parameters
+
+# NEW: Portfolio cycle management
+async def record_portfolio_cycle(self, cycle: PortfolioCycleData) -> int:
+    """Record a portfolio trading cycle"""
+    query = """
+        INSERT INTO portfolio_cycles (
+            cycle_timestamp, cycle_duration_seconds, status,
+            signals_generated, buy_signals, sell_signals, trades_executed,
+            portfolio_risk_score, portfolio_value, cash_allocation_pct,
+            execution_priority, total_exposure_pct, max_single_position_pct,
+            diversification_score, error_message
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        RETURNING cycle_id
+    """
+
+async def update_portfolio_cycle(self, cycle_id: int, updates: Dict[str, Any]) -> bool:
+    """Update portfolio cycle with completion data"""
+
+async def get_latest_portfolio_cycle(self) -> Optional[Dict[str, Any]]:
+    """Get the most recent portfolio cycle"""
+
+# NEW: Jupiter operations tracking
+async def record_jupiter_operation(self, operation: JupiterOperationData) -> int:
+    """Record Jupiter quote or swap operation"""
+
+async def get_jupiter_operations_by_trade(self, trade_id: int) -> List[Dict[str, Any]]:
+    """Get all Jupiter operations for a specific trade"""
+
+# NEW: Emergency events tracking
+async def record_emergency_event(self, event: EmergencyEventData) -> int:
+    """Record emergency event"""
+
+async def get_emergency_events_today(self) -> List[Dict[str, Any]]:
+    """Get all emergency events for today"""
+```
+
+### **2. Vault Trade Executor Updates (trade_executor.py)**
+
+#### **Integration with Database Tracking**
+```python
+# UPDATE: _record_trade_execution method
+async def _record_trade_execution(self, signal: TradingSignal, allocation: AssetAllocation,
+                                tx_sig: Optional[str], success: bool, error: str = None,
+                                jupiter_operation_id: Optional[int] = None):
+    """Record trade execution with enhanced tracking"""
+    try:
+        # Get current cycle timestamp
+        cycle_timestamp = datetime.now().replace(minute=0, second=0, microsecond=0)
+        
+        # Create enhanced TradeData
+        trade_data = TradeData(
+            token_id=await self._get_token_id(signal.symbol),
+            trade_type='buy',  # Vault only does buys (sells are emergency exits)
+            price=signal.current_price or 0.0,
+            quantity=allocation.position_value_usdc / (signal.current_price or 1.0),
+            value_usdc=allocation.position_value_usdc,
+            fee_usdc=0.0,  # Calculate from Jupiter data
+            tx_hash=tx_sig or '',
+            execution_time=datetime.now(),
+            
+            # NEW: Vault-specific fields
+            signal_confidence=signal.confidence,
+            model_version=signal.model_version,
+            signal_strength=signal.strength.value,
+            predicted_change_pct=signal.predicted_change_pct,
+            cycle_timestamp=cycle_timestamp,
+            jupiter_operation_id=jupiter_operation_id
+        )
+        
+        # Record in database
+        if not self.db_manager:
+            await self.initialize()
+        
+        trade_id = await self.db_manager.record_trade(trade_data)
+        logger.info(f"✅ Recorded vault trade: ID {trade_id}")
+        
+        return trade_id
+        
+    except Exception as e:
+        logger.error(f"Failed to record trade execution: {e}")
+        return None
+
+# UPDATE: create_jupiter_trade method to record Jupiter operations
+async def create_jupiter_trade(self, input_mint: str, output_mint: str, 
+                             amount_usdc: float, slippage_bps: int = 50) -> Optional[bytes]:
+    """Create Jupiter swap transaction data and record the operation"""
+    try:
+        start_time = time.time()
+        
+        # Get Jupiter quote
+        quote = await self.jupiter_client.get_quote(
+            input_mint=input_mint,
+            output_mint=output_mint,
+            amount=int(amount_usdc * 1e6),
+            slippage_bps=slippage_bps
+        )
+        
+        if not quote or 'error' in quote:
+            # Record failed operation
+            operation_data = JupiterOperationData(
+                trade_id=0,  # Will be updated later
+                operation_time=datetime.now(),
+                operation_type='quote',
+                input_mint=input_mint,
+                output_mint=output_mint,
+                success=False,
+                error_message=str(quote.get('error', 'Quote failed'))
+            )
+            await self._record_jupiter_operation(operation_data)
+            return None
+        
+        # Get swap transaction data
+        swap_data = await self.jupiter_client.get_swap_transaction(quote)
+        
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Record successful operation
+        operation_data = JupiterOperationData(
+            trade_id=0,  # Will be updated when trade is recorded
+            operation_time=datetime.now(),
+            operation_type='swap',
+            input_mint=input_mint,
+            output_mint=output_mint,
+            input_amount=int(quote.get('inAmount', 0)),
+            output_amount=int(quote.get('outAmount', 0)),
+            slippage_bps=slippage_bps,
+            price_impact_pct=float(quote.get('priceImpactPct', 0)),
+            route_plan=quote.get('routePlan'),
+            success=True,
+            execution_time_ms=execution_time_ms
+        )
+        
+        jupiter_id = await self._record_jupiter_operation(operation_data)
+        
+        # Store jupiter_id for trade recording
+        self._pending_jupiter_id = jupiter_id
+        
+        return swap_data
+        
+    except Exception as e:
+        logger.error(f"Jupiter trade creation failed: {e}")
+        return None
+
+async def _record_jupiter_operation(self, operation: JupiterOperationData) -> Optional[int]:
+    """Record Jupiter operation in database"""
+    try:
+        if not self.db_manager:
+            await self.initialize()
+        
+        return await self.db_manager.record_jupiter_operation(operation)
+    except Exception as e:
+        logger.error(f"Failed to record Jupiter operation: {e}")
+        return None
+```
+
+### **3. Hourly Inference Scheduler Updates (hourly_inference_scheduler.py)**
+
+#### **Portfolio Cycle Management Integration**
+```python
+# UPDATE: run_inference_and_trading_cycle method
+async def run_inference_and_trading_cycle(self):
+    """Complete cycle with enhanced portfolio cycle tracking"""
+    cycle_start_time = datetime.now().replace(minute=0, second=0, microsecond=0)
+    cycle_id = None
+    
+    try:
+        # 1. Create portfolio cycle record
+        cycle_data = PortfolioCycleData(
+            cycle_timestamp=cycle_start_time,
+            status='running'
+        )
+        
+        if not self.db_manager:
+            self.db_manager = await get_db_manager()
+        
+        cycle_id = await self.db_manager.record_portfolio_cycle(cycle_data)
+        logger.info(f"🚀 Started portfolio cycle {cycle_id} at {cycle_start_time}")
+        
+        # 2. Prepare inference data (EXISTING FUNCTIONALITY)
+        inference_data = await self.prepare_batch_inference_data()
+        ready_tokens = [addr for addr, data in inference_data.items() 
+                       if data.get('ready_for_inference', False)]
+        
+        if len(ready_tokens) < 5:
+            await self._complete_cycle_with_error(cycle_id, "Insufficient tokens ready for inference")
+            return
+        
+        # 3. Generate portfolio signals (EXISTING INTEGRATION)
+        from ..inference.portfolio_coordinator import generate_portfolio_signals
+        portfolio_signals = await generate_portfolio_signals()
+        
+        if not portfolio_signals:
+            await self._complete_cycle_with_status(cycle_id, 'completed', {
+                'signals_generated': 0,
+                'message': 'No portfolio signals generated'
+            })
+            return
+        
+        # 4. Execute vault trades (EXISTING FUNCTIONALITY)
+        trades_executed = 0
+        if portfolio_signals.buy_signals:
+            from ..vault.trade_executor import VaultTradeExecutor
+            executor = VaultTradeExecutor()
+            
+            trade_results = await executor.execute_portfolio_trades(portfolio_signals)
+            trades_executed = len([r for r in trade_results if r])
+            
+            logger.info(f"Executed {trades_executed} vault trades")
+        
+        # 5. Complete cycle with success metrics
+        cycle_duration = (datetime.now() - cycle_start_time).total_seconds()
+        
+        await self._complete_cycle_with_status(cycle_id, 'completed', {
+            'cycle_duration_seconds': cycle_duration,
+            'signals_generated': len(portfolio_signals.buy_signals + portfolio_signals.sell_signals),
+            'buy_signals': len(portfolio_signals.buy_signals),
+            'sell_signals': len(portfolio_signals.sell_signals),
+            'trades_executed': trades_executed,
+            'portfolio_risk_score': portfolio_signals.portfolio_risk_score,
+            'execution_priority': portfolio_signals.execution_priority,
+            'total_exposure_pct': getattr(portfolio_signals, 'total_exposure_pct', None),
+            'diversification_score': getattr(portfolio_signals, 'diversification_score', None)
+        })
+        
+        logger.info(f"✅ Completed portfolio cycle {cycle_id} in {cycle_duration:.1f}s")
+    
+    except Exception as e:
+        logger.error(f"Inference and trading cycle failed: {e}")
+        if cycle_id:
+            await self._complete_cycle_with_error(cycle_id, str(e))
+
+async def _complete_cycle_with_status(self, cycle_id: int, status: str, metrics: Dict[str, Any]):
+    """Complete cycle with status and metrics"""
+    try:
+        updates = {
+            'status': status,
+            **metrics
+        }
+        await self.db_manager.update_portfolio_cycle(cycle_id, updates)
+    except Exception as e:
+        logger.error(f"Failed to update cycle {cycle_id}: {e}")
+
+async def _complete_cycle_with_error(self, cycle_id: int, error_message: str):
+    """Complete cycle with error status"""
+    await self._complete_cycle_with_status(cycle_id, 'failed', {
+        'error_message': error_message,
+        'cycle_duration_seconds': (datetime.now() - 
+            datetime.now().replace(minute=0, second=0, microsecond=0)).total_seconds()
+    })
+```
+
+### **4. Emergency Monitor Updates (emergency_monitor.py)**
+
+#### **Enhanced Emergency Event Recording**
+```python
+# UPDATE: _record_emergency_event method
+async def _record_emergency_event(self, event_type: str, symbol: str, details: Dict[str, Any]):
+    """Record emergency event with enhanced tracking"""
+    try:
+        # Get token ID
+        token_id = None
+        if symbol:
+            token_info = await self.db_manager.get_token_by_symbol(symbol)
+            token_id = token_info['token_id'] if token_info else None
+        
+        # Create emergency event data
+        event_data = EmergencyEventData(
+            event_time=datetime.now(),
+            event_type=event_type,
+            token_id=token_id,
+            position_size=details.get('position_size'),
+            trigger_value=details.get('trigger_value'),
+            threshold_value=details.get('threshold_value'),
+            trigger_type=details.get('trigger_type'),
+            action_taken=details.get('action_taken'),
+            tx_signature=details.get('tx_signature'),
+            portfolio_impact=details.get('portfolio_impact'),
+            position_pnl=details.get('position_pnl'),
+            notes=details.get('notes')
+        )
+        
+        # Record in database
+        event_id = await self.db_manager.record_emergency_event(event_data)
+        logger.critical(f"🚨 Recorded emergency event {event_id}: {event_type}")
+        
+        return event_id
+        
+    except Exception as e:
+        logger.error(f"Failed to record emergency event: {e}")
+        return None
+
+# UPDATE: _execute_emergency_exit method
+async def _execute_emergency_exit(self, symbol: str, position, reason: str):
+    """Execute emergency exit with enhanced tracking"""
+    try:
+        if self.emergency_exits_today >= self.max_daily_exits:
+            await self._record_emergency_event('daily_limit_reached', symbol, {
+                'trigger_type': 'daily_limit',
+                'action_taken': 'alert_only',
+                'notes': f'Daily emergency exit limit reached: {self.emergency_exits_today}'
+            })
+            return
+        
+        # Execute emergency sell order via vault
+        exit_result = await self.vault_client.emergency_exit_position(symbol, position.size)
+        
+        if exit_result:
+            self.emergency_exits_today += 1
+            
+            # Record successful emergency exit
+            await self._record_emergency_event('emergency_exit_executed', symbol, {
+                'position_size': position.size,
+                'trigger_type': reason,
+                'action_taken': 'exit_position',
+                'tx_signature': exit_result,
+                'position_pnl': getattr(position, 'unrealized_pnl', None),
+                'notes': f'Emergency exit executed due to {reason}'
+            })
+            
+            logger.critical(f"✅ Emergency exit completed: {symbol} - {reason}")
+        else:
+            # Record failed emergency exit
+            await self._record_emergency_event('emergency_exit_failed', symbol, {
+                'position_size': position.size,
+                'trigger_type': reason,
+                'action_taken': 'exit_position',
+                'notes': f'Emergency exit failed for {symbol}',
+                'error_message': 'Vault client exit failed'
+            })
+            
+    except Exception as e:
+        logger.error(f"Emergency exit execution failed: {e}")
+        await self._record_emergency_event('emergency_exit_error', symbol, {
+            'trigger_type': reason,
+            'action_taken': 'exit_position',
+            'error_message': str(e),
+            'notes': f'Emergency exit error for {symbol}'
+        })
+```
+
+### **5. Integration Testing Requirements**
+
+#### **Test Files to Update**
+```python
+# NEW: test_database_migration.py
+"""Test all new database schema features"""
+
+class TestDatabaseMigration:
+    async def test_enhanced_trades_table(self):
+        """Test trades table with new vault-specific columns"""
+        
+    async def test_portfolio_cycles_table(self):
+        """Test portfolio cycle recording and querying"""
+        
+    async def test_jupiter_operations_table(self):
+        """Test Jupiter operation tracking"""
+        
+    async def test_emergency_events_table(self):
+        """Test emergency event recording"""
+        
+    async def test_materialized_views(self):
+        """Test materialized view creation and data"""
+
+# UPDATE: test_vault_integration.py
+"""Add tests for enhanced vault trading tracking"""
+
+class TestVaultTradingTracking:
+    async def test_complete_trading_cycle_tracking(self):
+        """Test end-to-end cycle tracking from signals to database"""
+        
+    async def test_jupiter_operation_linking(self):
+        """Test Jupiter operations are properly linked to trades"""
+        
+    async def test_emergency_event_recording(self):
+        """Test emergency events are recorded with complete data"""
+```
+
+## **IMPLEMENTATION PRIORITY**
+
+1. **IMMEDIATE (Phase 3.3)**:
+   - Database layer updates (TradeData, new dataclasses, enhanced methods)
+   - Trade executor integration with enhanced tracking
+   - Portfolio cycle management in scheduler
+
+2. **SHORT-TERM**:
+   - Emergency monitoring enhancements
+   - Jupiter operations tracking
+   - Integration testing
+
+3. **ONGOING**:
+   - Performance optimization
+   - Monitoring dashboards using materialized views
+   - Production deployment and monitoring
+
+### **6. Jupiter Client Updates (jupiter_client.py)**
+
+#### **Operation Tracking Integration**
+```python
+# UPDATE: get_quote method to support tracking
+async def get_quote(self, input_mint: str, output_mint: str, amount: int, 
+                   slippage_bps: int = 50, track_operation: bool = True) -> Optional[Dict]:
+    """Get Jupiter quote with optional operation tracking"""
+    start_time = time.time()
+    
+    try:
+        # Existing quote logic...
+        quote = await self._fetch_quote(input_mint, output_mint, amount, slippage_bps)
+        
+        # NEW: Track operation if requested
+        if track_operation and hasattr(self, 'db_manager') and self.db_manager:
+            execution_time_ms = int((time.time() - start_time) * 1000)
+            
+            operation_data = JupiterOperationData(
+                trade_id=0,  # Updated later when linked to trade
+                operation_time=datetime.now(),
+                operation_type='quote',
+                input_mint=input_mint,
+                output_mint=output_mint,
+                input_amount=amount,
+                output_amount=int(quote.get('outAmount', 0)) if quote else 0,
+                slippage_bps=slippage_bps,
+                price_impact_pct=float(quote.get('priceImpactPct', 0)) if quote else None,
+                route_plan=quote.get('routePlan') if quote else None,
+                success=quote is not None and 'error' not in quote,
+                error_message=quote.get('error') if quote and 'error' in quote else None,
+                execution_time_ms=execution_time_ms
+            )
+            
+            # Store for later linking to trade
+            self._last_operation_data = operation_data
+        
+        return quote
+        
+    except Exception as e:
+        logger.error(f"Jupiter quote failed: {e}")
+        
+        # Track failed operation
+        if track_operation and hasattr(self, 'db_manager') and self.db_manager:
+            operation_data = JupiterOperationData(
+                trade_id=0,
+                operation_time=datetime.now(),
+                operation_type='quote',
+                input_mint=input_mint,
+                output_mint=output_mint,
+                input_amount=amount,
+                slippage_bps=slippage_bps,
+                success=False,
+                error_message=str(e),
+                execution_time_ms=int((time.time() - start_time) * 1000)
+            )
+            self._last_operation_data = operation_data
+        
+        return None
+
+# NEW: Method to link operations to trades
+async def link_last_operation_to_trade(self, trade_id: int) -> Optional[int]:
+    """Link the last recorded operation to a trade"""
+    try:
+        if hasattr(self, '_last_operation_data') and self._last_operation_data:
+            # Update trade_id and record in database
+            self._last_operation_data.trade_id = trade_id
+            
+            if hasattr(self, 'db_manager') and self.db_manager:
+                jupiter_id = await self.db_manager.record_jupiter_operation(self._last_operation_data)
+                self._last_operation_data = None  # Clear after recording
+                return jupiter_id
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Failed to link Jupiter operation to trade: {e}")
+        return None
+```
+
+### **7. Portfolio Coordinator Updates (portfolio_coordinator.py)**
+
+#### **Enhanced Signal Generation with Cycle Awareness**
+```python
+# UPDATE: generate_portfolio_signals method
+async def generate_portfolio_signals(self, cycle_timestamp: Optional[datetime] = None) -> PortfolioSignal:
+    """Generate portfolio signals with cycle tracking metadata"""
+    try:
+        # Set cycle timestamp if not provided
+        if cycle_timestamp is None:
+            cycle_timestamp = datetime.now().replace(minute=0, second=0, microsecond=0)
+        
+        # Existing signal generation logic...
+        signals = await self._generate_signals_for_all_tokens()
+        
+        # NEW: Enhanced portfolio risk assessment
+        risk_metrics = await self._calculate_enhanced_risk_metrics()
+        
+        # NEW: Calculate portfolio-level metrics for cycle tracking
+        portfolio_value = await self._get_current_portfolio_value()
+        total_exposure = sum(s.position_value_usdc for s in signals.buy_signals)
+        exposure_pct = (total_exposure / portfolio_value * 100) if portfolio_value > 0 else 0
+        
+        # Calculate diversification score
+        diversification_score = self._calculate_diversification_score(signals.buy_signals)
+        
+        # Enhanced portfolio signal with cycle metadata
+        portfolio_signal = PortfolioSignal(
+            buy_signals=signals.buy_signals,
+            sell_signals=signals.sell_signals,
+            portfolio_risk_score=risk_metrics['overall_risk'],
+            execution_priority=self._determine_execution_priority(risk_metrics),
+            asset_allocations=signals.asset_allocations,
+            
+            # NEW: Cycle tracking fields
+            cycle_timestamp=cycle_timestamp,
+            total_exposure_pct=exposure_pct,
+            diversification_score=diversification_score,
+            portfolio_value=portfolio_value,
+            cash_allocation_pct=100 - exposure_pct
+        )
+        
+        logger.info(f"Generated portfolio signals for cycle {cycle_timestamp}: "
+                   f"{len(signals.buy_signals)} buys, {len(signals.sell_signals)} sells")
+        
+        return portfolio_signal
+        
+    except Exception as e:
+        logger.error(f"Portfolio signal generation failed: {e}")
+        return PortfolioSignal(buy_signals=[], sell_signals=[], portfolio_risk_score=1.0)
+
+async def _calculate_enhanced_risk_metrics(self) -> Dict[str, float]:
+    """Calculate enhanced risk metrics for cycle tracking"""
+    try:
+        # Existing risk calculations...
+        concentration_risk = await self._calculate_concentration_risk()
+        correlation_risk = await self._calculate_correlation_risk()
+        
+        # NEW: Additional risk metrics for database tracking
+        volatility_risk = await self._calculate_portfolio_volatility()
+        drawdown_risk = await self._calculate_max_drawdown()
+        
+        return {
+            'overall_risk': (concentration_risk + correlation_risk + volatility_risk) / 3,
+            'concentration_risk': concentration_risk,
+            'correlation_risk': correlation_risk,
+            'volatility_risk': volatility_risk,
+            'drawdown_risk': drawdown_risk
+        }
+        
+    except Exception as e:
+        logger.error(f"Risk metrics calculation failed: {e}")
+        return {'overall_risk': 1.0}
+
+def _calculate_diversification_score(self, buy_signals: List[TradingSignal]) -> float:
+    """Calculate portfolio diversification score (0-1, higher is better)"""
+    try:
+        if not buy_signals:
+            return 1.0
+        
+        # Simple diversification: inverse of concentration
+        total_allocation = sum(s.position_value_usdc for s in buy_signals)
+        if total_allocation == 0:
+            return 1.0
+        
+        # Calculate Herfindahl-Hirschman Index
+        allocations = [s.position_value_usdc / total_allocation for s in buy_signals]
+        hhi = sum(alloc ** 2 for alloc in allocations)
+        
+        # Convert to diversification score (1 - HHI, bounded)
+        diversification = max(0.0, min(1.0, 1.0 - hhi))
+        
+        return diversification
+        
+    except Exception as e:
+        logger.error(f"Diversification calculation failed: {e}")
+        return 0.5
+```
+
+### **8. Main Application Updates (main.py)**
+
+#### **Enhanced System Monitoring**
+```python
+# UPDATE: CalvinVaultSystem class
+class CalvinVaultSystem:
+    """Enhanced main orchestrator with database tracking"""
+    
+    def __init__(self):
+        self.scheduler = None
+        self.emergency_monitor = None
+        self.running = False
+        
+        # NEW: System metrics tracking
+        self.system_start_time = datetime.now()
+        self.total_cycles_completed = 0
+        self.total_trades_executed = 0
+        self.total_emergency_events = 0
+        
+        logger.info("Calvin Vault System initializing...")
+
+    async def _health_check(self):
+        """Enhanced periodic system health check with database metrics"""
+        try:
+            # Existing health checks...
+            if not self.scheduler or not self.scheduler.is_running:
+                logger.warning("Scheduler not running - attempting restart")
+                await self.scheduler.start_async()
+            
+            # NEW: Database-based health metrics
+            db_manager = await get_db_manager()
+            await db_manager.health_check()
+            
+            # Get recent cycle performance
+            recent_cycles = await db_manager.query("""
+                SELECT COUNT(*) as total, 
+                       COUNT(*) FILTER (WHERE status = 'completed') as completed,
+                       COUNT(*) FILTER (WHERE status = 'failed') as failed
+                FROM portfolio_cycles 
+                WHERE cycle_timestamp >= NOW() - INTERVAL '24 hours'
+            """)
+            
+            # Get recent trade performance  
+            recent_trades = await db_manager.query("""
+                SELECT COUNT(*) as total_trades,
+                       AVG(signal_confidence) as avg_confidence,
+                       AVG(processing_time_ms) as avg_processing_time
+                FROM trades 
+                WHERE cycle_timestamp >= NOW() - INTERVAL '24 hours'
+            """)
+            
+            # Get emergency events count
+            emergency_count = await db_manager.query("""
+                SELECT COUNT(*) as emergency_events
+                FROM emergency_events 
+                WHERE event_time >= NOW() - INTERVAL '24 hours'
+            """)
+            
+            # Log comprehensive health status
+            health_metrics = {
+                'uptime_hours': (datetime.now() - self.system_start_time).total_seconds() / 3600,
+                'cycles_24h': recent_cycles[0] if recent_cycles else {},
+                'trades_24h': recent_trades[0] if recent_trades else {},
+                'emergency_events_24h': emergency_count[0]['emergency_events'] if emergency_count else 0
+            }
+            
+            logger.info(f"System Health: {health_metrics}")
+            
+            # Record system health in database
+            await db_manager.query("""
+                INSERT INTO system_health (check_time, component, status, details)
+                VALUES (NOW(), 'vault_system', 'healthy', $1)
+            """, [health_metrics])
+            
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            
+            # Record health check failure
+            try:
+                db_manager = await get_db_manager()
+                await db_manager.query("""
+                    INSERT INTO system_health (check_time, component, status, error_message)
+                    VALUES (NOW(), 'vault_system', 'degraded', $1)
+                """, [str(e)])
+            except:
+                pass  # Don't fail on health recording failure
+```
+
+### **9. Configuration Updates**
+
+#### **Environment Variables for Enhanced Tracking**
+```bash
+# NEW: Database tracking configuration
+ENABLE_PORTFOLIO_CYCLE_TRACKING=true
+ENABLE_JUPITER_OPERATION_TRACKING=true
+ENABLE_EMERGENCY_EVENT_TRACKING=true
+
+# NEW: Performance thresholds for alerting
+MAX_CYCLE_DURATION_SECONDS=300
+MIN_SIGNAL_CONFIDENCE_THRESHOLD=0.5
+MAX_DAILY_EMERGENCY_EVENTS=5
+
+# NEW: Database performance settings
+DB_QUERY_TIMEOUT_SECONDS=30
+DB_CONNECTION_POOL_SIZE=10
+ENABLE_DATABASE_QUERY_LOGGING=false
+```
+
+### **10. Migration Script**
+
+#### **Complete Database Migration Script**
+```python
+# NEW: scripts/migrate_database_schema.py
+"""
+Database migration script for vault trading enhancements
+"""
+
+import asyncio
+import logging
+from calvin_1.src.database.production_db import get_db_manager
+
+async def run_migration():
+    """Execute complete database schema migration"""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        db_manager = await get_db_manager()
+        
+        # 1. Create backup
+        logger.info("Creating database backup...")
+        await db_manager.execute("SELECT pg_dump('calvin_trading_dev') AS backup")
+        
+        # 2. Add new columns to trades table
+        logger.info("Adding new columns to trades table...")
+        await db_manager.execute("""
+            ALTER TABLE trades 
+                ADD COLUMN IF NOT EXISTS signal_confidence DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS model_version VARCHAR(50),
+                ADD COLUMN IF NOT EXISTS signal_strength VARCHAR(10),
+                ADD COLUMN IF NOT EXISTS predicted_change_pct DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS cycle_timestamp TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS jupiter_operation_id INTEGER;
+        """)
+        
+        # 3. Create new tables
+        logger.info("Creating portfolio_cycles table...")
+        # ... portfolio_cycles table creation SQL
+        
+        logger.info("Creating jupiter_operations table...")
+        # ... jupiter_operations table creation SQL
+        
+        logger.info("Creating emergency_events table...")
+        # ... emergency_events table creation SQL
+        
+        # 4. Create indexes
+        logger.info("Creating new indexes...")
+        # ... index creation SQL
+        
+        # 5. Create materialized views
+        logger.info("Creating materialized views...")
+        # ... materialized view creation SQL
+        
+        # 6. Validate migration
+        logger.info("Validating migration...")
+        await validate_migration(db_manager)
+        
+        logger.info("✅ Database migration completed successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Database migration failed: {e}")
+        raise
+
+async def validate_migration(db_manager):
+    """Validate the migration was successful"""
+    # Check all new columns exist
+    result = await db_manager.query("""
+        SELECT column_name FROM information_schema.columns 
+        WHERE table_name = 'trades' AND column_name IN (
+            'signal_confidence', 'model_version', 'signal_strength',
+            'predicted_change_pct', 'cycle_timestamp', 'jupiter_operation_id'
+        )
+    """)
+    
+    if len(result) != 6:
+        raise Exception("Not all new columns were added to trades table")
+    
+    # Check new tables exist
+    tables = ['portfolio_cycles', 'jupiter_operations', 'emergency_events']
+    for table in tables:
+        result = await db_manager.query(f"""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = '{table}'
+            )
+        """)
+        if not result[0]['exists']:
+            raise Exception(f"Table {table} was not created")
+    
+    logger.info("✅ Migration validation passed")
+
+if __name__ == "__main__":
+    asyncio.run(run_migration())
+```
+
+This comprehensive plan ensures all code components are updated to work with the enhanced database schema while maintaining backward compatibility and adding production-ready tracking capabilities.
+
+
+
+
+
+
+
+
+
+
+
+
+
+

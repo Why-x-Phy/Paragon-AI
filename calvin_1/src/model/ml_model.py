@@ -15,8 +15,8 @@ from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLRO
 from tensorflow.keras.utils import plot_model
 
 from src.config.config import config
-from utils.logger import log_manager
-from model.profit_functions import (
+from src.utils.logger import log_manager
+from src.model.profit_functions import (
     profit_loss, directional_loss, combined_profit_mse_loss, 
     cumulative_return_metric, win_rate_metric, sharpe_ratio_metric,
     backtest_trades, direction_accuracy, simple_directional_loss,
@@ -718,7 +718,7 @@ class MLModel:
         self.optimization_target = "mse"
         
         # Create custom_objects dictionary with our custom functions
-        from model.profit_functions import (
+        from src.model.profit_functions import (
             profit_loss, directional_loss, combined_profit_mse_loss, 
             cumulative_return_metric, win_rate_metric, sharpe_ratio_metric,
             direction_accuracy
@@ -806,7 +806,10 @@ class MLModel:
         plt.tight_layout()
         
         if filename:
-            file_path = os.path.join(self.models_dir, filename)
+            # Save to plots/training directory
+            plots_dir = os.path.join(os.path.dirname(self.models_dir), 'plots', 'training')
+            os.makedirs(plots_dir, exist_ok=True)
+            file_path = os.path.join(plots_dir, filename)
             plt.savefig(file_path)
             logger.info(f"Training history plot saved to {file_path}")
         else:
@@ -882,7 +885,10 @@ class MLModel:
         plt.tight_layout()
         
         if filename:
-            file_path = os.path.join(self.models_dir, filename)
+            # Save to plots/training directory
+            plots_dir = os.path.join(os.path.dirname(self.models_dir), 'plots', 'training')
+            os.makedirs(plots_dir, exist_ok=True)
+            file_path = os.path.join(plots_dir, filename)
             plt.savefig(file_path)
             logger.info(f"Predictions plot saved to {file_path}")
         else:
@@ -972,7 +978,10 @@ class MLModel:
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         
         if filename:
-            file_path = os.path.join(self.models_dir, filename)
+            # Save to plots/backtests directory
+            plots_dir = os.path.join(os.path.dirname(self.models_dir), 'plots', 'backtests')
+            os.makedirs(plots_dir, exist_ok=True)
+            file_path = os.path.join(plots_dir, filename)
             plt.savefig(file_path)
             logger.info(f"Backtest results plot saved to {file_path}")
         else:
@@ -1084,7 +1093,7 @@ class MLModel:
             
         # Run the backtest
         try:
-            from model.profit_functions import simple_backtest_strategy
+            from src.model.profit_functions import simple_backtest_strategy
             
             # Get resolution from config if not provided
             if resolution is None:
@@ -1367,8 +1376,12 @@ class MLModel:
         
         # Save or show
         if filename:
-            plt.savefig(filename)
-            logger.info(f"Simple backtest plot saved to {filename}")
+            # Save to plots/backtests directory
+            plots_dir = os.path.join(os.path.dirname(self.models_dir), 'plots', 'backtests')
+            os.makedirs(plots_dir, exist_ok=True)
+            file_path = os.path.join(plots_dir, filename)
+            plt.savefig(file_path)
+            logger.info(f"Simple backtest plot saved to {file_path}")
         else:
             plt.show()
 
@@ -1441,8 +1454,12 @@ class MLModel:
         
         # Save or show the plot
         if filename:
-            plt.savefig(filename)
-            logger.info(f"Price comparison plot saved to {filename}")
+            # Save to plots/comparisons directory
+            plots_dir = os.path.join(os.path.dirname(self.models_dir), 'plots', 'comparisons')
+            os.makedirs(plots_dir, exist_ok=True)
+            file_path = os.path.join(plots_dir, filename)
+            plt.savefig(file_path)
+            logger.info(f"Price comparison plot saved to {file_path}")
         else:
             plt.show()
 
@@ -1469,7 +1486,7 @@ class MLModel:
         Returns:
             Path to saved plot or None
         """
-        from model.profit_functions import backtest_trades, plot_backtest_with_signals
+        from src.model.profit_functions import backtest_trades, plot_backtest_with_signals
         
         # If no price data provided, use the close prices from OHLCV data
         if y_true is None:
@@ -1490,13 +1507,15 @@ class MLModel:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f"{symbol}_backtest_{timestamp}.png"
                 
-            # Plot with signals
+            # Plot with signals - save to plots/backtests directory
+            plots_dir = os.path.join(os.path.dirname(self.models_dir), 'plots', 'backtests')
+            os.makedirs(plots_dir, exist_ok=True)
             return plot_backtest_with_signals(
                 ohlcv_data=ohlcv_data,
                 trades=trades,
                 filename=filename,
                 title=title,
-                output_dir=self.models_dir
+                output_dir=plots_dir
             )
         else:
             logger.warning("No predictions provided for backtest visualization")

@@ -34,12 +34,12 @@ import pandas as pd
 import json
 
 # Local imports
-from src.config.config import config
-from src.utils.logger import log
-from src.inference.strategy_engine import SimpleStrategyEngine, TradingSignal, SignalType, SignalStrength
-from src.inference.model_registry import get_model_registry
-from src.trading.position_manager import PositionManager, RiskLimits
-from src.database.production_db import get_db_manager
+from ..config.config import config
+from ..utils.logger import log
+from .strategy_engine import SimpleStrategyEngine, TradingSignal, SignalType, SignalStrength
+from .model_registry import get_model_registry
+from ..trading.position_manager import PositionManager, RiskLimits
+from ..database.production_db import get_db_manager
 
 logger = log
 

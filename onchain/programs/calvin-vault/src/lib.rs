@@ -10,8 +10,8 @@ pub mod errors;
 
 use instructions::*;
 
-// This should be replaced with the actual program ID during deployment
-declare_id!("Eehx8tDgRctoJbTEdXRp85hCW55nH62g5Eiy7yAn7KDg");
+// Program ID will be set during deployment
+declare_id!("7rky4NGhHtUREVJLKnAKwapDBmzCMbEno6VDcFZXyWxA");
 
 /// The main vault program
 #[program]
@@ -86,6 +86,13 @@ pub mod vault {
     ) -> Result<u64> {
         instructions::get_user_vault_shares(ctx)
     }
+
+    /// Initialize a token account for trading (called after vault init)
+    pub fn initialize_token_accounts(
+        ctx: Context<InitializeTokenAccounts>,
+    ) -> Result<()> {
+        instructions::initialize_token_accounts(ctx)
+    }
 }
 
 /// Error codes for the vault program
@@ -129,4 +136,19 @@ pub enum ErrorCode {
 
     #[msg("Insufficient accounts provided for Jupiter swap")]
     InsufficientAccounts,
+
+    #[msg("Invalid oracle account provided")]
+    InvalidOracleAccount,
+
+    #[msg("Oracle not found for token")]
+    OracleNotFound,
+
+    #[msg("Stale oracle price data")]
+    StaleOraclePrice,
+
+    #[msg("Invalid price data from oracle")]
+    InvalidPriceData,
+
+    #[msg("Too many tokens - maximum 25 supported")]
+    TooManyTokens,
 } 

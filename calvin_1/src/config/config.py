@@ -97,6 +97,28 @@ class Config:
         else:
             raise ValueError(f"Unknown Solana network: {self.solana_network}")
     
+    def get(self, key, default=None):
+        """Get configuration value with optional default (dict-like interface)"""
+        # Convert key to lowercase and check if it exists as an attribute
+        attr_name = key.lower()
+        if hasattr(self, attr_name):
+            return getattr(self, attr_name)
+        
+        # Check environment variable directly
+        env_value = os.getenv(key, default)
+        if env_value is not None:
+            # Try to convert to appropriate type
+            if isinstance(default, (int, float)):
+                try:
+                    return type(default)(env_value)
+                except (ValueError, TypeError):
+                    return default
+            elif isinstance(default, bool):
+                return env_value.lower() in ('true', '1', 'yes', 'on')
+            return env_value
+        
+        return default
+
     def validate(self):
         """Validate that all required configuration is present"""
         required_fields = [

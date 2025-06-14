@@ -7,7 +7,7 @@ from typing import List
 import os
 from datetime import timezone, timedelta
 
-from utils.logger import log # Import the configured logger instance
+from ..utils.logger import log # Import the configured logger instance
 logger = log # Assign to the 'logger' variable used in this module
 
 def denormalize_data(data, scale=1.0, offset=0.0):
@@ -479,7 +479,7 @@ def backtest_trades(prices, predictions, transaction_cost_pct=0.001):
             continue
             
         # Calculate predicted direction and confidence based on previous price
-        pred_return = (predictions[i] - prices[i-1]) / prices[i-1]
+        pred_return = (predictions[i] - prices[i]) / prices[i]
         
         # Trend confirmation - only buy in uptrends, only sell in downtrends
         trend_up = prices[i-1] > sma[i-1]
@@ -740,7 +740,7 @@ def simple_backtest_strategy(prices, predictions, ohlcv_df=None, include_detaile
     portfolio_values = [initial_cash]
     trades = []
     
-    # Position sizing - use 90% of available cash
+    # Position sizing - use 10% of available cash
     position_size_pct = 0.10
     
     if verbosity > 0:

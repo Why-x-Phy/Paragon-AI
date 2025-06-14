@@ -100,7 +100,7 @@ class InferenceDataProcessor:
         env_config = get_config()
         
         return InferenceDataConfig(
-            min_data_points=int(env_config.get('MIN_DATA_POINTS_FOR_INFERENCE', 24)),
+            min_data_points=int(env_config.get('MIN_DATA_POINTS_FOR_INFERENCE', 36)),
             data_quality_threshold=float(env_config.get('DATA_QUALITY_THRESHOLD', 0.95)),
             lookback_hours=int(env_config.get('DATA_PROCESSOR_LOOKBACK_HOURS', 48)),
             

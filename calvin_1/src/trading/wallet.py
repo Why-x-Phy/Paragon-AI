@@ -12,8 +12,8 @@ from solders.system_program import transfer, TransferParams
 from solders.signature import Signature
 from spl.token.instructions import get_associated_token_address
 
-from src.config.config import config
-from src.utils.logger import log_manager
+from ..config.config import config
+from ..utils.logger import log_manager
 
 logger = log_manager.get_logger("wallet")
 

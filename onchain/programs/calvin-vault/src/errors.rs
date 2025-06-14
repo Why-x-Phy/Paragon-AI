@@ -59,4 +59,16 @@ pub enum VaultError {
 
     #[msg("Account initialization failed")]
     AccountInitializationFailed,
+
+    #[msg("Invalid oracle account provided")]
+    InvalidOracleAccount,
+
+    #[msg("Oracle not found for token")]
+    OracleNotFound,
+
+    #[msg("Stale oracle price data")]
+    StaleOraclePrice,
+
+    #[msg("Invalid price data from oracle")]
+    InvalidPriceData,
 } 

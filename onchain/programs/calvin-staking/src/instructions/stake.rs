@@ -145,7 +145,9 @@ pub fn stake_calvin(ctx: Context<StakeCalvin>, amount: u64) -> Result<()> {
     user_stake.last_stake_timestamp = Clock::get()?.unix_timestamp;
 
     // Mint Vault Pass tokens to represent the user's staked amount
-    // The amount of Vault Pass tokens equals the total staked CALVIN
+    // Convert from CALVIN decimals (6) to Vault Pass decimals (0)
+    let vault_pass_amount = amount / 1_000_000; // Convert from micro-CALVIN to whole CALVIN
+    
     let stake_config_seeds = &[
         STAKE_CONFIG_SEED,
         &[stake_config.bump],
@@ -161,12 +163,12 @@ pub fn stake_calvin(ctx: Context<StakeCalvin>, amount: u64) -> Result<()> {
             },
             &[stake_config_seeds],
         ),
-        amount, // Mint Vault Pass tokens equal to staked amount
+        vault_pass_amount, // Mint Vault Pass tokens equal to whole CALVIN amount
     )?;
 
     // Update total vault passes minted
     stake_vault.total_vault_passes = stake_vault.total_vault_passes
-        .checked_add(amount)
+        .checked_add(vault_pass_amount)
         .ok_or(StakingError::ArithmeticError)?;
 
     // Emit stake event

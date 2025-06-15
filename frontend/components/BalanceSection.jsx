@@ -89,6 +89,10 @@ export default function BalanceSection() {
       { 
         label: 'USDC Balance', 
         amount: userTokenBalances ? `${userTokenBalances.usdcFormatted}` : '0.000'
+      },
+      { 
+        label: 'Vault Pass Tokens', 
+        amount: userTokenBalances ? `${userTokenBalances.vaultPassFormatted}` : '0'
       }
     ]
   };

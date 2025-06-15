@@ -1,7 +1,7 @@
 import { PT_Sans, Orbitron } from "next/font/google";
 import "./globals.css";
 import { SolanaProvider } from "@/components/provider/Solana";
-import { AuthProviders } from "@/components/provider/AuthProviders";
+import AuthProviders from "@/components/provider/AuthProviders";
 import "@solana/wallet-adapter-react-ui/styles.css";
 import { Toaster } from "sonner";
 

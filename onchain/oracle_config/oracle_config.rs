@@ -1,5 +1,4 @@
 // Calvin AI - Pyth Oracle Configuration
-// Generated with manually found price feed IDs
 
 use anchor_lang::prelude::*;
 

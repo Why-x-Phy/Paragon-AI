@@ -14,7 +14,10 @@ export default function ActionButtons() {
         userStakeInfo, 
         userVaultPosition, 
         tierInfo, 
-        txStates 
+        txStates,
+        loading,
+        refreshing,
+        userTokenBalances
     } = useVault();
     
     const [isDepositModalOpen, setIsDepositModalOpen] = useState(false);
@@ -32,6 +35,10 @@ export default function ActionButtons() {
     const handleStake = () => {
         setIsStakeModalOpen(true);
     }
+
+    // Check if data is still loading - for staking we only need token balances
+    const isStakingDataLoading = !userTokenBalances;
+    const isVaultDataLoading = loading || refreshing;
 
     // Show wallet connection message if not connected
     if (!connected) {
@@ -59,10 +66,11 @@ export default function ActionButtons() {
                     icon="/stake.svg" 
                     textSize="sm:text-lg" 
                     onClick={handleStake}
-                    loading={txStates.stake === 'pending'}
-                    disabled={txStates.stake === 'pending'}
+                    loading={txStates.stake === 'pending' || isStakingDataLoading}
+                    disabled={txStates.stake === 'pending' || isStakingDataLoading}
                 >
-                    {txStates.stake === 'pending' ? 'Staking...' : 'Stake CALVIN'}
+                    {txStates.stake === 'pending' ? 'Staking...' : 
+                     isStakingDataLoading ? 'Loading...' : 'Stake CALVIN'}
                 </Button>
                 
                 <StakeModal isOpen={isStakeModalOpen} onClose={() => setIsStakeModalOpen(false)} />
@@ -106,10 +114,11 @@ export default function ActionButtons() {
                     icon="/deposit.svg" 
                     textSize="sm:text-lg" 
                     onClick={handleDeposit}
-                    loading={txStates.deposit === 'pending'}
-                    disabled={txStates.deposit === 'pending' || !tierInfo}
+                    loading={txStates.deposit === 'pending' || isVaultDataLoading}
+                    disabled={txStates.deposit === 'pending' || !tierInfo || isVaultDataLoading}
                 >
-                    {txStates.deposit === 'pending' ? 'Depositing...' : 'Deposit USDC'}
+                    {txStates.deposit === 'pending' ? 'Depositing...' : 
+                     isVaultDataLoading ? 'Loading...' : 'Deposit USDC'}
                 </Button>
                 <Button 
                     className="flex-1" 
@@ -117,10 +126,11 @@ export default function ActionButtons() {
                     icon="/withdraw.svg" 
                     textSize="sm:text-lg" 
                     onClick={handleWithdraw}
-                    loading={txStates.withdraw === 'pending'}
-                    disabled={txStates.withdraw === 'pending' || !hasVaultShares}
+                    loading={txStates.withdraw === 'pending' || isVaultDataLoading}
+                    disabled={txStates.withdraw === 'pending' || !hasVaultShares || isVaultDataLoading}
                 >
-                    {txStates.withdraw === 'pending' ? 'Withdrawing...' : 'Withdraw USDC'}
+                    {txStates.withdraw === 'pending' ? 'Withdrawing...' : 
+                     isVaultDataLoading ? 'Loading...' : 'Withdraw USDC'}
                 </Button>
             </div>
 
@@ -132,10 +142,11 @@ export default function ActionButtons() {
                     icon="/stake.svg" 
                     textSize="sm:text-base" 
                     onClick={handleStake}
-                    loading={txStates.stake === 'pending' || txStates.unstake === 'pending'}
-                    disabled={txStates.stake === 'pending' || txStates.unstake === 'pending'}
+                    loading={txStates.stake === 'pending' || txStates.unstake === 'pending' || isStakingDataLoading}
+                    disabled={txStates.stake === 'pending' || txStates.unstake === 'pending' || isStakingDataLoading}
                 >
-                    {(txStates.stake === 'pending' || txStates.unstake === 'pending') ? 'Processing...' : 'Manage CALVIN'}
+                    {(txStates.stake === 'pending' || txStates.unstake === 'pending') ? 'Processing...' : 
+                     isStakingDataLoading ? 'Loading...' : 'Manage CALVIN'}
                 </Button>
             </div>
 

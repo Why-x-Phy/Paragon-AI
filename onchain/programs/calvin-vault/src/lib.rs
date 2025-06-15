@@ -11,7 +11,7 @@ pub mod errors;
 use instructions::*;
 
 // Program ID will be set during deployment
-declare_id!("7rky4NGhHtUREVJLKnAKwapDBmzCMbEno6VDcFZXyWxA");
+declare_id!("2nLsDVW67Qw5LXGvaTzUQ7xRxytY52APWJAz2c7aqqyJ");
 
 /// The main vault program
 #[program]

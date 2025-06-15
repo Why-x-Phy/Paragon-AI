@@ -140,6 +140,9 @@ pub fn unstake_calvin(ctx: Context<UnstakeCalvin>, amount: u64) -> Result<()> {
         .ok_or(StakingError::ArithmeticError)?;
 
     // Burn corresponding Vault Pass tokens
+    // Convert from CALVIN decimals (6) to Vault Pass decimals (0)
+    let vault_pass_burn_amount = amount / 1_000_000; // Convert from micro-CALVIN to whole CALVIN
+    
     // The user is the owner of their token account, so they must authorize the burn
     token::burn(
         CpiContext::new(
@@ -150,12 +153,12 @@ pub fn unstake_calvin(ctx: Context<UnstakeCalvin>, amount: u64) -> Result<()> {
                 authority: ctx.accounts.user.to_account_info(), // User owns the token account
             },
         ),
-        amount,
+        vault_pass_burn_amount,
     )?;
 
     // Update total vault passes
     stake_vault.total_vault_passes = stake_vault.total_vault_passes
-        .checked_sub(amount)
+        .checked_sub(vault_pass_burn_amount)
         .ok_or(StakingError::ArithmeticError)?;
 
     // Recalculate tier based on new staked amount

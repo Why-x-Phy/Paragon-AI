@@ -8,7 +8,8 @@ import {
 } from "@solana/web3.js";
 import { 
   TOKEN_PROGRAM_ID,
-  ASSOCIATED_TOKEN_PROGRAM_ID
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync
 } from "@solana/spl-token";
 import { CalvinStaking } from "../target/types/calvin_staking";
 import { Vault } from "../target/types/vault";
@@ -18,7 +19,7 @@ import { Vault } from "../target/types/vault";
  */
 async function initializePrograms() {
   // Set up provider for devnet
-  const connection = new anchor.web3.Connection("https://api.devnet.solana.com", "confirmed");
+  const connection = new anchor.web3.Connection("https://devnet.helius-rpc.com/?api-key=acfda155-4d7f-4930-8ac4-ddd9eebfb70d", "confirmed");
   
   // Load the authority wallet (you'll need to provide this)
   const authorityKeypair = Keypair.fromSecretKey(
@@ -32,8 +33,8 @@ async function initializePrograms() {
   anchor.setProvider(provider);
 
   // Program IDs from your deployed contracts
-  const STAKING_PROGRAM_ID = new PublicKey("BMeQT4VD9X4RFYT8MAmofKJk14dFyFrBWqJJzTeNgGtW");
-  const VAULT_PROGRAM_ID = new PublicKey("7rky4NGhHtUREVJLKnAKwapDBmzCMbEno6VDcFZXyWxA");
+  const STAKING_PROGRAM_ID = new PublicKey("GocZdo1RPcsQnbiQrFp6Ybgd3bWUp48Jd4wytN3QN3Vw");
+const VAULT_PROGRAM_ID = new PublicKey("2nLsDVW67Qw5LXGvaTzUQ7xRxytY52APWJAz2c7aqqyJ");
   
   // Token addresses (Devnet)
   const CALVIN_MINT = new PublicKey("CrWbUJ4kMgduYDVRK8bDXhNBHr8cScixi79nGdGejnb1"); // Devnet CALVIN
@@ -126,9 +127,10 @@ async function initializePrograms() {
       VAULT_PROGRAM_ID
     );
 
-    const [usdcVault] = PublicKey.findProgramAddressSync(
-      [vaultAuthority.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), USDC_MINT.toBuffer()].flat(),
-      ASSOCIATED_TOKEN_PROGRAM_ID
+    const usdcVault = getAssociatedTokenAddressSync(
+      USDC_MINT,
+      vaultAuthority,
+      true  // allowOwnerOffCurve - PDAs are off-curve by design!
     );
 
     const [sharesMint] = PublicKey.findProgramAddressSync(
@@ -194,21 +196,22 @@ async function initializePrograms() {
       VAULT_PROGRAM_ID
     );
 
-    // Trading tokens to create accounts for
+    // Trading tokens to create accounts for (DEVNET ONLY - these tokens exist on devnet)
     const TRADING_TOKENS = [
-      { symbol: "SOL", mint: new PublicKey("So11111111111111111111111111111111111111112") },
-      { symbol: "JUP", mint: new PublicKey("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN") },
-      { symbol: "BONK", mint: new PublicKey("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263") },
-      // Add more tokens as needed...
+      { symbol: "USDC", mint: USDC_MINT }, // ✅ USDC exists on devnet
+      { symbol: "SOL", mint: new PublicKey("So11111111111111111111111111111111111111112") }, // ✅ SOL exists everywhere
+      // Note: JUP and BONK mainnet addresses don't exist on devnet
+      // We'll add devnet-specific tokens later or create test tokens
     ];
 
     for (const token of TRADING_TOKENS) {
       try {
         console.log(`  Creating account for ${token.symbol}...`);
         
-        const [vaultTokenAccount] = PublicKey.findProgramAddressSync(
-          [vaultAuthority.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), token.mint.toBuffer()].flat(),
-          ASSOCIATED_TOKEN_PROGRAM_ID
+        const vaultTokenAccount = getAssociatedTokenAddressSync(
+          token.mint,
+          vaultAuthority,
+          true  // allowOwnerOffCurve - PDAs are off-curve by design!
         );
 
         const tx3 = await vaultProgram.methods

@@ -1,9 +1,9 @@
 'use client'
 
 import { SessionProvider } from 'next-auth/react'
-import { DiscordAuthProvider } from './DiscordAuthProvider'
+import DiscordAuthProvider from './DiscordAuthProvider'
 
-export const AuthProviders = ({ children }) => {
+export default function AuthProviders({ children }) {
   return (
     <SessionProvider>
       <DiscordAuthProvider>

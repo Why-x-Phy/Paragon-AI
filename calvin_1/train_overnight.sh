@@ -14,8 +14,8 @@ set -e  # Exit on any error
 
 # Token configurations: "TOKEN_ADDRESS:SYMBOL"
 TOKENS=(
-    "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof:RENDER"
-    "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3:PYTH"
+    "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R:RAY"
+    "85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ:W"
     "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm:\$WIF"
 )
 

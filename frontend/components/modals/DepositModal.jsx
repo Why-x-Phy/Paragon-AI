@@ -4,38 +4,41 @@ import { useState } from 'react';
 import Modal from '@/components/UI/Modal';
 import BalanceCard from '@/components/BalanceCard';
 import Button from '@/components/UI/Button';
-import { useVaultData } from '@/hooks/useVaultData';
+import { useVault } from '@/hooks/useVault';
 
 export default function DepositModal({ isOpen, onClose }) {
   const [amount, setAmount] = useState('');
-  const { vaultData } = useVaultData();
+  const { userTokenBalances, userVaultPosition, depositUsdc, txStates } = useVault();
   
   const balances = {
     title: 'Your Balance',
     balances: [
-      { label: '$USDC Locked', amount: vaultData.userBalance.balances[1].amount },
-      { label: '$USDC in Wallet', amount: 5643 }
+      { label: '$USDC Locked', amount: userVaultPosition?.usdcDepositedFormatted || '0' },
+      { label: '$USDC in Wallet', amount: userTokenBalances?.usdcFormatted || '0' }
     ]
   };
 
   const handleDeposit = async () => {
     try {
-      // TODO: Add validation
       if (!amount || Number(amount) <= 0) {
         alert('Please enter a valid amount');
         return;
       }
 
-      // TODO: Replace with actual contract call
-      console.log('Depositing:', amount, 'USDC');
-      // const tx = await vaultContract.deposit(amount);
-      // await tx.wait();
+      // Check if user has enough USDC
+      const userUsdcBalance = parseFloat(userTokenBalances?.usdcFormatted || '0');
+      if (userUsdcBalance < Number(amount)) {
+        alert(`Insufficient USDC balance. You have ${userUsdcBalance} USDC`);
+        return;
+      }
+
+      await depositUsdc(Number(amount));
       
       setAmount('');
       onClose();
     } catch (error) {
       console.error('Deposit failed:', error);
-      alert('Failed to deposit. Please try again.');
+      // Error handling is done in the hook with toast notifications
     }
   };
 
@@ -64,8 +67,9 @@ export default function DepositModal({ isOpen, onClose }) {
                     icon="/deposit.svg"
                     textSize="text-lg"
                     onClick={handleDeposit}
+                    disabled={txStates.deposit === 'pending'}
                 >
-                Deposit USDC
+                {txStates.deposit === 'pending' ? 'Depositing...' : 'Deposit USDC'}
                 </Button>
             </div>
         </div>

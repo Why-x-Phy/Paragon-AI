@@ -5,8 +5,10 @@
     "lint": "prettier */*.js \"*/**/*{.js,.ts}\" --check"
   },
   "dependencies": {
+    "@auth/nextjs": "^0.0.0-380f8d56",
     "@coral-xyz/anchor": "^0.31.1",
-    "@solana/spl-token": "^0.4.13"
+    "@solana/spl-token": "^0.4.13",
+    "next-auth": "^5.0.0-beta.28"
   },
   "devDependencies": {
     "@types/bn.js": "^5.1.0",

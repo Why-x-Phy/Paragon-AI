@@ -35,10 +35,10 @@ export const MOCK_DATA = {
 // Smart Contract Configuration - Using environment variables for deployed programs
 export const CONTRACTS = {
   // Calvin Staking Program (deployed)
-  CALVIN_STAKING_PROGRAM: process.env.NEXT_PUBLIC_CALVIN_STAKING_PROGRAM || 'qUKhRct5LW3e9Zwn1e7DvKscsSwVv2S952D7nx39Ach',
+  CALVIN_STAKING_PROGRAM: process.env.NEXT_PUBLIC_CALVIN_STAKING_PROGRAM || 'GocZdo1RPcsQnbiQrFp6Ybgd3bWUp48Jd4wytN3QN3Vw',
   
   // Calvin Vault Program (deployed)
-  CALVIN_VAULT_PROGRAM: process.env.NEXT_PUBLIC_CALVIN_VAULT_PROGRAM || '7rky4NGhHtUREVJLKnAKwapDBmzCMbEno6VDcFZXyWxA',
+  CALVIN_VAULT_PROGRAM: process.env.NEXT_PUBLIC_CALVIN_VAULT_PROGRAM || '2nLsDVW67Qw5LXGvaTzUQ7xRxytY52APWJAz2c7aqqyJ',
   
   // Token Addresses
   CALVIN_TOKEN: process.env.NEXT_PUBLIC_CALVIN_TOKEN || 'CrWbUJ4kMgduYDVRK8bDXhNBHr8cScixi79nGdGejnb1',

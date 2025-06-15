@@ -95,6 +95,12 @@ export const useVault = () => {
       throw new Error('Wallet not connected');
     }
 
+    // Only check for token balance data (needed for staking validation)
+    // We don't need vault state since staking only uses the Staking Program
+    if (!userTokenBalances) {
+      throw new Error('Token balance data not loaded yet - please wait');
+    }
+
     updateTxState('stake', UI.TX_PENDING);
     try {
       const signature = await vaultClient.stakeCalvin(amount);
@@ -124,7 +130,7 @@ export const useVault = () => {
       // Reset state after delay
       setTimeout(() => updateTxState('stake', UI.TX_IDLE), 3000);
     }
-  }, [vaultClient, wallet.connected, fetchUserData, updateTxState]);
+  }, [vaultClient, wallet.connected, fetchUserData, updateTxState, userTokenBalances]);
 
   // Unstake CALVIN tokens
   const unstakeCalvin = useCallback(async (amount) => {

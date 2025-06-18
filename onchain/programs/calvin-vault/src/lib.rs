@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount};
+// Removed unused token imports - we use them in specific instruction files
 
 // Import modules
 pub mod constants;
@@ -7,8 +7,10 @@ pub mod state;
 pub mod utils;
 pub mod instructions;
 pub mod errors;
+pub mod oracle_config;
 
 use instructions::*;
+use errors::ErrorCode;
 
 // Program ID will be set during deployment
 declare_id!("2nLsDVW67Qw5LXGvaTzUQ7xRxytY52APWJAz2c7aqqyJ");
@@ -93,62 +95,88 @@ pub mod vault {
     ) -> Result<()> {
         instructions::initialize_token_accounts(ctx)
     }
-}
 
-/// Error codes for the vault program
-#[error_code]
-pub enum ErrorCode {
-    #[msg("Arithmetic error")]
-    ArithmeticError,
+    // 🔒 NEW SECURITY INSTRUCTIONS
 
-    #[msg("Not qualified for deposit - insufficient stake or NFTs")]
-    NotQualifiedForDeposit,
+    /// Add a token to the whitelist (emergency owners only)
+    pub fn add_whitelisted_token(
+        ctx: Context<AddWhitelistedToken>,
+        mint: Pubkey,
+        symbol: String,
+        pyth_oracle: Pubkey,
+        switchboard_oracle: Option<Pubkey>,
+        max_allocation_bps: u16,
+    ) -> Result<()> {
+        instructions::add_whitelisted_token(ctx, mint, symbol, pyth_oracle, switchboard_oracle, max_allocation_bps)
+    }
 
-    #[msg("Deposit exceeds cap for your tier")]
-    DepositExceedsCap,
+    /// Remove a token from the whitelist (emergency owners only)
+    pub fn remove_whitelisted_token(
+        ctx: Context<RemoveWhitelistedToken>,
+        mint: Pubkey,
+    ) -> Result<()> {
+        instructions::remove_whitelisted_token(ctx, mint)
+    }
 
-    #[msg("Insufficient shares for withdrawal")]
-    InsufficientShares,
+    /// Add an emergency owner for multisig (current owners only)
+    pub fn add_emergency_owner(
+        ctx: Context<AddEmergencyOwner>,
+        new_owner: Pubkey,
+        new_required_signatures: u8,
+    ) -> Result<()> {
+        instructions::add_emergency_owner(ctx, new_owner, new_required_signatures)
+    }
 
-    #[msg("Insufficient liquidity for withdrawal")]
-    InsufficientLiquidity,
+    /// Propose an emergency action (emergency owners only)
+    pub fn propose_emergency_action(
+        ctx: Context<ProposeEmergencyAction>,
+        operation_type: state::OperationType,
+        params: Vec<u8>,
+    ) -> Result<()> {
+        instructions::propose_emergency_action(ctx, operation_type, params)
+    }
 
-    #[msg("Vault is paused")]
-    VaultPaused,
+    /// Approve an emergency action (emergency owners only)
+    pub fn approve_emergency_action(
+        ctx: Context<ApproveEmergencyAction>,
+        operation_id: u64,
+    ) -> Result<()> {
+        instructions::approve_emergency_action(ctx, operation_id)
+    }
 
-    #[msg("Invalid price type from Pyth")]
-    InvalidPriceType,
+    /// Execute an approved emergency action (anyone can execute once threshold reached)
+    pub fn execute_emergency_action(
+        ctx: Context<ExecuteEmergencyAction>,
+        operation_id: u64,
+    ) -> Result<()> {
+        instructions::execute_emergency_action(ctx, operation_id)
+    }
 
-    #[msg("Price is not in trading status from Pyth")]
-    PriceNotTrading,
+    /// Enhanced pause controls - pause trading only
+    pub fn pause_trading(
+        ctx: Context<PauseTrading>,
+    ) -> Result<()> {
+        instructions::pause_trading(ctx)
+    }
 
-    #[msg("Price is too stale from Pyth")]
-    PriceTooStale,
+    /// Enhanced pause controls - pause deposits only
+    pub fn pause_deposits(
+        ctx: Context<PauseDeposits>,
+    ) -> Result<()> {
+        instructions::pause_deposits(ctx)
+    }
 
-    #[msg("Jupiter swap failed")]
-    JupiterSwapFailed,
+    /// Enhanced pause controls - pause withdrawals (emergency only)
+    pub fn pause_withdrawals(
+        ctx: Context<PauseWithdrawals>,
+    ) -> Result<()> {
+        instructions::pause_withdrawals(ctx)
+    }
 
-    #[msg("Only the vault owner can perform this action")]
-    UnauthorizedOwner,
-
-    #[msg("Only Calvin AI can perform this action")]
-    UnauthorizedCalvin,
-
-    #[msg("Insufficient accounts provided for Jupiter swap")]
-    InsufficientAccounts,
-
-    #[msg("Invalid oracle account provided")]
-    InvalidOracleAccount,
-
-    #[msg("Oracle not found for token")]
-    OracleNotFound,
-
-    #[msg("Stale oracle price data")]
-    StaleOraclePrice,
-
-    #[msg("Invalid price data from oracle")]
-    InvalidPriceData,
-
-    #[msg("Too many tokens - maximum 25 supported")]
-    TooManyTokens,
+    /// Enhanced pause controls - pause all operations
+    pub fn pause_all(
+        ctx: Context<PauseAll>,
+    ) -> Result<()> {
+        instructions::pause_all(ctx)
+    }
 } 

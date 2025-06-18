@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, MintTo, Transfer, FreezeAccount};
 use anchor_spl::associated_token::AssociatedToken;
 
-use crate::{constants::*, state::*, utils, ErrorCode};
+use crate::{constants::*, state::*, utils, errors::ErrorCode};
 
 #[derive(Accounts)]
 #[instruction(amount: u64)]
@@ -14,6 +14,7 @@ pub struct Deposit<'info> {
     #[account(
         mut,
         constraint = !vault.paused @ ErrorCode::VaultPaused,
+        constraint = !vault.deposits_paused @ ErrorCode::DepositsPaused,
     )]
     pub vault: Account<'info, Vault>,
     
@@ -88,50 +89,134 @@ pub struct Deposit<'info> {
 pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
     // Get accounts
     let vault = &mut ctx.accounts.vault;
-    let user_position = &mut ctx.accounts.user_position;
+    let vault_key = vault.key(); // Get vault key before mutable operations
     let user = &ctx.accounts.user;
+    let user_position = &mut ctx.accounts.user_position;
+    
+    // 🔒 REENTRANCY PROTECTION
+    if vault.reentrancy_guard {
+        emit!(crate::state::SecurityEvent {
+            event_type: crate::state::SecurityEventType::ReentrancyAttempt,
+            severity: crate::state::SecuritySeverity::Critical,
+            vault: vault_key,
+            details: format!("Reentrancy attempt detected in deposit by user {}", user.key()),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        return Err(error!(ErrorCode::ReentrancyDetected));
+    }
+    vault.reentrancy_guard = true;
+    
+    // 🔒 PAUSE CHECKS - Allow granular control
+    if vault.deposits_paused {
+        vault.reentrancy_guard = false;
+        return Err(error!(ErrorCode::DepositsPaused));
+    }
+    
+    // 🔒 ENHANCED ARITHMETIC SAFETY
+    if let Err(e) = utils::validate_deposit_amount(amount) {
+        vault.reentrancy_guard = false;
+        return Err(e);
+    }
     
     // Initialize user position if it's new
     if user_position.user_authority == Pubkey::default() {
         user_position.user_authority = user.key();
-        user_position.vault = vault.key();
+        user_position.vault = vault_key;
         user_position.total_deposits_usdc = 0;
         user_position.last_deposit_timestamp = Clock::get()?.unix_timestamp;
         user_position.bump = ctx.bumps.user_position;
     }
     
+    // 🔒 CPI RATE LIMITING for staking program calls
+    if let Err(e) = utils::validate_and_track_cpi_call(vault, &ctx.accounts.staking_program.key(), &vault_key) {
+        vault.reentrancy_guard = false;
+        return Err(e);
+    }
+    
     // Verify user's tier and check deposit caps via staking program
-    utils::verify_tier_and_check_cap(
+    if let Err(e) = utils::verify_tier_and_check_cap(
         &ctx.accounts.staking_program.to_account_info(),
         &user.key(),
         user_position.total_deposits_usdc,
         amount,
         vault,
         &ctx.remaining_accounts,
-    )?;
+    ) {
+        vault.reentrancy_guard = false;
+        return Err(e);
+    }
     
     // Calculate deposit fee
-    let deposit_fee = utils::calculate_deposit_fee(amount)?;
+    let deposit_fee = match utils::calculate_deposit_fee(amount) {
+        Ok(fee) => fee,
+        Err(e) => {
+            vault.reentrancy_guard = false;
+            return Err(e);
+        }
+    };
     
     // Get current NAV (for calculating shares)
-    let vault_nav = utils::current_nav_usdc(
+    // remaining_accounts format: [0] stake_config, [1] user_stake, [2+] vault token accounts, price accounts, mint accounts
+    // Skip staking accounts (first 2) and pass the rest to utility function for parsing
+    let nav_parsing_accounts = &ctx.remaining_accounts[2..];
+    
+    let vault_nav = match utils::current_nav_usdc(
         vault,
         &ctx.accounts.vault_usdc_token,
-        &[],  // Only USDC for a simple implementation
-        &[],  // No price accounts needed for now
-        &[],  // No token mints needed for now
-    )?;
+        nav_parsing_accounts,
+    ) {
+        Ok(nav) => nav,
+        Err(e) => {
+            vault.reentrancy_guard = false;
+            return Err(e);
+        }
+    };
+    
+    // 🔒 VALIDATE NAV BOUNDS
+    if vault_nav > MAX_TOTAL_NAV {
+        vault.reentrancy_guard = false;
+        emit!(crate::state::SecurityEvent {
+            event_type: crate::state::SecurityEventType::ArithmeticSafetyViolation,
+            severity: crate::state::SecuritySeverity::High,
+            vault: vault_key,
+            details: format!("Vault NAV {} exceeds maximum {}", vault_nav, MAX_TOTAL_NAV),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        return Err(error!(ErrorCode::NavTooHigh));
+    }
     
     // Calculate shares to mint
-    let shares_to_mint = utils::calculate_shares_to_mint(
+    let shares_to_mint = match utils::calculate_shares_to_mint(
         amount,
         deposit_fee,
         vault.total_shares,
         vault_nav,
-    )?;
+    ) {
+        Ok(shares) => shares,
+        Err(e) => {
+            vault.reentrancy_guard = false;
+            return Err(e);
+        }
+    };
+    
+    // 🔒 VALIDATE SHARE PRICE BOUNDS
+    if vault.total_shares > 0 && vault_nav > 0 {
+        let share_price = vault_nav.checked_div(vault.total_shares).unwrap_or(0);
+        if share_price < MIN_SHARE_PRICE || share_price > MAX_SHARE_PRICE {
+            vault.reentrancy_guard = false;
+            emit!(crate::state::SecurityEvent {
+                event_type: crate::state::SecurityEventType::ArithmeticSafetyViolation,
+                severity: crate::state::SecuritySeverity::High,
+                vault: vault_key,
+                details: format!("Share price {} out of bounds [{}, {}]", share_price, MIN_SHARE_PRICE, MAX_SHARE_PRICE),
+                timestamp: Clock::get()?.unix_timestamp,
+            });
+            return Err(error!(ErrorCode::SharePriceOutOfBounds));
+        }
+    }
     
     // Transfer deposit fee to treasury
-    token::transfer(
+    if let Err(e) = token::transfer(
         CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
@@ -141,11 +226,14 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
             },
         ),
         deposit_fee,
-    )?;
+    ) {
+        vault.reentrancy_guard = false;
+        return Err(e.into());
+    }
     
     // Transfer remaining amount to vault
     let amount_after_fee = amount.checked_sub(deposit_fee).unwrap();
-    token::transfer(
+    if let Err(e) = token::transfer(
         CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
@@ -155,7 +243,10 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
             },
         ),
         amount_after_fee,
-    )?;
+    ) {
+        vault.reentrancy_guard = false;
+        return Err(e.into());
+    }
     
     // Mint share tokens to user
     let vault_authority_seeds = &[
@@ -163,7 +254,7 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         &[vault.authority_bump],
     ];
     
-    token::mint_to(
+    if let Err(e) = token::mint_to(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             MintTo {
@@ -174,10 +265,13 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
             &[vault_authority_seeds],
         ),
         shares_to_mint,
-    )?;
+    ) {
+        vault.reentrancy_guard = false;
+        return Err(e.into());
+    }
     
     // 🔒 CRITICAL: Freeze user's share token account to make shares non-transferable
-    token::freeze_account(
+    if let Err(e) = token::freeze_account(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             FreezeAccount {
@@ -187,7 +281,10 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
             },
             &[vault_authority_seeds],
         ),
-    )?;
+    ) {
+        vault.reentrancy_guard = false;
+        return Err(e.into());
+    }
     
     // Update vault state
     vault.total_shares = vault.total_shares
@@ -200,16 +297,23 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         .ok_or(error!(ErrorCode::ArithmeticError))?;
     user_position.last_deposit_timestamp = Clock::get()?.unix_timestamp;
     
+    // 🔒 CLEAR REENTRANCY GUARD BEFORE EMITTING EVENTS
+    vault.reentrancy_guard = false;
+    
     // Emit deposit event
     emit!(crate::state::Deposit {
         user: user.key(),
+        vault: vault_key,
         amount,
         shares: shares_to_mint,
         fee: deposit_fee,
+        user_tier: 2, // Default tier 2 - actual tier validation happens in verify_tier_and_check_cap
+        share_price: if vault.total_shares > 0 { vault_nav / vault.total_shares } else { 1_000_000 }, // 1 USDC default
+        timestamp: Clock::get()?.unix_timestamp,
     });
     
     msg!(
-        "Deposited {} USDC with fee {}, minted {} shares (frozen). Total shares: {}",
+        "🔒 Secure deposit: {} USDC with fee {}, minted {} shares (frozen). Total shares: {}",
         amount_after_fee,
         deposit_fee,
         shares_to_mint,

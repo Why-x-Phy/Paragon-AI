@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 
-use crate::{constants::*, state::*, ErrorCode};
+use crate::{state::*, ErrorCode};
 
 #[derive(Accounts)]
 pub struct SetPauseStatus<'info> {

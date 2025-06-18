@@ -72,13 +72,13 @@ pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()> {
     let user_position = &mut ctx.accounts.user_position;
     let user = &ctx.accounts.user;
     
-    // Get current NAV (for calculating withdrawal amount)
+        // Get current NAV (for calculating withdrawal amount)
+    // nav_accounts format: groups of 3 [token_account, price_account, mint_account, ...]
+    
     let vault_nav = utils::current_nav_usdc(
         vault,
         &ctx.accounts.vault_usdc_token,
-        &[],  // Only USDC for a simple implementation
-        &[],  // No price accounts needed for now
-        &[],  // No token mints needed for now
+        &ctx.remaining_accounts,
     )?;
     
     // Calculate USDC amount to withdraw
@@ -170,8 +170,10 @@ pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()> {
     // Emit withdraw event
     emit!(crate::state::Withdraw {
         user: user.key(),
+        vault: vault.key(),
         amount: usdc_amount,
         shares,
+        timestamp: Clock::get()?.unix_timestamp,
     });
     
     msg!(

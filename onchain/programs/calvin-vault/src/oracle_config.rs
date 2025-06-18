@@ -25,19 +25,46 @@ pub const PYTH_PRICE_FEEDS: &[(&str, &str)] = &[
     ("ORCA", "0x37505261e557e251290b8c8899453064e8d760ed5c65a779726f2490980da74c"),
 ];
 
-// Convert hex string to Pubkey
+// Switchboard On-Demand Feed Addresses (Mainnet)
+pub const SWITCHBOARD_FEEDS: &[(&str, &str)] = &[
+    ("TRUMP", "9wcBMATS8bGLQ2UcRuYjsRAD7TPqB1CMhqfueBx78Uj2"),
+    ("WIF", "8GqzQoqqKzJoNaWZtf2udVGV3Fn74W9DQayYu1S1zvkt"),
+    ("ATH", "21JapEAFu8r8SAAQjB2fURfjiosnTHAFFm4S27qe4vVF"),
+    ("BONK", "7GCiue6chgGuk6BvaurQNWD1Ervho8zEdcNWt5ZCYQhu"),
+    ("FARTCOIN", "EE8Uyquv38j2JmyCiPprCNUxDBTrzpCXqR4hL3RGDUGh"),
+    ("JTO", "E9fHVUZnvT4i8H3jQLb6g2tSpcagunJpjwCGNTYxwKSE"),
+    ("JUP", "2F9M59yYc28WMrAymNWceaBEk8ZmDAjUAKULp8seAJF3"),
+    ("MEW", "7Eev1vbsrgEmiRbVjyyFL8nqRKQt7jNPVtxiS4C6ewns"),
+    ("MNDE", "CwtLbG7w71oCasCMYR8KARZYEVJK5x1GXdoYpqjctp7E"),
+    ("ORCA", "BFWHemmj4ZtvqQVsWrGrFrL2U8tz7Lzq8nhy1KRMVezL"),
+    ("PENGU", "DAG9yMr4FbTVd41Jojw6X589EHiPgR375SP5AdAAW7tH"),
+    ("POPCAT", "5FWVcePyDK5jF6ZqFgmEMyu9qu5qdsswwvMd7GvRmfFW"),
+    ("PYTH", "72ukr6M31f9cCzxvZT4Ba7AGyWSFLQGHjXU6WUzN4xD7"),
+    ("RAY", "AJkAFiXdbMonys8rTXZBrRnuUiLcDFdkyoPuvrVKXhex"),
+    ("RENDER", "B6xHth4K3fj3KK1TASXtHfbAReShYW3EihgwSKvhsugz"),
+    ("SPX", "8m5YKLgnftRTcVXJLk7bV37xc2qrWR9TkXq4TY3FP3pz"),
+    ("VIRTUAL", "34aJFwk2jTKmB2C6zWnT641ABCQv1P2ghrob57i1gFdg"),
+    ("W", "DwjV47HwtHW5YR1CPndw3Fq1QMeYyvYA7jYXhMtcUCte"),
+    ("SOL", "E8TLLh5jkYDvSXfAES7qe3s8Cfjj4hyvjksuvUHe8NEw"),
+    ("USDC", "aHTvxuDvCRRnmJDDR1JkfLa4SpCNsgC4vDeLMEcN3zY"),
+];
+
+// Convert hex string to Pubkey (manual implementation without hex crate)
 pub fn hex_string_to_pubkey(hex_str: &str) -> Result<Pubkey> {
     let hex_clean = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-    let bytes = hex::decode(hex_clean)
-        .map_err(|_| error!(ErrorCode::InvalidOracleAccount))?;
     
-    if bytes.len() != 32 {
-        return Err(error!(ErrorCode::InvalidOracleAccount));
+    if hex_clean.len() != 64 {
+        return Err(error!(crate::errors::ErrorCode::InvalidOracleAccount));
     }
     
-    let mut pubkey_bytes = [0u8; 32];
-    pubkey_bytes.copy_from_slice(&bytes);
-    Ok(Pubkey::from(pubkey_bytes))
+    let mut bytes = [0u8; 32];
+    for i in 0..32 {
+        let byte_str = &hex_clean[i*2..i*2+2];
+        bytes[i] = u8::from_str_radix(byte_str, 16)
+            .map_err(|_| error!(crate::errors::ErrorCode::InvalidOracleAccount))?;
+    }
+    
+    Ok(Pubkey::from(bytes))
 }
 
 // Get all oracle pubkeys for vault initialization
@@ -94,6 +121,26 @@ pub fn get_oracle_for_token_mint(token_mint: &Pubkey) -> Option<Pubkey> {
         .iter()
         .find(|(feed_symbol, _)| *feed_symbol == symbol)
         .and_then(|(_, hex_str)| hex_string_to_pubkey(hex_str).ok())
+}
+
+// Get Switchboard oracle for a specific token symbol
+pub fn get_switchboard_oracle_for_symbol(symbol: &str) -> Option<Pubkey> {
+    SWITCHBOARD_FEEDS
+        .iter()
+        .find(|(feed_symbol, _)| *feed_symbol == symbol)
+        .and_then(|(_, addr_str)| addr_str.parse().ok())
+}
+
+// Get both Pyth and Switchboard oracles for a token symbol
+pub fn get_dual_oracle_config(symbol: &str) -> (Option<Pubkey>, Option<Pubkey>) {
+    let pyth_oracle = PYTH_PRICE_FEEDS
+        .iter()
+        .find(|(feed_symbol, _)| *feed_symbol == symbol)
+        .and_then(|(_, hex_str)| hex_string_to_pubkey(hex_str).ok());
+    
+    let switchboard_oracle = get_switchboard_oracle_for_symbol(symbol);
+    
+    (pyth_oracle, switchboard_oracle)
 }
 
 // Vault state update for oracle configuration - returns (oracle_accounts, token_oracle_mapping)

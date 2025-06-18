@@ -75,7 +75,7 @@ pub fn initialize(
 ) -> Result<()> {
     let vault = &mut ctx.accounts.vault;
     
-    // Initialize vault state with separate authorities
+    // Initialize basic vault state
     vault.emergency_owner = emergency_owner;
     vault.calvin_authority = calvin_authority;
     vault.staking_program_id = staking_program_id;
@@ -96,11 +96,50 @@ pub fn initialize(
     vault.shares_mint_bump = ctx.bumps.shares_mint;
     vault.authority_bump = ctx.bumps.vault_authority;
     
-    msg!("Vault initialized:");
+    // 🔒 Initialize security features with safe defaults
+    vault.reentrancy_guard = false;
+    
+    // Start with no granular pauses (all operations enabled)
+    vault.trading_paused = false;
+    vault.deposits_paused = false;
+    vault.withdrawals_paused = false;
+    
+    // Initialize multisig with single owner for deployment compatibility
+    vault.emergency_owners = [Pubkey::default(); 2];
+    vault.emergency_owners[0] = emergency_owner; // Set first owner
+    vault.emergency_owners_count = 1;            // Only one owner initially
+    vault.required_signatures = 1;               // Single signature required initially
+    vault.next_operation_id = 1;                 // Start operation IDs at 1
+    
+    // 🔒 Initialize CPI rate limiting with empty trackers
+    vault.cpi_call_counts = [crate::state::CpiCallTracker {
+        program_id: Pubkey::default(),
+        calls_per_hour: 0,
+        last_reset: 0,
+        max_calls_per_hour: 200,
+    }; 2];
+    vault.cpi_trackers_count = 0; // No trackers initially
+    
+    // Reserved space removed for stack size optimization
+    // vault.reserved = [0u8; 0];
+    
+    // Emit security event for vault initialization
+    emit!(crate::state::SecurityEvent {
+        event_type: crate::state::SecurityEventType::EmergencyActionExecuted,
+        severity: crate::state::SecuritySeverity::Medium,
+        vault: vault.key(),
+        details: format!("Vault initialized with emergency owner: {}", emergency_owner),
+        timestamp: Clock::get()?.unix_timestamp,
+    });
+    
+    msg!("🔒 Enhanced Vault initialized:");
     msg!("  Emergency owner: {}", emergency_owner);
     msg!("  Calvin authority: {}", calvin_authority);
     msg!("  Staking program: {}", staking_program_id);
     msg!("  Per NFT cap: {}", per_nft_cap);
+    msg!("  Security features: ENABLED");
+    msg!("  Multisig owners: 1 (can be expanded to 3)");
+    msg!("  Required signatures: 1 (can be increased)");
     
     Ok(())
 } 

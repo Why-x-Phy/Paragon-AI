@@ -1,94 +1,21 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, TokenAccount, Transfer};
-use pyth_sdk_solana::state::{PriceAccount, PriceStatus};
+use anchor_spl::token::{self, TokenAccount, Mint, Transfer};
+use pyth_sdk_solana::state::{PriceStatus};
+use crate::errors::ErrorCode;
+use crate::state::Vault;
+use crate::constants::*;
+// Oracle config functions are imported only where needed
 
-use crate::{constants::*, state::*, ErrorCode};
-
-// Oracle configuration functions
-// Note: This would be better as a separate module, but for now we'll include the logic here
-
-/// Get oracle pubkey for a specific token mint
-pub fn get_oracle_for_token_mint(token_mint: &Pubkey) -> Option<Pubkey> {
-    // Token mint to symbol mapping
-    let token_mint_str = token_mint.to_string();
-    
-    let symbol = match token_mint_str.as_str() {
-        "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU" => "USDC", // Devnet USDC
-        "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN" => "TRUMP",
-        "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof" => "RENDER",
-        "JUPyiwrYJFskUPiHa7hc8VUtAeFoSYbKedZNsD7c" => "JUP",
-        "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263" => "BONK",
-        "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump" => "FARTCOIN",
-        "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R" => "RAY",
-        "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL" => "JTO",
-        "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3npgxbkkTs8LG" => "PYTH",
-        "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm" => "WIF",
-        "BUjZjAS2vbbb65g7Z1Ca9ZRVYoJscURG5L3AkVXHP2ac" => "VIRTUAL",
-        "3Bmj7x4udgJhKa43EYRcmNq2JLkgz7eAayFn8qYhyXKV" => "PENGU",
-        "85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ" => "W",
-        "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr" => "POPCAT",
-        "ATHdb8YvGvBVhgJB3PaMU5sCdAUHkhkN42jdYWK4h2xQ" => "ATH",
-        "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5" => "MEW",
-        "MNDEFzGvMt87ueuHvVU9VcTqsAP5b3fTGPsHuuPA5ey" => "MNDE",
-        "AUKyeqDfN8p6B93X9gYCnCpdJUfvxU6ZWEmAy2VKqm3w" => "SPX",
-        "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE" => "ORCA",
-        _ => return None,
-    };
-    
-    // Convert hex string to Pubkey for the given symbol
-    let hex_str = match symbol {
-        "USDC" => "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
-        "TRUMP" => "0x879551021853eec7a7dc827578e8e69da7e4fa8148339aa0d3d5296405be4b1a",
-        "RENDER" => "0x3d4a2bd9535be6ce8059d75eadeba507b043257321aa544717c56fa19b49e35d",
-        "JUP" => "0x0a0408d619e9380abad35060f9192039ed5042fa6f82301d0e48bb52be830996",
-        "BONK" => "0x72b021217ca3fe68922a19aaf990109cb9d84e9ad004b4d2025ad6f529314419",
-        "FARTCOIN" => "0x58cd29ef0e714c5affc44f269b2c1899a52da4169d7acc147b9da692e6953608",
-        "RAY" => "0x91568baa8beb53db23eb3fb7f22c6e8bd303d103919e19733f2bb642d3e7987a",
-        "JTO" => "0xb43660a5f790c69354b0729a5ef9d50d68f1df92107540210b9cccba1f947cc2",
-        "PYTH" => "0x0bbf28e9a841a1cc788f6a361b17ca072d0ea3098a1e5df1c3922d0d719579ff",
-        "WIF" => "0x4ca4beeca86f0d164160323817a4e42b10010a724c2217c6ee41b54cd4cc61fc",
-        "VIRTUAL" => "0x8132e3eb1dac3e56939a16ff83848d194345f6688bff97eb1c8bd462d558802b",
-        "PENGU" => "0xbed3097008b9b5e3c93bec20be79cb43986b85a996475589351a21e67bae9b61",
-        "W" => "0xeff7446475e218517566ea99e72a4abec2e1bd8498b43b7d8331e29dcb059389",
-        "POPCAT" => "0xb9312a7ee50e189ef045aa3c7842e099b061bd9bdc99ac645956c3b660dc8cce",
-        "ATH" => "0xf6b551a947e7990089e2d5149b1e44b369fcc6ad3627cb822362a2b19d24ad4a",
-        "MEW" => "0x514aed52ca5294177f20187ae883cec4a018619772ddce41efcc36a6448f5d5d",
-        "MNDE" => "0x3607bf4d7b78666bd3736c7aacaf2fd2bc56caa8667d3224971ebe3c0623292a",
-        "SPX" => "0x8414cfadf82f6bed644d2e399c11df21ec0131aa574c56030b132113dbbf3a0a",
-        "ORCA" => "0x37505261e557e251290b8c8899453064e8d760ed5c65a779726f2490980da74c",
-        _ => return None,
-    };
-    
-    // Convert hex string to pubkey
-    hex_string_to_pubkey(hex_str).ok()
-}
-
-/// Convert hex string to Pubkey
-fn hex_string_to_pubkey(hex_str: &str) -> Result<Pubkey> {
-    let hex_clean = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-    
-    // Decode hex string to bytes
-    let mut bytes = [0u8; 32];
-    if hex_clean.len() != 64 {
-        return Err(error!(ErrorCode::InvalidOracleAccount));
-    }
-    
-    for i in 0..32 {
-        let byte_str = &hex_clean[i*2..i*2+2];
-        bytes[i] = u8::from_str_radix(byte_str, 16)
-            .map_err(|_| error!(ErrorCode::InvalidOracleAccount))?;
-    }
-    
-    Ok(Pubkey::from(bytes))
-}
+// Oracle functions now use the proper oracle_config module
+// All oracle mappings and functions are centralized in oracle_config.rs
 
 /// Verify user's tier via CPI call to staking program and check deposit caps
 pub fn verify_tier_and_check_cap(
     staking_program: &AccountInfo,
-    user: &Pubkey,
+    _user: &Pubkey,  // Prefixed with _ to indicate intentionally unused (placeholder)
     current_deposits: u64,
     new_deposit: u64,
-    vault: &Vault,
+    _vault: &Vault,  // Prefixed with _ to indicate intentionally unused (placeholder)
     remaining_accounts: &[AccountInfo],
 ) -> Result<()> {
     // Get user's tier by reading their stake account directly
@@ -162,148 +89,162 @@ pub fn verify_tier_and_check_cap(
     }
 }
 
-/// Calculates the current total value of the vault in USDC using Pyth oracle prices
-/// Updated to use oracle configuration and properly validate price accounts
-pub fn current_nav_usdc<'info>(
-    vault: &Vault,
-    usdc_vault: &Account<'info, TokenAccount>,
-    token_accounts: &[Account<'info, TokenAccount>],
-    price_accounts: &[AccountInfo<'info>],
-    token_mints: &[Pubkey],
+/// Calculate the current NAV in USDC using oracle price feeds
+/// 
+/// remaining_accounts structure:
+/// [0..1] - Staking program accounts (stake_config, user_stake) 
+/// [2..] - Oracle data in groups of 3: [token_account, price_account, mint_account]
+pub fn current_nav_usdc(
+    _vault: &Vault,
+    usdc_token_account: &Account<TokenAccount>,
+    remaining_accounts: &[AccountInfo],
 ) -> Result<u64> {
-    msg!("Calculating NAV with {} token accounts and {} price accounts", 
-         token_accounts.len(), price_accounts.len());
+    msg!("Calculating NAV with {} remaining accounts", remaining_accounts.len());
     
-    let mut total_nav = usdc_vault.amount; // Start with USDC balance
-    msg!("Starting NAV with USDC balance: {}", total_nav);
+    // Start with USDC balance (no conversion needed)
+    let mut total_nav_usdc = usdc_token_account.amount;
+    msg!("USDC balance: {}", total_nav_usdc);
     
-    // Process each token account
-    for (i, token_account) in token_accounts.iter().enumerate() {
-        // Skip if this is the USDC account (already counted)
-        if token_account.mint == vault.usdc_mint {
-            msg!("Skipping USDC account (already counted)");
-            continue;
+    // Skip first 2 accounts (staking program accounts)
+    if remaining_accounts.len() < 2 {
+        msg!("No oracle accounts provided, returning USDC balance only");
+        return Ok(total_nav_usdc);
+    }
+    
+    let oracle_accounts = &remaining_accounts[2..];
+    msg!("Processing {} oracle accounts", oracle_accounts.len());
+    
+    // Process oracle accounts in chunks of 3
+    for (i, chunk) in oracle_accounts.chunks(3).enumerate() {
+        if chunk.len() != 3 {
+            msg!("Invalid chunk size {} at index {}", chunk.len(), i);
+            return Err(ErrorCode::InvalidOracleAccounts.into());
         }
         
-        // Only process accounts with non-zero balances
+        let token_account_info = &chunk[0];
+        let price_account_info = &chunk[1];
+        let mint_account_info = &chunk[2];
+        
+        msg!("Processing token chunk {}", i);
+        
+        // Parse token account using standard SPL token deserialization
+        let token_account = match TokenAccount::try_deserialize(
+            &mut token_account_info.data.borrow().as_ref()
+        ) {
+            Ok(account) => account,
+            Err(e) => {
+                msg!("Failed to deserialize token account {}: {}", i, e);
+                continue; // Skip invalid token accounts
+            }
+        };
+        
+        // Skip if no balance
         if token_account.amount == 0 {
-            msg!("Skipping token with zero balance: {}", token_account.mint);
+            msg!("Token account {} has zero balance, skipping", i);
             continue;
         }
         
-        // Find the oracle account for this token mint
-        let token_mint = &token_account.mint;
-        let oracle_pubkey = match get_oracle_for_token_mint(token_mint) {
-            Some(oracle) => oracle,
-            None => {
-                msg!("No oracle found for token mint: {}, skipping", token_mint);
-                continue;
+        // Parse mint account to get decimals
+        let mint_account = match Mint::try_deserialize(
+            &mut mint_account_info.data.borrow().as_ref()
+        ) {
+            Ok(mint) => mint,
+            Err(e) => {
+                msg!("Failed to deserialize mint account {}: {}", i, e);
+                continue; // Skip invalid mint accounts
             }
         };
         
-        // Find the corresponding price account in remaining_accounts
-        let price_account_info = match price_accounts.iter()
-            .find(|acc| acc.key() == oracle_pubkey) {
-            Some(acc) => acc,
-            None => {
-                msg!("Oracle account not provided for token: {}, expected: {}", 
-                     token_mint, oracle_pubkey);
-                continue;
-            }
-        };
-        
-        // Parse the price account
-        let price_data = price_account_info.data.borrow();
-        let price_feed = match pyth_sdk_solana::state::load_price_account(&price_data) {
+        // Parse Pyth price feed using the raw account data approach
+        let price_account_data = price_account_info.data.borrow();
+        let price_feed: &pyth_sdk_solana::state::SolanaPriceAccount = match pyth_sdk_solana::state::load_price_account(&price_account_data) {
             Ok(feed) => feed,
             Err(e) => {
-                msg!("Failed to parse price account for {}: {:?}", token_mint, e);
-                continue;
+                msg!("Failed to load price account {}: {:?}", i, e);
+                continue; // Skip invalid price feeds
             }
         };
         
-        // Check price staleness
-        if check_price_staleness(&price_feed).is_err() {
-            msg!("Stale price for token: {}, skipping", token_mint);
+        // Check price status and staleness
+        if price_feed.agg.status != PriceStatus::Trading {
+            msg!("Price not trading for token {}", i);
             continue;
         }
         
-        // Get token decimals (hardcoded for now, should query mint in production)
-        let token_decimals = match get_token_decimals(token_mint) {
-            Some(decimals) => decimals,
-            None => {
-                msg!("Unknown decimals for token: {}, assuming 9", token_mint);
-                9u8 // Most Solana tokens have 9 decimals
-            }
-        };
-        let token_decimal_factor = 10u64.pow(token_decimals as u32);
-        
-        // Calculate USDC value of this token position
-        let token_balance = token_account.amount;
-        let price = price_feed.agg.price;
-        let price_expo = price_feed.expo;
-        
-        msg!("Processing token: {} with balance: {}, price: {}, expo: {}", 
-             token_mint, token_balance, price, price_expo);
-        
-        // Convert price to proper decimal format
-        // Pyth prices are in the format price * 10^expo
-        let (price_in_usdc, overflow) = if price_expo >= 0 {
-            // Positive exponent: multiply
-            price.checked_mul(10i64.pow(price_expo as u32))
-                .map(|p| (p as u64, false))
-                .unwrap_or((0, true))
-                 } else {
-             // Negative exponent: divide
-             ((price / 10i64.pow(price_expo.unsigned_abs())) as u64, false)
-         };
-        
-        if overflow || price_in_usdc == 0 {
-            msg!("Price overflow or zero for token: {}, skipping", token_mint);
+        // Basic staleness check
+        let current_time = Clock::get()?.unix_timestamp;
+        let price_time = price_feed.timestamp;
+        if current_time - price_time > MAX_PRICE_STALENESS_SECONDS {
+            msg!("Price too stale for token {}", i);
             continue;
         }
         
-        // Calculate token value in USDC
-        // For proper calculation: token_value = (token_balance * price_in_usdc) / token_decimal_factor
-        let token_value = match token_balance
-            .checked_mul(price_in_usdc)
-            .and_then(|v| v.checked_div(token_decimal_factor)) {
-            Some(value) => value,
-            None => {
-                msg!("Arithmetic overflow calculating value for token: {}", token_mint);
+        // Calculate value in USDC
+        match calculate_token_value_usdc(
+            token_account.amount,
+            mint_account.decimals,
+            price_feed.agg.price,
+            price_feed.expo,
+        ) {
+            Ok(token_value_usdc) => {
+                msg!("Token {} value: {} USDC", i, token_value_usdc);
+                total_nav_usdc = total_nav_usdc
+                    .checked_add(token_value_usdc)
+                    .ok_or(ErrorCode::MathOverflow)?;
+            }
+            Err(e) => {
+                msg!("Failed to calculate value for token {}: {:?}", i, e);
                 continue;
             }
-        };
-        
-        msg!("Token {} value: {} USDC", token_mint, token_value);
-        
-        // Add to total NAV
-        total_nav = match total_nav.checked_add(token_value) {
-            Some(new_nav) => new_nav,
-            None => {
-                msg!("NAV overflow when adding token value");
-                return Err(error!(ErrorCode::ArithmeticError));
-            }
-        };
+        }
     }
     
-    msg!("Final NAV: {} USDC", total_nav);
-    Ok(total_nav)
+    msg!("Total NAV: {} USDC", total_nav_usdc);
+    Ok(total_nav_usdc)
 }
 
-/// Get token decimals for known tokens (hardcoded for now)
-/// In production, this should query the mint account
-fn get_token_decimals(token_mint: &Pubkey) -> Option<u8> {
-    let token_mint_str = token_mint.to_string();
-    
-    // Known token decimals
-    match token_mint_str.as_str() {
-        "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU" => Some(6), // USDC (Devnet)
-        "So11111111111111111111111111111111111111112" => Some(9),  // SOL
-        "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263" => Some(5), // BONK
-        "JUPyiwrYJFskUPiHa7hc8VUtAeFoSYbKedZNsD7c" => Some(6),    // JUP
-        _ => None, // Default to querying mint (not implemented here)
+/// Calculate the USDC value of a token amount given its price
+fn calculate_token_value_usdc(
+    token_amount: u64,
+    token_decimals: u8,
+    price: i64,
+    price_expo: i32,
+) -> Result<u64> {
+    if price <= 0 {
+        return Ok(0);
     }
+    
+    // Convert token amount to base units (remove decimals)
+    let token_amount_scaled = token_amount as u128;
+    let price_scaled = price as u128;
+    
+    // Calculate raw value: token_amount * price
+    let raw_value = token_amount_scaled
+        .checked_mul(price_scaled)
+        .ok_or(ErrorCode::MathOverflow)?;
+    
+    // Apply price exponent (Pyth prices have negative exponents)
+    let value_with_price_expo = if price_expo < 0 {
+        raw_value / (10u128.pow((-price_expo) as u32))
+    } else {
+        raw_value * (10u128.pow(price_expo as u32))
+    };
+    
+    // Convert to USDC units (6 decimals) from token decimals
+    let usdc_decimals = 6u8;
+    let value_usdc = if token_decimals > usdc_decimals {
+        // Token has more decimals than USDC, so divide
+        value_with_price_expo / (10u128.pow((token_decimals - usdc_decimals) as u32))
+    } else if token_decimals < usdc_decimals {
+        // Token has fewer decimals than USDC, so multiply  
+        value_with_price_expo * (10u128.pow((usdc_decimals - token_decimals) as u32))
+    } else {
+        // Same decimals
+        value_with_price_expo
+    };
+    
+    // Ensure result fits in u64
+    u64::try_from(value_usdc).map_err(|_| ErrorCode::MathOverflow.into())
 }
 
 /// Calculate the number of shares to mint for a deposit
@@ -399,7 +340,7 @@ pub fn transfer_tokens<'info>(
 
 /// Check if the vault has enough USDC liquidity
 pub fn check_liquidity(
-    vault: &Vault,
+    _vault: &Vault,
     usdc_balance: u64,
     total_nav: u64,
 ) -> Result<bool> {
@@ -414,9 +355,9 @@ pub fn check_liquidity(
 }
 
 /// Forward a transaction to Jupiter for token swaps
-pub fn forward_jupiter<'info>(
-    jupiter_program: AccountInfo<'info>,
-    accounts: &[AccountInfo<'info>],
+pub fn forward_jupiter<'a, 'b>(
+    jupiter_program: AccountInfo<'a>,
+    accounts: &[AccountInfo<'b>],
     data: Vec<u8>,
     signer_seeds: &[&[&[u8]]],
     vault_authority_key: &Pubkey,
@@ -469,7 +410,7 @@ pub fn forward_jupiter<'info>(
 
 /// Check Pyth price feed staleness
 pub fn check_price_staleness(
-    price_feed: &PriceAccount,
+    price_feed: &pyth_sdk_solana::state::SolanaPriceAccount,
 ) -> Result<()> {
     let current_timestamp = Clock::get()?.unix_timestamp;
     let price_timestamp = price_feed.timestamp;
@@ -510,3 +451,250 @@ pub fn after_trade(
     
     Ok(())
 }
+
+// 🔒 CPI RATE LIMITING FUNCTIONS
+
+/// Validate and track CPI calls to prevent spam attacks
+/// Limits to 200 calls/hour per program for headroom
+pub fn validate_and_track_cpi_call(
+    vault: &mut Vault,
+    program_id: &Pubkey,
+    vault_key: &Pubkey,
+) -> Result<()> {
+    let current_time = Clock::get()?.unix_timestamp;
+    
+    // Find existing tracker for this program
+    let mut tracker_found = false;
+    for i in 0..vault.cpi_trackers_count as usize {
+        if vault.cpi_call_counts[i].program_id == *program_id {
+            let tracker = &mut vault.cpi_call_counts[i];
+            
+            // Reset counter if hour has passed (3600 seconds)
+            if current_time - tracker.last_reset > 3600 {
+                tracker.calls_per_hour = 0;
+                tracker.last_reset = current_time;
+            }
+            
+            // Check rate limit
+            if tracker.calls_per_hour >= tracker.max_calls_per_hour {
+                emit!(crate::state::SecurityEvent {
+                    event_type: crate::state::SecurityEventType::RateLimitExceeded,
+                    severity: crate::state::SecuritySeverity::High,
+                    vault: *vault_key,
+                    details: format!("CPI rate limit exceeded for program {}: {} calls/hour", 
+                                   program_id, tracker.calls_per_hour),
+                    timestamp: current_time,
+                });
+                return Err(error!(ErrorCode::CpiRateLimitExceeded));
+            }
+            
+            tracker.calls_per_hour += 1;
+            tracker_found = true;
+            break;
+        }
+    }
+    
+    // Add new tracker if not found and space available
+    if !tracker_found {
+        if vault.cpi_trackers_count >= 2 {
+            // Maximum trackers reached - this shouldn't happen in normal operation
+            msg!("Maximum CPI trackers reached, cannot track new program: {}", program_id);
+            return Err(error!(ErrorCode::CpiTrackingFailed));
+        }
+        
+        let tracker_index = vault.cpi_trackers_count as usize;
+        vault.cpi_call_counts[tracker_index] = crate::state::CpiCallTracker {
+            program_id: *program_id,
+            calls_per_hour: 1,
+            last_reset: current_time,
+            max_calls_per_hour: 200, // 200 calls/hour for headroom
+        };
+        vault.cpi_trackers_count += 1;
+        
+        msg!("Added new CPI tracker for program: {}", program_id);
+    }
+    
+    Ok(())
+}
+
+/// Get CPI call statistics for monitoring
+pub fn get_cpi_call_stats(vault: &Vault, program_id: &Pubkey) -> Option<(u32, u32, i64)> {
+    for i in 0..vault.cpi_trackers_count as usize {
+        if vault.cpi_call_counts[i].program_id == *program_id {
+            let tracker = &vault.cpi_call_counts[i];
+            return Some((
+                tracker.calls_per_hour,
+                tracker.max_calls_per_hour,
+                tracker.last_reset,
+            ));
+        }
+    }
+    None
+}
+
+/// Reset CPI call counters (for emergency use only)
+pub fn reset_cpi_counters(vault: &mut Vault) -> Result<()> {
+    let current_time = Clock::get()?.unix_timestamp;
+    
+    for i in 0..vault.cpi_trackers_count as usize {
+        vault.cpi_call_counts[i].calls_per_hour = 0;
+        vault.cpi_call_counts[i].last_reset = current_time;
+    }
+    
+    msg!("All CPI counters reset");
+    Ok(())
+}
+
+/// Validate deposit amount for enhanced arithmetic safety
+pub fn validate_deposit_amount(amount: u64) -> Result<()> {
+    if amount == 0 {
+        return Err(error!(ErrorCode::ZeroDeposit));
+    }
+    if amount > MAX_DEPOSIT_AMOUNT {
+        return Err(error!(ErrorCode::DepositTooLarge));
+    }
+    Ok(())
+}
+
+// 🔒 SWITCHBOARD ORACLE INTEGRATION
+
+/// Get validated price from Pyth primary oracle with Switchboard fallback
+pub fn get_validated_price_with_fallback(
+    token_mint: &Pubkey,
+    primary_oracle: &AccountInfo,
+    fallback_oracle: Option<&AccountInfo>,
+) -> Result<(i64, i32)> {
+    // Try primary oracle (Pyth) first
+    match get_pyth_price(primary_oracle) {
+        Ok((price, expo)) => {
+            // Validate with Switchboard fallback if available
+            if let Some(fallback) = fallback_oracle {
+                if let Ok((fallback_price, fallback_expo)) = get_switchboard_price(fallback) {
+                    // Check price deviation between oracles (max 5% difference)
+                    if let Err(_) = validate_oracle_deviation(price, expo, fallback_price, fallback_expo) {
+                        msg!("Oracle price deviation too high, using Pyth only");
+                        // Still use Pyth price but log the deviation
+                        emit!(crate::state::SecurityEvent {
+                            event_type: crate::state::SecurityEventType::OracleFallbackTriggered,
+                            severity: crate::state::SecuritySeverity::Medium,
+                            vault: token_mint.key(), // Using token mint as identifier
+                            details: format!("Oracle deviation detected: Pyth {} vs Switchboard {}", 
+                                           price, fallback_price),
+                            timestamp: Clock::get()?.unix_timestamp,
+                        });
+                    }
+                }
+            }
+            Ok((price, expo))
+        }
+        Err(_) => {
+            // Use Switchboard fallback if Pyth fails
+            if let Some(fallback) = fallback_oracle {
+                emit!(crate::state::SecurityEvent {
+                    event_type: crate::state::SecurityEventType::OracleFallbackTriggered,
+                    severity: crate::state::SecuritySeverity::High,
+                    vault: token_mint.key(),
+                    details: format!("Pyth oracle failed, using Switchboard fallback"),
+                    timestamp: Clock::get()?.unix_timestamp,
+                });
+                get_switchboard_price(fallback)
+            } else {
+                Err(error!(ErrorCode::AllOraclesFailed))
+            }
+        }
+    }
+}
+
+/// Parse Pyth price feed
+pub fn get_pyth_price(price_account: &AccountInfo) -> Result<(i64, i32)> {
+    let price_account_data = price_account.data.borrow();
+    let price_feed: &pyth_sdk_solana::state::SolanaPriceAccount = pyth_sdk_solana::state::load_price_account(&price_account_data)
+        .map_err(|_| error!(ErrorCode::InvalidPriceData))?;
+    
+    // Check price status and staleness
+    if price_feed.agg.status != PriceStatus::Trading {
+        return Err(error!(ErrorCode::PriceNotTrading));
+    }
+    
+    // Check staleness
+    let current_time = Clock::get()?.unix_timestamp;
+    if current_time - price_feed.timestamp > MAX_PRICE_STALENESS_SECONDS {
+        return Err(error!(ErrorCode::PriceTooStale));
+    }
+    
+    Ok((price_feed.agg.price, price_feed.expo))
+}
+
+/// Parse Switchboard price feed using official SDK
+pub fn get_switchboard_price(feed_account: &AccountInfo) -> Result<(i64, i32)> {
+    use switchboard_on_demand::on_demand::accounts::pull_feed::PullFeedAccountData;
+    
+    // Parse Switchboard feed account data
+    let feed_data = feed_account.data.borrow();
+    let feed = PullFeedAccountData::parse(feed_data)
+        .map_err(|_| error!(ErrorCode::InvalidSwitchboardFeed))?;
+    
+    // Get the latest value using the get_value method with proper parameters
+    // Based on switchboard-on-demand 0.3.8, we need to provide Clock and max_staleness
+    let clock = Clock::get()?;
+    let max_staleness_slots = (SWITCHBOARD_STALENESS_SECONDS / 400) as u64; // ~400ms per slot
+    
+    // Use get_value method which is the correct approach for switchboard-on-demand
+    // Method signature: get_value(&Clock, max_staleness_slots: u64, min_samples: u32, use_cached: bool)
+    let decimal_value = feed.get_value(&clock, max_staleness_slots, 1, true)
+        .map_err(|_| error!(ErrorCode::SwitchboardFeedStale))?;
+    
+    // Convert SwitchboardDecimal to i64 price and i32 exponent
+    // SwitchboardDecimal stores value as mantissa * 10^(-scale)
+    let mantissa = decimal_value.mantissa();
+    let scale = decimal_value.scale();
+    
+    // Convert to Pyth-compatible format (price, expo)
+    // Keep the original scale to preserve token-specific decimal precision
+    let price_i64 = i64::try_from(mantissa)
+        .map_err(|_| error!(ErrorCode::InvalidPriceData))?;
+    
+    // Switchboard scale is positive (decimal places), Pyth expo is negative
+    let expo = -(scale as i32);
+    
+    Ok((price_i64, expo))
+}
+
+/// Validate price deviation between two oracle sources
+pub fn validate_oracle_deviation(
+    price1: i64,
+    expo1: i32,
+    price2: i64,
+    expo2: i32,
+) -> Result<()> {
+    // Normalize prices to same exponent for comparison
+    let (normalized_price1, normalized_price2) = if expo1 == expo2 {
+        (price1, price2)
+    } else if expo1 < expo2 {
+        // price1 has smaller exponent (more precision), scale price2 up
+        let scale_factor = 10i64.pow((expo1 - expo2) as u32);
+        (price1, price2 * scale_factor)
+    } else {
+        // price2 has smaller exponent (more precision), scale price1 up
+        let scale_factor = 10i64.pow((expo2 - expo1) as u32);
+        (price1 * scale_factor, price2)
+    };
+    
+    // Calculate percentage difference
+    let avg_price = (normalized_price1 + normalized_price2) / 2;
+    if avg_price == 0 {
+        return Ok(()); // Both prices are zero, no deviation
+    }
+    
+    let diff = (normalized_price1 - normalized_price2).abs();
+    let deviation_pct = (diff * 100) / avg_price;
+    
+    // Allow max 5% deviation between oracle sources
+    if deviation_pct > 5 {
+        return Err(error!(ErrorCode::OracleDeviationTooHigh));
+    }
+    
+    Ok(())
+}
+
+

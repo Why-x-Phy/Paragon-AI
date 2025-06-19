@@ -5,6 +5,10 @@ package_manager = "yarn"
 resolution = true
 skip-lint = false
 
+[programs.mainnet]
+calvin_staking = "CNfW3eVGXVFb4cUo48xEsbxrqcJsrsHcKkLAD6ycJC81"
+calvin_vault = "7soxQcqTSQeQeT7dcSKBskvh46DoLEWAEhzPcW8Nv3em"
+
 [programs.devnet]
 calvin_staking = "FH8te8ebpGLRUc32pZHj4q6DUwzt3KykQYZyA4NQPsod"
 calvin_vault = "Evdjoh1AHQb6Ls1n7Td7buAiDA5ty7Ec8NCYt8eWEXFp"
@@ -16,9 +20,12 @@ calvin_vault = "7rky4NGhHtUREVJLKnAKwapDBmzCMbEno6VDcFZXyWxA"
 [registry]
 url = "https://api.apr.dev"
 
+[build]
+features = ["custom-heap", "custom-panic", "anchor-debug"]
+
 [provider]
-cluster = "https://devnet.helius-rpc.com/?api-key=acfda155-4d7f-4930-8ac4-ddd9eebfb70d"
-wallet = "./devnet-test.json"
+cluster = "https://mainnet.helius-rpc.com/?api-key=acfda155-4d7f-4930-8ac4-ddd9eebfb70d"
+wallet = "/home/ubuntu/.config/solana/id.json"
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/trade_instruction_test.ts"

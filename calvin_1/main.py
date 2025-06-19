@@ -1151,7 +1151,7 @@ async def plot_price_comparison_cmd(args: Dict[str, Any]) -> None:
     logger.info(f"Price comparison plot generated: {output_file}")
 
 
-async def run_api_server(args: Dict[str, Any]) -> None:
+def run_api_server(args: Dict[str, Any]) -> None:
     """Run the Calvin AI Trades API server for frontend integration"""
     logger.info("🚀 Starting Calvin AI Trades API Server")
     
@@ -1171,7 +1171,7 @@ async def run_api_server(args: Dict[str, Any]) -> None:
         logger.info(f"   Reload: {reload}")
         logger.info(f"   Log Level: {log_level}")
         
-        # Run the FastAPI server
+        # Run the FastAPI server (uvicorn.run creates its own event loop)
         uvicorn.run(
             "api_server:app",
             host=host,
@@ -1289,7 +1289,7 @@ def main():
         elif command == 'run-vault-system':
             asyncio.run(run_vault_system(args_dict))
         elif command == 'run-api-server':
-            asyncio.run(run_api_server(args_dict))
+            run_api_server(args_dict)  # No asyncio.run() needed - uvicorn creates its own event loop
         else:
             logger.error(f"Unknown command: {command}")
     except KeyboardInterrupt:

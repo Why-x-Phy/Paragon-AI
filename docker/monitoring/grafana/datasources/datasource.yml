@@ -1,6 +1,7 @@
 apiVersion: 1
 
 datasources:
+  # Prometheus - Primary metrics source
   - name: Prometheus
     type: prometheus
     access: proxy
@@ -15,11 +16,15 @@ datasources:
       cacheLevel: 'High'
       disableRecordingRules: false
       incrementalQueryOverlapWindow: 10m
+      exemplarTraceIdDestinations:
+        - name: traceID
+          url: http://localhost:3000/explore
 
+  # TimescaleDB - Direct database access for trading data
   - name: Calvin-TimescaleDB
     type: postgres
     access: proxy
-    url: timescaledb-primary:5432
+    url: timescaledb:5432
     database: calvin_trading
     user: calvin_prod
     secureJsonData:
@@ -28,4 +33,19 @@ datasources:
       sslmode: disable
       postgresVersion: 1500
       timescaledb: true
-    editable: true 
+      maxOpenConns: 10
+      maxIdleConns: 5
+      connMaxLifetime: 14400
+    editable: true
+
+  # Redis metrics (if redis_exporter is configured)
+  - name: Calvin-Redis-Metrics
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: false
+    editable: true
+    jsonData:
+      exemplarTraceIdDestinations:
+        - name: traceID
+          url: http://localhost:3000/explore 

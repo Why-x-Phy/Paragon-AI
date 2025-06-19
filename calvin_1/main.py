@@ -38,11 +38,7 @@ from src.trading.trading_strategy import TradingStrategy
 from src.trading.wallet import SolanaWallet
 from src.config.config import config
 from src.utils.logger import log_manager, log
-from src.scripts.train_rl_model import train_rl_model
-from src.scripts.train_fast_rl import train_fast_rl_model
-from src.scripts.train_historical_rl import train_historical_rl
-from src.scripts.train_prediction_guided import train_prediction_guided_model
-from src.scripts.train_cross_token import train_cross_token_model
+
 
 # NEW: Phase 3.2 imports
 from src.data.hourly_inference_scheduler import HourlyInferenceScheduler
@@ -61,6 +57,8 @@ class CalvinVaultSystem:
     
     def __init__(self):
         self.scheduler = None
+        self.websocket_manager = None
+        self.emergency_monitor = None
         self.running = False
         
         logger.info("Calvin Vault System initializing...")
@@ -73,25 +71,52 @@ class CalvinVaultSystem:
             await db_manager.health_check()
             logger.info("✅ Database connection established")
             
+            # Initialize WebSocket Feed Manager for all tracked tokens
+            from src.data.websocket_feed import WebSocketFeedManager
+            self.websocket_manager = WebSocketFeedManager()
+            await self.websocket_manager.initialize()
+            logger.info("✅ WebSocket Feed Manager initialized")
+            
             # Initialize inference scheduler with vault trading
             self.scheduler = HourlyInferenceScheduler()
             await self.scheduler.initialize()
             logger.info("✅ Inference scheduler initialized")
             
+            # Initialize emergency monitoring
+            from src.vault.emergency_monitor import EmergencyStopLossMonitor
+            self.emergency_monitor = EmergencyStopLossMonitor()
+            await self.emergency_monitor.initialize()
+            
+            # 🚨 CRITICAL FIX: Connect emergency monitor to WebSocket feeds
+            # The emergency monitor needs access to the WebSocket feed for price monitoring
+            if hasattr(self.websocket_manager, 'price_feed') and self.websocket_manager.price_feed:
+                self.emergency_monitor.websocket_feed = self.websocket_manager.price_feed
+                logger.info("✅ Emergency monitor connected to WebSocket price feed")
+            else:
+                logger.warning("⚠️ Emergency monitor running without WebSocket feeds (price monitoring disabled)")
+            
+            # Connect emergency monitor to websocket price feeds
+            self.websocket_manager.add_price_handler(self._relay_price_to_emergency_monitor)
+            logger.info("✅ Emergency monitoring initialized")
+            
             # Validate environment configuration
             self._validate_configuration()
             
-            logger.info("🎉 Calvin Vault System initialization complete")
+            # 🆕 VALIDATE SYSTEM STATE RECOVERY
+            await self._validate_state_recovery()
+            
+            logger.info("✅ Calvin Vault System initialization complete with state recovery")
             
         except Exception as e:
-            logger.error(f"❌ System initialization failed: {e}")
+            logger.error(f"System initialization failed: {e}")
             raise
 
     def _validate_configuration(self):
         """Validate required configuration"""
         required_vars = [
             'DATABASE_URL',
-            'REDIS_URL'
+            'REDIS_URL',
+            'BIRDEYE_API_KEY'  # Required for WebSocket feeds
         ]
         
         # Optional vault-specific variables (will use defaults if not set)
@@ -115,6 +140,9 @@ class CalvinVaultSystem:
     async def start(self):
         """Start the complete Calvin vault trading system"""
         try:
+            # Track startup time for uptime calculation
+            self.start_time = datetime.utcnow()
+            
             await self.initialize()
             
             logger.info("🚀 Starting Calvin AI Vault Trading System")
@@ -124,30 +152,73 @@ class CalvinVaultSystem:
             
             self.running = True
             
+            # Start WebSocket feeds for all tracked tokens FIRST
+            await self.websocket_manager.start()
+            logger.info("✅ WebSocket feeds started for all tracked tokens")
+            
             # Start inference and trading scheduler
             await self.scheduler.start_async()
             logger.info("✅ Enhanced inference scheduler started with vault trading")
             
-            # Keep running
+            # Start emergency monitoring (will use existing websocket feeds)
+            asyncio.create_task(self._start_emergency_monitoring())
+            logger.info("✅ Emergency monitoring started")
+            
+            # Keep running with enhanced health monitoring
             while self.running:
                 await asyncio.sleep(60)  # Check every minute
                 
                 # Periodic health checks and status reports
                 if datetime.now().minute == 0:  # Every hour
-                    await self._health_check()
+                    await self._comprehensive_health_check()
             
         except Exception as e:
             logger.error(f"❌ System startup failed: {e}")
             await self.shutdown()
             raise
 
-    async def _health_check(self):
-        """Periodic system health check"""
+    async def _start_emergency_monitoring(self):
+        """Start emergency monitoring in background"""
+        try:
+            if self.emergency_monitor:
+                # Emergency monitor will use websocket feeds from the manager
+                await self.emergency_monitor.start_monitoring()
+        except Exception as e:
+            logger.error(f"❌ Emergency monitoring startup failed: {e}")
+
+    async def _relay_price_to_emergency_monitor(self, symbol: str, price_update):
+        """Relay price updates from websocket manager to emergency monitor"""
+        try:
+            if self.emergency_monitor and hasattr(self.emergency_monitor, '_on_price_update'):
+                # The emergency monitor expects a PriceUpdate object directly
+                await self.emergency_monitor._on_price_update(price_update)
+        except Exception as e:
+            logger.error(f"❌ Error relaying price update to emergency monitor: {e}")
+
+    async def _comprehensive_health_check(self):
+        """Enhanced system health check with all components"""
         try:
             # Check scheduler health
             if not self.scheduler or not self.scheduler.is_running:
                 logger.warning("⚠️ Scheduler not running - attempting restart")
                 await self.scheduler.start_async()
+            
+            # Check WebSocket feed health
+            if self.websocket_manager:
+                ws_stats = self.websocket_manager.get_stats()
+                logger.info(f"📡 WebSocket Health: {ws_stats['tokens_subscribed']} tokens, {ws_stats['price_updates_received']} updates")
+                
+                # Refresh tokens periodically (every 6 hours)
+                if ws_stats['last_token_refresh']:
+                    last_refresh = ws_stats['last_token_refresh']
+                    if isinstance(last_refresh, str):
+                        from datetime import datetime
+                        last_refresh = datetime.fromisoformat(last_refresh.replace('Z', '+00:00'))
+                    
+                    hours_since_refresh = (datetime.utcnow() - last_refresh).total_seconds() / 3600
+                    if hours_since_refresh > 6:  # Refresh every 6 hours
+                        logger.info("🔄 Refreshing tracked tokens...")
+                        await self.websocket_manager.refresh_tokens()
             
             # Check database connectivity
             db_manager = await get_db_manager()
@@ -160,30 +231,423 @@ class CalvinVaultSystem:
             logger.info(f"   Vault trades: {stats.get('vault_trading', {}).get('total_trades', 0)}")
             logger.info(f"   Success rate: {stats.get('vault_trading', {}).get('cycles_per_hour', 0):.1f} cycles/hour")
             
+            # Log emergency monitoring stats
+            if self.emergency_monitor:
+                emergency_stats = self.emergency_monitor.get_monitoring_stats()
+                logger.info(f"🚨 Emergency Monitor: {emergency_stats.get('positions_monitored', 0)} positions, {emergency_stats.get('emergency_events_triggered', 0)} events")
+            
         except Exception as e:
-            logger.error(f"❌ Health check failed: {e}")
+            logger.error(f"❌ Comprehensive health check failed: {e}")
 
     async def shutdown(self):
-        """Graceful system shutdown"""
-        logger.info("🛑 Shutting down Calvin Vault System...")
+        """Graceful system shutdown with state persistence"""
+        logger.info("🛑 Initiating graceful Calvin Vault System shutdown...")
         
         self.running = False
         
         try:
+            # 🆕 PERSIST STATE BEFORE SHUTDOWN
+            await self._persist_system_state()
+            
             # Stop scheduler
             if self.scheduler:
+                logger.info("🔄 Stopping inference scheduler...")
                 await self.scheduler.stop_async()
                 logger.info("✅ Scheduler stopped")
+            
+            # Stop WebSocket manager
+            if self.websocket_manager:
+                logger.info("🔄 Stopping WebSocket feed manager...")
+                await self.websocket_manager.stop()
+                logger.info("✅ WebSocket manager stopped")
+            
+            # Stop emergency monitor
+            if self.emergency_monitor:
+                logger.info("🔄 Stopping emergency monitor...")
+                await self.emergency_monitor.stop_monitoring()
+                logger.info("✅ Emergency monitor stopped")
+            
+            # Final health check record
+            await self._record_shutdown_status()
             
             logger.info("🏁 Calvin Vault System shutdown complete")
             
         except Exception as e:
-            logger.error(f"❌ Shutdown error: {e}")
+            logger.error(f"Shutdown error: {e}")
+
+    async def _persist_system_state(self):
+        """Persist critical system state before shutdown"""
+        try:
+            logger.info("💾 Persisting system state before shutdown...")
+            
+            # 1. Persist portfolio coordinator state
+            await self._persist_portfolio_state()
+            
+            # 2. Persist emergency monitor state
+            await self._persist_emergency_state()
+            
+            # 3. Record final system statistics
+            await self._record_final_system_stats()
+            
+            logger.info("✅ System state persisted successfully")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ State persistence failed (non-critical): {e}")
+    
+    async def _persist_portfolio_state(self):
+        """Persist portfolio coordinator state to database"""
+        try:
+            from src.inference.portfolio_coordinator import get_portfolio_coordinator
+            coordinator = await get_portfolio_coordinator()
+            
+            # Persist daily P&L tracking
+            if coordinator.daily_pnl_by_asset:
+                db_manager = await get_db_manager()
+                await db_manager.record_health_check(
+                    component='daily_pnl_tracking',
+                    status='updated',
+                    details={
+                        'asset_pnl': coordinator.daily_pnl_by_asset,
+                        'total_assets': len(coordinator.daily_pnl_by_asset),
+                        'last_updated': datetime.utcnow().isoformat()
+                    }
+                )
+            
+            # Persist performance attribution for each asset
+            for symbol, perf_data in coordinator.performance_attribution.items():
+                db_manager = await get_db_manager()
+                await db_manager.record_health_check(
+                    component='portfolio_performance_attribution',
+                    status='healthy',
+                    details={
+                        'symbol': symbol,
+                        'total_signals': perf_data.get('total_signals', 0),
+                        'successful_signals': perf_data.get('successful_signals', 0),
+                        'total_pnl': perf_data.get('total_pnl', 0.0),
+                        'signal_generation_rate': perf_data.get('win_rate', 0.0),
+                        'avg_return': perf_data.get('avg_return', 0.0),
+                        'sharpe_ratio': perf_data.get('sharpe_ratio', 0.0),
+                        'last_updated': datetime.utcnow().isoformat()
+                    }
+                )
+            
+            logger.info(f"💾 Persisted portfolio state: {len(coordinator.daily_pnl_by_asset)} P&L assets, {len(coordinator.performance_attribution)} performance records")
+            
+        except Exception as e:
+            logger.warning(f"Failed to persist portfolio state: {e}")
+    
+    async def _persist_emergency_state(self):
+        """Persist emergency monitor state to database"""
+        try:
+            if self.emergency_monitor:
+                db_manager = await get_db_manager()
+                
+                # Get monitoring stats from the correct method
+                monitoring_stats = self.emergency_monitor.get_monitoring_stats()
+                
+                await db_manager.record_health_check(
+                    component='emergency_monitor',
+                    status='healthy',
+                    details={
+                        'emergency_exits_today': self.emergency_monitor.emergency_exits_today,
+                        'max_daily_exits': self.emergency_monitor.thresholds.max_daily_exits,
+                        'total_alerts_today': monitoring_stats.get('total_alerts', 0),
+                        'portfolio_checks_today': monitoring_stats.get('portfolio_checks', 0),
+                        'position_checks_today': monitoring_stats.get('position_checks', 0),
+                        'price_updates_processed': monitoring_stats.get('price_updates_processed', 0),
+                        'emergency_events_triggered': monitoring_stats.get('emergency_events_triggered', 0),
+                        'positions_monitored': monitoring_stats.get('positions_monitored', 0),
+                        'last_updated': datetime.utcnow().isoformat(),
+                        'shutdown_persist': True
+                    }
+                )
+                
+                logger.info(f"💾 Persisted emergency state: {self.emergency_monitor.emergency_exits_today} exits today")
+            
+        except Exception as e:
+            logger.warning(f"Failed to persist emergency state: {e}")
+    
+    async def _record_final_system_stats(self):
+        """Record final system statistics before shutdown"""
+        try:
+            db_manager = await get_db_manager()
+            
+            # Calculate system uptime
+            if hasattr(self, 'start_time'):
+                uptime_seconds = (datetime.utcnow() - self.start_time).total_seconds()
+            else:
+                uptime_seconds = 0
+            
+            # Collect final stats
+            stats = {
+                'shutdown_timestamp': datetime.utcnow().isoformat(),
+                'uptime_seconds': uptime_seconds,
+                'uptime_hours': uptime_seconds / 3600,
+                'graceful_shutdown': True,
+                'components_active': {
+                    'scheduler': self.scheduler is not None,
+                    'websocket_manager': self.websocket_manager is not None,
+                    'emergency_monitor': self.emergency_monitor is not None
+                }
+            }
+            
+            # Use 'healthy' status instead of 'completed' to avoid constraint violation
+            await db_manager.record_health_check(
+                component='system_shutdown',
+                status='healthy',  # FIXED: Use valid health status
+                details=stats
+            )
+            
+            logger.info(f"💾 Recorded final system stats: {uptime_seconds/3600:.1f}h uptime")
+            
+        except Exception as e:
+            logger.warning(f"Failed to record final system stats: {e}")
+    
+    async def _record_shutdown_status(self):
+        """Record final shutdown status"""
+        try:
+            db_manager = await get_db_manager()
+            # Use 'healthy' status for successful shutdown instead of 'shutdown'
+            await db_manager.record_health_check(
+                component='calvin_vault_system',
+                status='healthy',  # FIXED: Use valid health status
+                details={
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'shutdown_type': 'graceful',
+                    'all_components_stopped': True
+                }
+            )
+            
+        except Exception as e:
+            logger.warning(f"Failed to record shutdown status: {e}")
 
     def signal_handler(self, signum, frame):
         """Handle shutdown signals"""
         logger.info(f"Received signal {signum} - initiating shutdown")
         asyncio.create_task(self.shutdown())
+
+    async def _validate_state_recovery(self):
+        """Validate that all components have properly recovered their state"""
+        try:
+            logger.info("🔍 Validating system state recovery...")
+            recovery_report = {}
+            
+            # 1. Validate database connectivity and recent data
+            db_validation = await self._validate_database_state()
+            recovery_report['database'] = db_validation
+            
+            # 2. Validate portfolio coordinator state recovery
+            portfolio_validation = await self._validate_portfolio_state()
+            recovery_report['portfolio_coordinator'] = portfolio_validation
+            
+            # 3. Validate position manager state recovery
+            position_validation = await self._validate_position_state()
+            recovery_report['position_manager'] = position_validation
+            
+            # 4. Validate emergency monitor state recovery
+            emergency_validation = await self._validate_emergency_state()
+            recovery_report['emergency_monitor'] = emergency_validation
+            
+            # 5. Validate vault connectivity
+            vault_validation = await self._validate_vault_connectivity()
+            recovery_report['vault_connectivity'] = vault_validation
+            
+            # Generate recovery summary
+            successful_recoveries = sum(1 for result in recovery_report.values() if result['status'] == 'recovered')
+            total_components = len(recovery_report)
+            
+            logger.info(f"📊 State Recovery Summary: {successful_recoveries}/{total_components} components recovered successfully")
+            
+            for component, result in recovery_report.items():
+                status_emoji = "✅" if result['status'] == 'recovered' else "⚠️" if result['status'] == 'partial' else "❌"
+                logger.info(f"  {status_emoji} {component}: {result['message']}")
+            
+            # Log any warnings or issues
+            warnings = [result['message'] for result in recovery_report.values() if result['status'] in ['partial', 'failed']]
+            if warnings:
+                logger.warning(f"⚠️ State recovery warnings: {'; '.join(warnings)}")
+            
+            # Record state recovery status in database
+            await self._record_state_recovery_status(recovery_report)
+            
+        except Exception as e:
+            logger.error(f"State recovery validation failed: {e}")
+            # Don't fail initialization - system can still operate with default state
+    
+    async def _validate_database_state(self) -> Dict[str, str]:
+        """Validate database state and recent data availability"""
+        try:
+            db_manager = await get_db_manager()
+            
+            # Check recent portfolio cycles
+            recent_cycles = await db_manager.get_recent_portfolio_cycles(limit=5)
+            cycles_count = len(recent_cycles)
+            
+            # Check open positions
+            open_positions = await db_manager.get_open_positions()
+            positions_count = len(open_positions)
+            
+            # Check recent trades
+            recent_trades = await db_manager.get_pending_trades(hours_back=24)
+            trades_count = len(recent_trades)
+            
+            if cycles_count > 0:
+                last_cycle = recent_cycles[0]['cycle_timestamp']
+                hours_since_last = (datetime.utcnow() - last_cycle).total_seconds() / 3600
+                
+                if hours_since_last < 2:  # Recent activity
+                    return {
+                        'status': 'recovered',
+                        'message': f"{cycles_count} recent cycles, {positions_count} open positions, {trades_count} pending trades"
+                    }
+                else:
+                    return {
+                        'status': 'partial',
+                        'message': f"Last cycle {hours_since_last:.1f}h ago, {positions_count} positions"
+                    }
+            else:
+                return {
+                    'status': 'partial',
+                    'message': f"No recent cycles, {positions_count} positions available"
+                }
+                
+        except Exception as e:
+            return {
+                'status': 'failed',
+                'message': f"Database validation failed: {e}"
+            }
+    
+    async def _validate_portfolio_state(self) -> Dict[str, str]:
+        """Validate portfolio coordinator state recovery"""
+        try:
+            # Check if portfolio coordinator recovered state
+            from src.inference.portfolio_coordinator import get_portfolio_coordinator
+            coordinator = await get_portfolio_coordinator()
+            
+            # Check recovered data
+            daily_pnl_assets = len(coordinator.daily_pnl_by_asset)
+            performance_assets = len(coordinator.performance_attribution)
+            history_length = len(coordinator.portfolio_history)
+            tracked_symbols = len(coordinator.tracked_symbols)
+            
+            if daily_pnl_assets > 0 or performance_assets > 0 or history_length > 0:
+                return {
+                    'status': 'recovered',
+                    'message': f"{tracked_symbols} tracked symbols, {daily_pnl_assets} P&L assets, {performance_assets} perf. assets, {history_length} history"
+                }
+            else:
+                return {
+                    'status': 'partial',
+                    'message': f"{tracked_symbols} tracked symbols loaded (no historical state recovered)"
+                }
+                
+        except Exception as e:
+            return {
+                'status': 'failed',
+                'message': f"Portfolio validation failed: {e}"
+            }
+    
+    async def _validate_position_state(self) -> Dict[str, str]:
+        """Validate position manager state recovery"""
+        try:
+            # Check if position manager recovered positions
+            from src.trading.position_manager import get_position_manager
+            position_manager = await get_position_manager()
+            
+            active_positions = len(position_manager.get_active_positions())
+            position_tokens = len(position_manager.position_by_token)
+            
+            if active_positions > 0:
+                return {
+                    'status': 'recovered',
+                    'message': f"{active_positions} active positions across {position_tokens} tokens"
+                }
+            else:
+                return {
+                    'status': 'recovered',
+                    'message': "No active positions (clean slate)"
+                }
+                
+        except Exception as e:
+            return {
+                'status': 'failed',
+                'message': f"Position validation failed: {e}"
+            }
+    
+    async def _validate_emergency_state(self) -> Dict[str, str]:
+        """Validate emergency monitor state recovery"""
+        try:
+            if self.emergency_monitor:
+                emergency_exits = self.emergency_monitor.emergency_exits_today
+                max_exits = self.emergency_monitor.thresholds.max_daily_exits
+                
+                return {
+                    'status': 'recovered',
+                    'message': f"{emergency_exits}/{max_exits} emergency exits today"
+                }
+            else:
+                return {
+                    'status': 'failed',
+                    'message': "Emergency monitor not initialized"
+                }
+                
+        except Exception as e:
+            return {
+                'status': 'failed',
+                'message': f"Emergency validation failed: {e}"
+            }
+    
+    async def _validate_vault_connectivity(self) -> Dict[str, str]:
+        """Validate vault smart contract connectivity"""
+        try:
+            # Test vault connectivity through emergency monitor
+            if self.emergency_monitor and self.emergency_monitor.vault_client:
+                vault_state = await self.emergency_monitor.vault_client.get_vault_state()
+                
+                if vault_state.get('initialized', False):
+                    total_usdc = vault_state.get('total_usdc', 0)
+                    total_shares = vault_state.get('total_shares', 0)
+                    return {
+                        'status': 'recovered',
+                        'message': f"Vault: ${total_usdc:,.2f} USDC, {total_shares:,} shares"
+                    }
+                else:
+                    return {
+                        'status': 'failed',
+                        'message': "Vault not initialized or unreachable"
+                    }
+            else:
+                return {
+                    'status': 'failed',
+                    'message': "Vault client not available"
+                }
+                
+        except Exception as e:
+            return {
+                'status': 'failed',
+                'message': f"Vault connectivity failed: {e}"
+            }
+    
+    async def _record_state_recovery_status(self, recovery_report: Dict):
+        """Record state recovery status in database for monitoring"""
+        try:
+            db_manager = await get_db_manager()
+            
+            # Record overall system recovery status
+            await db_manager.record_health_check(
+                component='system_state_recovery',
+                status='healthy',  # FIXED: Use valid health status instead of 'completed'
+                details={
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'recovery_report': recovery_report,
+                    'successful_components': sum(1 for r in recovery_report.values() if r['status'] == 'recovered'),
+                    'total_components': len(recovery_report),
+                    'system_ready': all(r['status'] in ['recovered', 'partial'] for r in recovery_report.values())
+                }
+            )
+            
+        except Exception as e:
+            logger.warning(f"Failed to record state recovery status: {e}")
 
 
 async def run_vault_system(args: Dict[str, Any]) -> None:
@@ -242,8 +706,8 @@ async def train_model(args: Dict[str, Any]) -> None:
         return
     
     # Prepare data for ML
-    sequence_length = args.get('sequence_length', 26)
-    prediction_steps = args.get('prediction_horizon', 24)
+    sequence_length = args.get('sequence_length', 36)
+    prediction_steps = args.get('prediction_horizon', 1)
     
     logger.info(f"Preparing ML data with sequence_length={sequence_length}, prediction_horizon={prediction_steps} steps")
     X_train, X_test, y_train, y_test = data_processor.prepare_ml_data(
@@ -619,140 +1083,6 @@ async def get_token_info(args: Dict[str, Any]) -> None:
     except Exception as e:
         logger.error(f"Error getting token info: {e}")
 
-async def train_cross_token(args: Dict[str, Any]) -> None:
-    """Train cross-token generalization agent on multiple tokens"""
-    logger.info("Starting cross-token agent training")
-    
-    # Get token list
-    tokens = args.get('tokens')
-    if not tokens:
-        logger.error("Token list is required for cross-token training")
-        return
-    
-    # Parse comma-separated token list
-    token_list = [t.strip() for t in tokens.split(',')]
-    
-    # Run training
-    train_cross_token_model(
-        token_list=token_list,
-        days=args.get('days', 30),
-        resolution=args.get('resolution', '5m'),
-        episodes=args.get('episodes', 200),
-        batch_size=args.get('batch_size', 64),
-        ml_model_base_path="models",
-        token_scheduling=args.get('scheduling', 'random'),
-        use_predictions=not args.get('no_predictions', False),
-        initial_balance=args.get('balance', 10000.0),
-        sequence_length=args.get('sequence_length', 10)
-    )
-    
-    logger.info("Cross-token agent training completed")
-
-async def train_simple_model(args: Dict[str, Any]) -> None:
-    """Train a model using simple directional prediction and backtesting"""
-    logger.info("Starting simple model training")
-    
-    # Validate token address
-    if not args['token_address']:
-        logger.error("Token address is required for training")
-        return
-    
-    token_address = args['token_address']
-    symbol = args.get('symbol', 'SOL')
-    days = args.get('days', 30)
-    resolution = args.get('resolution', '5m')
-    
-    # Initialize data processor
-    data_processor = DataProcessor()
-    
-    # Get and process data
-    logger.info(f"Fetching and processing data for {symbol} ({token_address}), {days} days, {resolution} resolution")
-    df = data_processor.process_pipeline(
-        token_address, 
-        symbol, 
-        resolution, 
-        days, 
-        save_data=True,
-        include_sentiment=False
-    )
-    
-    if df.empty:
-        logger.error("No data available for training")
-        return
-    
-    # Prepare data for ML
-    sequence_length = args.get('sequence_length', 26)
-    prediction_steps = args.get('prediction_horizon', 1)
-    
-    logger.info(f"Preparing ML data with sequence_length={sequence_length}, prediction_horizon={prediction_steps} steps")
-    X_train, X_test, y_train, y_test = data_processor.prepare_ml_data(
-        df, 
-        target_col='close',
-        sequence_length=sequence_length,
-        prediction_horizon=prediction_steps,
-        include_feature_names=False
-    )
-    
-    logger.info(f"Data prepared: {X_train.shape[0]} training samples, {X_test.shape[0]} testing samples")
-    
-    # Initialize and train model with simple directional optimization
-    model_type = args.get('model_type', config.model_type)
-    ml_model = MLModel(model_type=model_type, optimization_target="mse")
-    
-    logger.info(f"Using MSE optimization for training")
-    
-    # Build the model
-    ml_model.build_model(input_shape=(X_train.shape[1], X_train.shape[2]))
-    
-    # Train the model
-    epochs = args.get('epochs', 100)
-    batch_size = args.get('batch_size', 32)
-    model_name = args.get('model_name', f"{symbol}_simple_{datetime.now().strftime('%Y%m%d')}")
-    
-    history = ml_model.train(
-        X_train, y_train,
-        X_test, y_test,
-        epochs=epochs,
-        batch_size=batch_size,
-        model_name=model_name
-    )
-    
-    # Evaluate the model
-    metrics = ml_model.evaluate(X_test, y_test, resolution=resolution)
-    ml_model.save_evaluation_metrics(metrics, model_name)
-    
-    # Run simple backtest
-    logger.info(f"Running simple backtest strategy")
-    y_pred = ml_model.predict(X_test)
-    
-    # Convert predictions and test data back to original scale
-    # Use the stored prices from the data_processor for inverse transform
-    y_pred_orig = data_processor.inverse_transform_predictions(y_pred, data_processor.prices_at_sequence_end_test)
-    # Recalculate y_test_orig from original df
-    original_indices = df.index[-(len(y_test)+prediction_steps-1):-(prediction_steps-1)] if prediction_steps > 1 else df.index[-len(y_test):]
-    base_prices_for_y_test = df.loc[original_indices, 'close'].values
-    target_pct_changes = data_processor.price_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
-    y_test_orig = base_prices_for_y_test * (1 + target_pct_changes)
-    
-    # Run and plot simple backtest
-    ml_model.plot_simple_backtest(
-        y_test_orig, 
-        y_pred_orig, 
-        filename=f"{model_name}_simple_backtest.png",
-        resolution=resolution
-    )
-    
-    # Plot training history if requested
-    if args.get('plot', False):
-        ml_model.plot_training_history(history, f"{model_name}_training.png")
-        ml_model.plot_predictions(y_test_orig, y_pred_orig, f"{model_name}_predictions.png")
-        
-        # Add the new price comparison plot
-        ml_model.plot_price_comparison(y_test_orig, y_pred_orig, f"{model_name}_price_comparison.png")
-    
-    logger.info(f"Simple model training completed: {model_name}")
-    logger.info(f"Evaluation metrics: {metrics}")
-
 async def plot_price_comparison_cmd(args: Dict[str, Any]) -> None:
     """Generate a plot showing actual vs predicted closing prices for a specific model"""
     logger.info("Generating price comparison plot")
@@ -778,7 +1108,7 @@ async def plot_price_comparison_cmd(args: Dict[str, Any]) -> None:
     token_address = args.get('token_address')
     symbol = args.get('symbol', 'SOL')
     days = args.get('days', 30)
-    resolution = args.get('resolution', '1h')
+    resolution = args.get('resolution', '1H')
     
     data_processor = DataProcessor()
     df = data_processor.process_pipeline(token_address, symbol, resolution, days, save_data=False)
@@ -788,7 +1118,7 @@ async def plot_price_comparison_cmd(args: Dict[str, Any]) -> None:
         return
     
     # Prepare test data
-    sequence_length = args.get('sequence_length', 24)
+    sequence_length = args.get('sequence_length', 36)
     prediction_steps = args.get('prediction_horizon', 1)
     
     logger.info(f"Preparing data with sequence_length={sequence_length}, prediction_horizon={prediction_steps} steps")
@@ -820,84 +1150,6 @@ async def plot_price_comparison_cmd(args: Dict[str, Any]) -> None:
     
     logger.info(f"Price comparison plot generated: {output_file}")
 
-async def test_fast_rl_agent_cmd(args: Dict[str, Any]) -> None:
-    """Wrapper to call the Fast RL agent testing logic."""
-    logger.info(f"Starting Fast RL Agent testing for token {args['symbol']} ({args['token_address']})")
-    # Import the actual testing function from the script where it will be defined
-    # We assume it will be in scripts/train_fast_rl.py for now
-    try:
-        from src.scripts.train_fast_rl import test_fast_rl_agent # Assuming the test function is named this
-        
-        # Convert Namespace to dict if necessary, or pass args directly
-        args_dict = vars(args) if isinstance(args, argparse.Namespace) else args
-        
-        # Set default values for optional arguments if not provided
-        if 'initial_balance' not in args_dict:
-            args_dict['initial_balance'] = 10000.0
-            
-        # Call the actual implementation
-        test_fast_rl_agent(args_dict)
-    except Exception as e:
-        logger.error(f"Error testing Fast RL agent: {e}")
-        # Print full traceback
-        import traceback
-        traceback.print_exc()
-
-async def continue_fast_rl_model_cmd(args: Dict[str, Any]) -> None:
-    """Wrapper to call the Fast RL model continuing training logic."""
-    logger.info(f"Starting continued training of Fast RL Agent for token {args['symbol']} ({args['token_address']})")
-    try:
-        from src.scripts.train_fast_rl import main as train_fast_rl_main
-        
-        # Convert Namespace to dict if necessary
-        args_dict = vars(args) if isinstance(args, argparse.Namespace) else args
-        
-        # Create sys.argv-like list for argparse in the train_fast_rl.py script
-        argv = ['continue']  # Command for continue training
-        
-        # Add all arguments
-        argv.extend(['--model-path', args_dict['model_path']])
-        argv.extend(['--token-address', args_dict['token_address']])
-        argv.extend(['--symbol', args_dict['symbol']])
-        argv.extend(['--days', str(args_dict['days'])])
-        argv.extend(['--resolution', args_dict['resolution']])
-        argv.extend(['--episodes', str(args_dict['episodes'])])
-        argv.extend(['--initial-balance', str(args_dict['initial_balance'])])
-        
-        if args_dict.get('include_social', True):
-            argv.append('--include-social')
-            
-        if 'day_offset' in args_dict and args_dict['day_offset'] > 0:
-            argv.extend(['--day-offset', str(args_dict['day_offset'])])
-            
-        # Add the new epsilon parameters
-        try:
-            if 'epsilon' in args_dict:
-                argv.extend(['--epsilon', str(args_dict['epsilon'])])
-                
-            if args_dict.get('reset_epsilon', False):
-                argv.append('--reset-epsilon')
-                
-            # Call the main function from train_fast_rl.py with our constructed arguments
-            import sys
-            original_argv = sys.argv
-            try:
-                sys.argv = [sys.argv[0]] + argv
-                train_fast_rl_main()
-            finally:
-                sys.argv = original_argv
-                
-        except Exception as e:
-            logger.error(f"Error continuing training of Fast RL agent: {e}")
-            # Print full traceback
-            import traceback
-            traceback.print_exc()
-        
-    except Exception as e:
-        logger.error(f"Error continuing training of Fast RL agent: {e}")
-        # Print full traceback
-        import traceback
-        traceback.print_exc()
 
 def parse_arguments():
     """Parse command-line arguments"""
@@ -918,72 +1170,8 @@ def parse_arguments():
     train_parser.add_argument('--plot', action='store_true', help='Plot training results')
     train_parser.add_argument('--bidirectional', action='store_true', default=True, help='Use bidirectional LSTM')
     train_parser.add_argument('--no-bidirectional', dest='bidirectional', action='store_false', help='Disable bidirectional LSTM')
-
-    # Add RL train command
-    rl_train_parser = subparsers.add_parser('train-rl', help='Train a Reinforcement Learning trading agent')
-    rl_train_parser.add_argument('--token-address', type=str, required=True, help='Address of the token to train on')
-    rl_train_parser.add_argument('--symbol', type=str, default='SOL', help='Symbol of the token')
-    rl_train_parser.add_argument('--days', type=int, default=90, help='Number of days of historical data to use')
-    rl_train_parser.add_argument('--resolution', type=str, default='5m', help='Data resolution (1m, 5m, 15m, 1h, 4h, 1d)')
-    rl_train_parser.add_argument('--sequence-length', type=int, default=26, help='Number of time steps in RL state')
-    rl_train_parser.add_argument('--episodes', type=int, default=200, help='Number of training episodes')
-    rl_train_parser.add_argument('--batch-size', type=int, default=64, help='Training batch size')
-    rl_train_parser.add_argument('--initial-balance', type=float, default=10000.0, help='Initial balance for trading')
     
-    # Add Fast RL train command
-    fast_rl_train_parser = subparsers.add_parser('train-fast-rl', help='Train an optimized fast Reinforcement Learning trading agent')
-    fast_rl_train_parser.add_argument('--token-address', type=str, required=True, help='Address of the token to train on')
-    fast_rl_train_parser.add_argument('--symbol', type=str, default='SOL', help='Symbol of the token')
-    fast_rl_train_parser.add_argument('--days', type=int, default=30, help='Number of days of historical data to use')
-    fast_rl_train_parser.add_argument('--resolution', type=str, default='5m', help='Data resolution (1m, 5m, 15m, 1h, 4h, 1d)')
-    fast_rl_train_parser.add_argument('--episodes', type=int, default=100, help='Number of training episodes')
-    fast_rl_train_parser.add_argument('--batch-size', type=int, default=256, help='Training batch size')
-    fast_rl_train_parser.add_argument('--initial-balance', type=float, default=10000.0, help='Initial balance for trading')
-    fast_rl_train_parser.add_argument('--network-type', type=str, default='simple', help='Neural network architecture to use: simple, deep, lstm, or dueling')
-    fast_rl_train_parser.add_argument('--include-social', action='store_true', default=True, help='Include social sentiment data in training')
     
-    # Add Sharpe ratio parameters
-    fast_rl_train_parser.add_argument('--risk-free-rate', type=float, default=0.0, help='Annual risk-free rate for Sharpe ratio calculation')
-    fast_rl_train_parser.add_argument('--sharpe-lookback', type=int, default=30, help='Number of steps to use for Sharpe ratio calculation')
-    fast_rl_train_parser.add_argument('--sharpe-weight', type=float, default=2.0, help='Weight of Sharpe ratio in reward function')
-    
-    # Add position sizing parameters
-    fast_rl_train_parser.add_argument('--position-sizing', type=str, default='fixed', choices=['fixed', 'kelly', 'random'], help='Position sizing strategy to use')
-    fast_rl_train_parser.add_argument('--max-position-pct', type=float, default=0.5, help='Maximum position size as fraction of portfolio (0.5 = 50%)')
-    
-    # Add reward type parameter
-    fast_rl_train_parser.add_argument('--reward-type', type=str, default='combined', choices=['combined', 'sharpe_only'], help='Type of reward function to use')
-    
-    # Add slippage parameter
-    fast_rl_train_parser.add_argument('--slippage', type=float, default=0.0015, help='Amount of slippage to apply to trades (0.0015 = 15 basis points)')
-    
-    # Add Historical RL train command
-    historical_rl_train_parser = subparsers.add_parser('train-historical-rl', help='Train a Reinforcement Learning agent with access to all previous history')
-    historical_rl_train_parser.add_argument('--token-address', type=str, required=True, help='Address of the token to train on')
-    historical_rl_train_parser.add_argument('--symbol', type=str, default='Fartcoin', help='Symbol of the token')
-    historical_rl_train_parser.add_argument('--days', type=int, default=90, help='Number of days of historical data to use')
-    historical_rl_train_parser.add_argument('--resolution', type=str, default='5m', help='Data resolution (1m, 5m, 15m, 1h, 4h, 1d)')
-    historical_rl_train_parser.add_argument('--episodes', type=int, default=100, help='Number of training episodes')
-    historical_rl_train_parser.add_argument('--batch-size', type=int, default=64, help='Training batch size')
-    historical_rl_train_parser.add_argument('--initial-balance', type=float, default=10000.0, help='Initial balance for trading')
-    historical_rl_train_parser.add_argument('--history-limit', type=int, default=80, help='Maximum historical steps to consider')
-    historical_rl_train_parser.add_argument('--train-every', type=int, default=1, help='Train the model every N steps for better speed')
-    
-    # Add Prediction-Guided RL train command
-    prediction_guided_train_parser = subparsers.add_parser('train-prediction-guided', help='Train a Prediction-Guided RL trading agent using ML price predictions')
-    prediction_guided_train_parser.add_argument('--token-address', type=str, required=True, help='Address of the token to train on')
-    prediction_guided_train_parser.add_argument('--ml-model-path', type=str, required=True, help='Path to trained ML price prediction model')
-    prediction_guided_train_parser.add_argument('--symbol', type=str, default='SOL', help='Symbol of the token')
-    prediction_guided_train_parser.add_argument('--days', type=int, default=30, help='Number of days of historical data to use')
-    prediction_guided_train_parser.add_argument('--resolution', type=str, default='1H', help='Data resolution (1m, 5m, 15m, 1h, 4h, 1d)')
-    prediction_guided_train_parser.add_argument('--sequence-length', type=int, default=36, help='Number of time steps in each sequence')
-    prediction_guided_train_parser.add_argument('--prediction-horizon', type=int, default=1, help='Number of steps into future to predict')
-    prediction_guided_train_parser.add_argument('--episodes', type=int, default=100, help='Number of training episodes')
-    prediction_guided_train_parser.add_argument('--batch-size', type=int, default=256, help='Training batch size')
-    prediction_guided_train_parser.add_argument('--initial-balance', type=float, default=10000.0, help='Initial balance for trading')
-    prediction_guided_train_parser.add_argument('--network-type', type=str, default='deep', help='Neural network architecture: simple, deep, lstm, or dueling')
-    
-    # Test model command
     test_parser = subparsers.add_parser('test', help='Test the ML model')
     test_parser.add_argument('--token-address', type=str, required=True, help='Address of the token to test on')
     test_parser.add_argument('--symbol', type=str, default='SOL', help='Symbol of the token')
@@ -1009,37 +1197,6 @@ def parse_arguments():
     info_parser = subparsers.add_parser('token-info', help='Get information about a token')
     info_parser.add_argument('--token-address', type=str, required=True, help='Address of the token to get info about')
     
-    # Add cross-token training command
-    cross_token_parser = subparsers.add_parser('train-cross-token', help='Train cross-token generalization agent')
-    cross_token_parser.add_argument('--tokens', required=True, help='Comma-separated list of token symbols')
-    cross_token_parser.add_argument('--days', type=int, default=30, help='Days of historical data')
-    cross_token_parser.add_argument('--resolution', default='5m', help='Data resolution')
-    cross_token_parser.add_argument('--episodes', type=int, default=200, help='Training episodes')
-    cross_token_parser.add_argument('--scheduling', default='random', 
-                                   choices=['random', 'sequential', 'curriculum'],
-                                   help='Token scheduling strategy')
-    cross_token_parser.add_argument('--no-predictions', action='store_true', 
-                                   help='Disable prediction guidance')
-    cross_token_parser.add_argument('--balance', type=float, default=10000.0,
-                                   help='Initial balance')
-    cross_token_parser.add_argument('--sequence-length', type=int, default=10,
-                                   help='Sequence length for prediction input')
-    cross_token_parser.add_argument('--batch-size', type=int, default=64,
-                                   help='Training batch size')
-    
-    # Add a simple training command
-    simple_train_parser = subparsers.add_parser('train-simple', help='Train model with simple directional optimization')
-    simple_train_parser.add_argument('--token-address', type=str, required=True, help='Address of the token to train on')
-    simple_train_parser.add_argument('--symbol', type=str, default='SOL', help='Symbol of the token')
-    simple_train_parser.add_argument('--days', type=int, default=30, help='Number of days of historical data to use')
-    simple_train_parser.add_argument('--resolution', type=str, default='5m', help='Data resolution (1m, 5m, 15m, 1h, 4h, 1d)')
-    simple_train_parser.add_argument('--model-type', type=str, default='lstm', help='Type of ML model to use')
-    simple_train_parser.add_argument('--sequence-length', type=int, default=24, help='Number of time steps in each input sequence')
-    simple_train_parser.add_argument('--prediction-horizon', type=int, default=1, help='Number of time steps in the future to predict')
-    simple_train_parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
-    simple_train_parser.add_argument('--batch-size', type=int, default=64, help='Training batch size')
-    simple_train_parser.add_argument('--plot', action='store_true', help='Plot training results')
-    
     # Add plot-prices command
     plot_prices_parser = subparsers.add_parser('plot-prices', help='Generate a price comparison plot')
     plot_prices_parser.add_argument('--token-address', type=str, required=True, help='Address of the token')
@@ -1047,35 +1204,9 @@ def parse_arguments():
     plot_prices_parser.add_argument('--model-path', type=str, help='Path to the model to use')
     plot_prices_parser.add_argument('--days', type=int, default=30, help='Number of days of historical data to use')
     plot_prices_parser.add_argument('--resolution', type=str, default='1h', help='Data resolution (1m, 5m, 15m, 1h, 4h, 1d)')
-    plot_prices_parser.add_argument('--sequence-length', type=int, default=24, help='Number of time steps in each input sequence')
+    plot_prices_parser.add_argument('--sequence-length', type=int, default=36, help='Number of time steps in each input sequence')
     plot_prices_parser.add_argument('--prediction-horizon', type=int, default=1, help='Number of time steps in the future to predict')
     plot_prices_parser.add_argument('--output-file', type=str, help='Output filename for the plot')
-    
-    # Add test-fast-rl command
-    test_rl_parser = subparsers.add_parser('test-fast-rl', help='Test a trained Fast RL agent on new token data')
-    test_rl_parser.add_argument('--token-address', type=str, required=True, help='Address of the token to test on')
-    test_rl_parser.add_argument('--symbol', type=str, default='TOKEN', help='Symbol of the token to test on')
-    test_rl_parser.add_argument('--agent-path', type=str, required=True, help='Path to the saved trained agent/policy network')
-    test_rl_parser.add_argument('--days', type=int, default=30, help='Number of days of historical data to use for testing')
-    test_rl_parser.add_argument('--resolution', type=str, default='5m', help='Data resolution (1m, 5m, 15m, 1h, 4h, 1d)')
-    test_rl_parser.add_argument('--initial-balance', type=float, default=10000.0, help='Initial balance for the test simulation')
-    test_rl_parser.add_argument('--verbose', action='store_true', help='Enable verbose logging for debugging')
-    test_rl_parser.set_defaults(func=test_fast_rl_agent_cmd)
-    
-    # Add continue-fast-rl command for continuing training of an existing model
-    continue_rl_parser = subparsers.add_parser('continue-fast-rl', help='Continue training an existing Fast RL agent model')
-    continue_rl_parser.add_argument('--model-path', type=str, required=True, help='Path to the saved model file (.h5)')
-    continue_rl_parser.add_argument('--token-address', type=str, required=True, help='Address of the token to train on')
-    continue_rl_parser.add_argument('--symbol', type=str, default='TOKEN', help='Symbol of the token to train on')
-    continue_rl_parser.add_argument('--days', type=int, default=30, help='Number of days of historical data to use')
-    continue_rl_parser.add_argument('--resolution', type=str, default='5m', help='Data resolution (1m, 5m, 15m, 1h, 4h, 1d)')
-    continue_rl_parser.add_argument('--episodes', type=int, default=50, help='Number of training episodes for continued training')
-    continue_rl_parser.add_argument('--initial-balance', type=float, default=10000.0, help='Initial balance for the trading simulation')
-    continue_rl_parser.add_argument('--include-social', action='store_true', default=True, help='Include social sentiment data in training')
-    continue_rl_parser.add_argument('--day-offset', type=int, default=0, help='Days to offset data collection (to get newer data)')
-    continue_rl_parser.add_argument('--epsilon', type=float, default=0.1, help='Starting epsilon value for exploration-exploitation balance (lower = more exploitation)')
-    continue_rl_parser.add_argument('--reset-epsilon', action='store_true', help='Whether to reset epsilon to the specified value (default: keeps original epsilon)')
-    continue_rl_parser.set_defaults(func=continue_fast_rl_model_cmd)
     
     # NEW: Phase 3.2 - Vault Trading System command
     vault_system_parser = subparsers.add_parser('run-vault-system', help='Run the Calvin AI Vault Trading System (Phase 3.2)')
@@ -1100,18 +1231,6 @@ def main():
     try:
         if command == 'train':
             asyncio.run(train_model(args_dict))
-        elif command == 'train-rl':
-            train_rl_model(args)
-        elif command == 'train-fast-rl':
-            train_fast_rl_model(args)
-        elif command == 'train-historical-rl':
-            train_historical_rl(args)
-        elif command == 'train-prediction-guided':
-            train_prediction_guided_model(args)
-        elif command == 'train-cross-token':
-            asyncio.run(train_cross_token(args_dict))
-        elif command == 'train-simple':
-            asyncio.run(train_simple_model(args_dict))
         elif command == 'test':
             asyncio.run(test_model(args_dict))
         elif command == 'run':
@@ -1122,10 +1241,6 @@ def main():
             asyncio.run(get_token_info(args_dict))
         elif command == 'plot-prices':
             asyncio.run(plot_price_comparison_cmd(args_dict))
-        elif command == 'test-fast-rl':
-            asyncio.run(test_fast_rl_agent_cmd(args_dict))
-        elif command == 'continue-fast-rl':
-            asyncio.run(continue_fast_rl_model_cmd(args_dict))
         elif command == 'run-vault-system':
             asyncio.run(run_vault_system(args_dict))
         else:

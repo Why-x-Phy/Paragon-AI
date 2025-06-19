@@ -8,7 +8,7 @@ Key Features:
 - <100ms prediction + strategy evaluation latency per token
 - Simple magnitude-based strategy (buy ≥2%, sell ≥3% predicted change)
 - Real-time feature preprocessing integration
-- Confidence-based signal filtering (>70% threshold)
+- Configurable confidence-based signal filtering (default 10% minimal threshold)
 - Memory management for GPU models
 - Integration with existing model registry and data pipeline
 
@@ -43,7 +43,7 @@ except ImportError:
 from ..config.config import config
 from ..utils.logger import log
 from .model_registry import get_model_registry, ModelMetadata
-from ..data.data_processor import DataProcessor
+from ..data.inference_data_processor import create_inference_data_processor
 from ..database.production_db import get_db_manager
 
 logger = log
@@ -93,7 +93,7 @@ class StrategyConfig:
     # Strategy settings
     default_buy_threshold: float = 0.02  # 2%
     default_sell_threshold: float = 0.03  # 3%
-    default_confidence_threshold: float = 0.10  # 10% (minimal threshold - strategy thresholds are primary)
+    default_confidence_threshold: float = None  # Will use config.MIN_PREDICTION_CONFIDENCE
     position_size_pct: float = 0.10  # 10% of available cash
     transaction_cost_pct: float = 0.001  # 0.1% fee
     
@@ -111,47 +111,42 @@ class SimpleStrategyEngine:
     Real-time strategy engine combining LSTM predictions with simple magnitude-based strategy
     """
     
-    def __init__(self, config: Optional[StrategyConfig] = None):
-        """
-        Initialize the strategy engine
+    def __init__(self, config: Optional[StrategyConfig] = None, backtest_mode: bool = False):
+        """Initialize the strategy engine with optimized LSTM prediction pipeline"""
+        # Initialize configuration with proper defaults
+        if config is None:
+            # Get the global config for correct defaults
+            from ..config.config import config as global_config
+            config = StrategyConfig(
+                default_confidence_threshold=global_config.MIN_PREDICTION_CONFIDENCE  # Use 0.10 from global config
+            )
         
-        Args:
-            config: Strategy configuration (uses defaults if None)
-        """
-        self.config = config or StrategyConfig()
+        self.config = config
+        self.backtest_mode = backtest_mode
         
-        # Initialize core components
+        # Initialize model registry
         self.model_registry = get_model_registry()
-        self.data_processor = DataProcessor()
         
-        # Redis for caching predictions and features
-        self.redis_client = None
-        self._init_redis()
-        
-        # Database manager for data access
-        self.db_manager = None
-        self._init_db_manager()
-        
-        # Performance tracking
-        self.prediction_times = []
-        self.signal_history = []
-        
-        # Feature cache
+        # Initialize caching and performance tracking
         self._feature_cache = {}
         self._prediction_cache = {}
+        self.prediction_times = []
         
-        # GPU memory management
+        # Initialize async components (will be set on first use)
+        self.db_manager = None
+        self.inference_processor = None
+        
+        # Initialize Redis connection
+        self._init_redis()
+        
+        # Initialize database manager (async initialization)
+        self._init_db_manager()
+        
+        # Configure GPU memory for TensorFlow
         self._configure_gpu_memory()
         
-        logger.info("Simple Strategy Engine initialized")
-        logger.info(f"Config: buy_threshold={self.config.default_buy_threshold:.1%}, "
-                   f"sell_threshold={self.config.default_sell_threshold:.1%}, "
-                   f"confidence_threshold={self.config.default_confidence_threshold:.1%}")
-        logger.info(f"Performance: target_latency={self.config.max_prediction_latency_ms}ms "
-                   f"(Note: First model loads will be slower due to GPU initialization)")
-        logger.info(f"Memory: max_models_in_memory={self.config.max_models_in_memory}, "
-                   f"threshold={self.config.model_memory_threshold_mb}MB "
-                   f"(Optimized for ~20 token models)")
+        # Log configuration
+        self._log_initialization()
 
     def _init_redis(self):
         """Initialize Redis connection for caching"""
@@ -189,6 +184,17 @@ class SimpleStrategyEngine:
                 logger.error(f"Failed to initialize database manager: {e}")
                 raise
 
+    async def _ensure_inference_processor(self):
+        """Ensure inference data processor is initialized"""
+        if self.inference_processor is None:
+            try:
+                await self._ensure_db_manager()
+                self.inference_processor = await create_inference_data_processor(self.db_manager, backtest_mode=self.backtest_mode)
+                logger.info(f"Inference data processor initialized (backtest_mode={self.backtest_mode})")
+            except Exception as e:
+                logger.error(f"Failed to initialize inference processor: {e}")
+                raise
+
     def _configure_gpu_memory(self):
         """Configure GPU memory growth to prevent memory issues"""
         if not HAS_TENSORFLOW:
@@ -206,13 +212,14 @@ class SimpleStrategyEngine:
         except Exception as e:
             logger.warning(f"GPU memory configuration failed: {e}")
 
-    async def generate_signal(self, symbol: str, version: Optional[str] = None) -> Optional[TradingSignal]:
+    async def generate_signal(self, symbol: str, version: Optional[str] = None, simulation_time: Optional[datetime] = None) -> Optional[TradingSignal]:
         """
         Generate trading signal for a token using LSTM prediction + simple strategy
         
         Args:
             symbol: Token symbol (e.g., 'BONK', 'JUP')
             version: Model version (defaults to latest)
+            simulation_time: Optional time for backtesting (defaults to current time)
             
         Returns:
             TradingSignal or None if failed
@@ -220,26 +227,42 @@ class SimpleStrategyEngine:
         start_time = time.time()
         
         try:
-            # 1. Get model and strategy parameters
+            # 1. Get model and strategy parameters (ADAPTIVE if available)
             model = self.model_registry.get_model(symbol, version)
             if not model:
                 logger.warning(f"No model available for {symbol}")
                 return None
             
             metadata = self.model_registry.get_model_metadata(symbol, version)
-            strategy_params = self.model_registry.get_strategy_parameters(symbol, version)
+            
+            # 🆕 USE ADAPTIVE PARAMETERS (if available)
+            strategy_params = await self.model_registry.get_adaptive_strategy_parameters(symbol, version)
+            
+            # Log whether we're using adaptive or static parameters
+            if strategy_params.get('_adaptive'):
+                logger.debug(f"Using ADAPTIVE parameters for {symbol}: "
+                           f"buy={strategy_params['buy_threshold']:.1%}, "
+                           f"sell={strategy_params['sell_threshold']:.1%}")
+            else:
+                logger.debug(f"Using static parameters for {symbol}: "
+                           f"buy={strategy_params['buy_threshold']:.1%}, "
+                           f"sell={strategy_params['sell_threshold']:.1%}")
             
             # 2. Get current market data
-            current_price = await self._get_current_price(symbol)
+            logger.debug(f"Getting current price for {symbol} at {simulation_time}")
+            current_price = await self._get_current_price(symbol, simulation_time)
             if not current_price:
                 logger.warning(f"No current price data for {symbol}")
                 return None
+            logger.debug(f"Current price for {symbol}: ${current_price}")
             
             # 3. Prepare features for prediction
-            features = await self._prepare_features(symbol, metadata)
+            logger.debug(f"Preparing features for {symbol}")
+            features = await self._prepare_features(symbol, metadata, simulation_time)
             if features is None:
                 logger.warning(f"Failed to prepare features for {symbol}")
                 return None
+            logger.debug(f"Features prepared for {symbol}: shape {features.shape}")
             
             # 4. Generate LSTM prediction
             raw_prediction = await self._predict_with_model(model, features, symbol)
@@ -302,14 +325,14 @@ class SimpleStrategyEngine:
             logger.error(f"Signal generation failed for {symbol}: {e}")
             return None
 
-    async def _get_current_price(self, symbol: str) -> Optional[float]:
+    async def _get_current_price(self, symbol: str, simulation_time: Optional[datetime] = None) -> Optional[float]:
         """Get current price from database or cache"""
         try:
             # Ensure database manager is initialized
             await self._ensure_db_manager()
             
-            # Try Redis cache first
-            if self.redis_client:
+            # Skip Redis cache in backtest mode or when simulation_time is provided
+            if not self.backtest_mode and not simulation_time and self.redis_client:
                 cache_key = f"price:current:{symbol}"
                 cached_price = self.redis_client.get(cache_key)
                 if cached_price:
@@ -321,8 +344,45 @@ class SimpleStrategyEngine:
                 logger.warning(f"Token {symbol} not found in database")
                 return None
             
-            # Get latest price from database
-            price = await self.db_manager.get_latest_price(token_info['token_id'])
+            # Get price from database (latest or at simulation time)
+            if simulation_time:
+                # For backtesting: get the most recent price before or at simulation time
+                # Make simulation_time timezone-aware if needed
+                from datetime import timezone
+                if simulation_time.tzinfo is None:
+                    simulation_time_utc = simulation_time.replace(tzinfo=timezone.utc)
+                else:
+                    simulation_time_utc = simulation_time
+                
+                # Go back further to ensure we find data
+                start_time = simulation_time_utc - timedelta(days=7)  # Go back 7 days
+                
+                logger.debug(f"Looking for {symbol} price data from {start_time} to {simulation_time_utc}")
+                
+                ohlcv_data = await self.db_manager.get_ohlcv_data(
+                    token_id=token_info['token_id'],
+                    resolution='1H',
+                    start_time=start_time,
+                    end_time=simulation_time_utc + timedelta(hours=1)  # Include simulation time
+                )
+                
+                if ohlcv_data:
+                    # Filter to only records at or before simulation time and get the most recent
+                    valid_records = [r for r in ohlcv_data if r.time <= simulation_time_utc]
+                    if valid_records:
+                        latest_record = max(valid_records, key=lambda x: x.time)
+                        logger.debug(f"Found price for {symbol} at {latest_record.time}: ${latest_record.close}")
+                        return float(latest_record.close)
+                    else:
+                        logger.warning(f"No records found at or before {simulation_time_utc} for {symbol}")
+                        # Debug: show what records we did find
+                        if ohlcv_data:
+                            logger.debug(f"Available records for {symbol}: {[r.time for r in ohlcv_data[:3]]}")
+                else:
+                    logger.warning(f"No OHLCV data found for {symbol} in range {start_time} to {simulation_time_utc}")
+            else:
+                # For live trading: get latest price
+                price = await self.db_manager.get_latest_price(token_info['token_id'])
             if price:
                 return float(price)
             
@@ -334,78 +394,73 @@ class SimpleStrategyEngine:
             logger.error(f"Failed to get current price for {symbol}: {e}")
             return None
 
-    async def _prepare_features(self, symbol: str, metadata: ModelMetadata) -> Optional[np.ndarray]:
-        """Prepare features for LSTM prediction"""
+    async def _prepare_features(self, symbol: str, metadata: ModelMetadata, simulation_time: Optional[datetime] = None) -> Optional[np.ndarray]:
+        """
+        Prepare features using EXACT same pattern as test_simple_inference.py (PROVEN TO WORK)
+        
+        Args:
+            symbol: Token symbol
+            metadata: Model metadata with input requirements
+            simulation_time: Optional time for backtesting (defaults to current time)
+            
+        Returns:
+            Feature array ready for model inference or None if failed
+        """
         try:
-            # Ensure database manager is initialized
+            logger.debug(f"Preparing features for {symbol} using WORKING test_simple_inference.py pattern")
+            
+            # Get token address from symbol
             await self._ensure_db_manager()
-            
-            # Check feature cache first
-            cache_key = f"features:{symbol}:{metadata.version}"
-            if cache_key in self._feature_cache:
-                cached_time, features = self._feature_cache[cache_key]
-                if (datetime.now() - cached_time).seconds < self.config.feature_cache_ttl:
-                    return features
-            
-            # Get token info first
             token_info = await self.db_manager.get_token_by_symbol(symbol)
             if not token_info:
-                logger.warning(f"Token {symbol} not found in database")
+                logger.error(f"Token {symbol} not found in database")
                 return None
             
-            # Get recent OHLCV data for feature engineering
-            # Calculate start time for data
-            lookback_hours = metadata.sequence_length + 24  # Extra buffer for indicators
-            end_time = datetime.now()
-            start_time = end_time - timedelta(hours=lookback_hours)
+            token_address = token_info['address']
+            logger.debug(f"Found token {symbol} with address {token_address}")
             
-            # Get OHLCV data from database
-            ohlcv_data = await self.db_manager.get_ohlcv_data(
-                token_id=token_info['token_id'],
-                resolution='1h',
-                start_time=start_time,
-                end_time=end_time,
-                limit=lookback_hours
+            # Get clean DataFrame from InferenceDataProcessor (with caching benefits)
+            await self._ensure_inference_processor()
+            inference_data = await self.inference_processor.prepare_inference_data(
+                token_address=token_address,
+                resolution='1H',
+                simulation_time=simulation_time
             )
             
-            if not ohlcv_data or len(ohlcv_data) < metadata.sequence_length:
-                logger.warning(f"Insufficient historical data for {symbol}: got {len(ohlcv_data) if ohlcv_data else 0}, need {metadata.sequence_length}")
+            if not inference_data or not inference_data.get('ready_for_inference'):
+                logger.warning(f"Inference data not ready for {symbol}")
                 return None
             
-            # Convert to DataFrame for data processor
-            df_data = []
-            for candle in ohlcv_data:
-                df_data.append({
-                    'time': candle.time,
-                    'open': candle.open,
-                    'high': candle.high,
-                    'low': candle.low,
-                    'close': candle.close,
-                    'volume': candle.volume
-                })
+            # Get clean DataFrame (processed by DataProcessor.prepare_inference_ready_data)
+            features_df = inference_data['features_dataframe']
+            logger.debug(f"Got clean DataFrame for {symbol}: shape {features_df.shape}")
             
-            ohlcv_df = pd.DataFrame(df_data).sort_values('time')
-            
-            # Use existing data processor for feature engineering
-            X, _, _, _ = self.data_processor.prepare_ml_data(
-                ohlcv_df,
+            # Use EXACT same DataProcessor.prepare_ml_data() call as test_simple_inference.py
+            from ..data.data_processor import DataProcessor
+            data_processor = DataProcessor()
+            _, X_test, _, _ = data_processor.prepare_ml_data(
+                features_df,
                 target_col='close',
                 sequence_length=metadata.sequence_length,
-                prediction_horizon=metadata.prediction_horizon,
-                test_size=0.01  # Just get the latest sequence
+                prediction_horizon=1,
+                test_size=0.0,  # Use all data
+                include_feature_names=False,
+                test_mode=True  # CRITICAL: Same as test_simple_inference.py
             )
             
-            if len(X) == 0:
-                logger.warning(f"No features generated for {symbol}")
+            if len(X_test) == 0:
+                logger.warning(f"No sequences generated for {symbol}")
                 return None
             
-            # Get the latest feature sequence
-            features = X[-1]  # Most recent sequence
+            # Get the latest sequence (for immediate prediction)
+            latest_sequence = X_test[-1]  # Shape: (sequence_length, num_features)
             
-            # Cache the features
-            self._feature_cache[cache_key] = (datetime.now(), features)
+            # Store the data_processor for inverse transform (CRITICAL)
+            self._current_data_processor = data_processor
             
-            return features
+            logger.debug(f"Prepared inference sequence for {symbol}: shape {latest_sequence.shape}, ready for model.predict()")
+            
+            return latest_sequence.astype(np.float32)
                 
         except Exception as e:
             logger.error(f"Feature preparation failed for {symbol}: {e}")
@@ -414,22 +469,38 @@ class SimpleStrategyEngine:
     async def _predict_with_model(self, model, features: np.ndarray, symbol: str) -> Optional[float]:
         """Generate prediction using LSTM model"""
         try:
-            # Check prediction cache
+            # Validate inputs
+            if model is None:
+                logger.error(f"Model is None for {symbol}")
+                return None
+            
+            if features is None:
+                logger.error(f"Features is None for {symbol}")
+                return None
+            
+            # Check prediction cache (skip in backtest mode)
             cache_key = f"prediction:{symbol}:{hash(features.tobytes())}"
-            if cache_key in self._prediction_cache:
+            if not self.backtest_mode and cache_key in self._prediction_cache:
                 cached_time, prediction = self._prediction_cache[cache_key]
                 if (datetime.now() - cached_time).seconds < self.config.cache_predictions_seconds:
                     return prediction
             
             # Make prediction
             features_batch = np.expand_dims(features, axis=0)  # Add batch dimension
+            logger.debug(f"Making prediction for {symbol} with features shape: {features_batch.shape}")
             prediction = model.predict(features_batch, verbose=0)
+            
+            # Check if prediction is valid
+            if prediction is None:
+                logger.error(f"Model returned None prediction for {symbol}")
+                return None
             
             # Extract scalar prediction
             raw_prediction = float(prediction[0][0]) if len(prediction.shape) > 1 else float(prediction[0])
             
-            # Cache the prediction
-            self._prediction_cache[cache_key] = (datetime.now(), raw_prediction)
+            # Cache the prediction (skip in backtest mode)
+            if not self.backtest_mode:
+                self._prediction_cache[cache_key] = (datetime.now(), raw_prediction)
             
             return raw_prediction
             
@@ -439,21 +510,59 @@ class SimpleStrategyEngine:
 
     async def _convert_prediction_to_price(self, raw_prediction: float, current_price: float, 
                                          symbol: str, metadata: ModelMetadata) -> float:
-        """Convert raw model prediction to actual price prediction"""
+        """Convert raw model prediction to actual price prediction using the same method as training"""
         try:
-            # The conversion depends on how the model was trained
-            # For percentage change models (most common):
-            if abs(raw_prediction) < 1.0:  # Likely percentage change
+            # Check for invalid predictions first
+            if np.isnan(raw_prediction) or np.isinf(raw_prediction):
+                logger.warning(f"Invalid raw prediction for {symbol}: {raw_prediction}, using current price")
+                return current_price
+            
+            # CRITICAL: Use the SAME conversion method as the training pipeline
+            # The models output scaled percentage changes that need to be:
+            # 1. Inverse scaled using the price_scaler 
+            # 2. Converted to absolute price using: price * (1 + percentage_change)
+            
+            # SIMPLIFIED APPROACH: Use the same simple logic as test_simple_inference.py
+            # The model output is already scaled appropriately, we just need to apply it
+            
+            try:
+                # Use the SAME data_processor that was used for feature preparation
+                if hasattr(self, '_current_data_processor') and self._current_data_processor is not None:
+                    data_processor = self._current_data_processor
+                    
+                    # Use the same inverse_transform_predictions method as training
+                    scaled_predictions = np.array([raw_prediction])  # Single prediction
+                    prices_at_sequence_end = np.array([current_price])  # Current price is the reference
+                    
+                    # This uses the exact same logic as test_simple_inference.py
+                    absolute_predictions = data_processor.inverse_transform_predictions(
+                        scaled_predictions, prices_at_sequence_end
+                    )
+                    predicted_price = absolute_predictions[0]
+                    
+                    # Calculate the actual percentage change for logging
+                    percentage_change = (predicted_price / current_price - 1) * 100
+                    
+                    logger.debug(f"Prediction conversion for {symbol}: raw={raw_prediction:.6f}, pct_change={percentage_change:.3f}%, price=${current_price:.6f} -> ${predicted_price:.6f}")
+                else:
+                    # No data_processor available, fallback
+                    logger.warning(f"No data_processor available for {symbol}, using fallback conversion")
+                    predicted_price = current_price * (1 + raw_prediction)
+                
+            except Exception as convert_e:
+                logger.warning(f"Failed to use inverse_transform_predictions for {symbol}: {convert_e}")
+                # Fallback: treat as raw percentage change
                 predicted_price = current_price * (1 + raw_prediction)
-            else:  # Likely absolute price
-                predicted_price = raw_prediction
             
             # Sanity check - prevent unrealistic predictions
             max_change = 0.50  # 50% max change
             min_price = current_price * (1 - max_change)
             max_price = current_price * (1 + max_change)
             
-            predicted_price = max(min_price, min(max_price, predicted_price))
+            if predicted_price < min_price or predicted_price > max_price:
+                change_pct = (predicted_price / current_price - 1) * 100
+                logger.warning(f"Extreme prediction for {symbol}: {change_pct:.2f}% change, clamping to ±50%")
+                predicted_price = max(min_price, min(max_price, predicted_price))
             
             return predicted_price
             
@@ -472,7 +581,11 @@ class SimpleStrategyEngine:
             # Get strategy parameters
             buy_threshold = strategy_params.get('buy_threshold', self.config.default_buy_threshold)
             sell_threshold = strategy_params.get('sell_threshold', self.config.default_sell_threshold)
-            confidence_threshold = strategy_params.get('confidence_threshold', self.config.default_confidence_threshold)
+            
+            # Use configurable confidence threshold
+            from ..config.config import config
+            default_confidence = self.config.default_confidence_threshold or config.MIN_PREDICTION_CONFIDENCE
+            confidence_threshold = strategy_params.get('confidence_threshold', default_confidence)
             
             # Calculate confidence based on magnitude of predicted change
             # Higher magnitude changes = higher confidence
@@ -519,8 +632,8 @@ class SimpleStrategyEngine:
             }
 
     async def _cache_signal(self, signal: TradingSignal):
-        """Cache the generated signal in Redis"""
-        if not self.redis_client:
+        """Cache the generated signal in Redis (disabled in backtest mode)"""
+        if not self.redis_client or self.backtest_mode:
             return
             
         try:
@@ -596,14 +709,31 @@ class SimpleStrategyEngine:
         self._prediction_cache.clear()
         logger.info("Strategy engine caches cleared")
 
+    def _log_initialization(self):
+        """Log strategy engine initialization details"""
+        logger.info(f"Simple Strategy Engine initialized (backtest_mode={self.backtest_mode})")
+        
+        # Get actual confidence threshold value for logging
+        from ..config.config import config
+        actual_confidence_threshold = self.config.default_confidence_threshold or config.MIN_PREDICTION_CONFIDENCE
+        
+        logger.info(f"Config: buy_threshold={self.config.default_buy_threshold:.1%}, "
+                   f"sell_threshold={self.config.default_sell_threshold:.1%}, "
+                   f"confidence_threshold={actual_confidence_threshold:.1%}")
+        logger.info(f"Performance: target_latency={self.config.max_prediction_latency_ms}ms "
+                   f"(Note: First model loads will be slower due to GPU initialization)")
+        logger.info(f"Memory: max_models_in_memory={self.config.max_models_in_memory}, "
+                   f"threshold={self.config.model_memory_threshold_mb}MB "
+                   f"(Optimized for ~20 token models)")
+
 # Convenience functions for easy integration
 _strategy_engine_instance: Optional[SimpleStrategyEngine] = None
 
-def get_strategy_engine() -> SimpleStrategyEngine:
+def get_strategy_engine(backtest_mode: bool = False) -> SimpleStrategyEngine:
     """Get or create the global strategy engine instance"""
     global _strategy_engine_instance
-    if _strategy_engine_instance is None:
-        _strategy_engine_instance = SimpleStrategyEngine()
+    if _strategy_engine_instance is None or (backtest_mode and not getattr(_strategy_engine_instance, 'backtest_mode', False)):
+        _strategy_engine_instance = SimpleStrategyEngine(backtest_mode=backtest_mode)
     return _strategy_engine_instance
 
 async def generate_signal(symbol: str, version: Optional[str] = None) -> Optional[TradingSignal]:

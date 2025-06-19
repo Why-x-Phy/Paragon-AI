@@ -573,7 +573,7 @@ class TradingStrategy:
         model: tf.keras.Model, 
         current_data: np.ndarray,
         current_price: float,
-        confidence_threshold: float = 0.7
+        confidence_threshold: float = None
     ) -> Tuple[str, float, float]:
         """
         Decide whether to buy, sell, or hold based on model prediction
@@ -582,13 +582,18 @@ class TradingStrategy:
             model: Trained model
             current_data: Current market data (features)
             current_price: Current token price
-            confidence_threshold: Threshold for model confidence
+            confidence_threshold: Threshold for model confidence (uses config if None)
             
         Returns:
             action: 'buy', 'sell', or 'hold'
             predicted_price: Model's price prediction
             confidence: Confidence score of the prediction
         """
+        # Use configurable confidence threshold
+        if confidence_threshold is None:
+            from ..config.config import config
+            confidence_threshold = config.MIN_PREDICTION_CONFIDENCE
+        
         # Make prediction
         prediction = model.predict(np.expand_dims(current_data, axis=0), verbose=0)
         predicted_price = float(prediction[0])

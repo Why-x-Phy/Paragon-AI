@@ -745,7 +745,7 @@ class ProductionDBManager:
             # Fallback to database
             query = """
                 SELECT close FROM ohlcv 
-                WHERE token_id = $1 AND resolution = '1m'
+                WHERE token_id = $1 AND resolution = '1H'
                 ORDER BY time DESC 
                 LIMIT 1
             """
@@ -771,7 +771,7 @@ class ProductionDBManager:
             pipe = self.redis_client.pipeline()
             
             for data in ohlcv_data:
-                if data.resolution == '1m':  # Only cache minute data
+                if data.resolution == '1H':  # Only cache hourly data (our primary resolution)
                     cache_key = f"prices:{data.token_id}:current"
                     pipe.setex(cache_key, self.cache_ttl['prices'], data.close)
             
@@ -1641,41 +1641,52 @@ class ProductionDBManager:
         except Exception as e:
             self.logger.error(f"Failed to get social data by symbol {symbol}: {e}")
             return []
-    async def health_check(self) -> bool:
-        """Perform a health check on database connections"""
+
+    async def record_health_check(self, component: str, status: str, details: Dict = None):
+        """Record health check with improved concurrency handling"""
         try:
-            # Test PostgreSQL connection
-            async with self.pg_pool.acquire() as conn:
-                result = await conn.fetchval("SELECT 1")
-                assert result == 1
+            # Acquire connection with timeout, then use it in async context manager
+            conn = await asyncio.wait_for(self.pg_pool.acquire(), timeout=5.0)
+            try:
+                await conn.execute("""
+                    INSERT INTO system_health (component, status, details, check_time)
+                    VALUES ($1, $2, $3, NOW())
+                """, component, status, json.dumps(details or {}))
+                
+                self.logger.debug(f"Recorded health check: {component} - {status}")
+            finally:
+                # Always release connection back to pool
+                await self.pg_pool.release(conn)
+                
+        except asyncio.TimeoutError:
+            self.logger.warning(f"Health check recording timed out for {component}")
+        except Exception as e:
+            # Don't raise exceptions from health checks to prevent cascading failures
+            self.logger.warning(f"Failed to record health check for {component}: {e}")
+
+    async def health_check(self) -> bool:
+        """Enhanced health check with connection pool monitoring"""
+        try:
+            # Quick PostgreSQL check with timeout
+            conn = await asyncio.wait_for(self.pg_pool.acquire(), timeout=3.0)
+            try:
+                await conn.fetchval("SELECT 1")
+            finally:
+                await self.pg_pool.release(conn)
             
-            # Test Redis connection
-            await self.redis_client.ping()
+            # Quick Redis check with timeout
+            if self.redis_client:
+                await asyncio.wait_for(self.redis_client.ping(), timeout=3.0)
             
-            self.logger.debug("Database health check passed")
             return True
             
-        except Exception as e:
-            self.logger.error(f"Database health check failed: {e}")
+        except asyncio.TimeoutError:
+            self.logger.error("Health check timed out - connection pool may be exhausted")
             return False
-    
-    async def record_health_check(self, component: str, status: str, details: Dict = None):
-        """Record system health check"""
-        try:
-            query = """
-                INSERT INTO system_health (check_time, component, status, details)
-                VALUES ($1, $2, $3, $4)
-            """
-            
-            details_json = json.dumps(details) if details else None
-            check_time = datetime.utcnow()
-            
-            async with self.pg_pool.acquire() as conn:
-                await conn.execute(query, check_time, component, status, details_json)
-                
         except Exception as e:
-            self.logger.error(f"Failed to record health check: {e}")
-    
+            self.logger.error(f"Health check failed: {e}")
+            return False
+
     async def get_database_stats(self) -> Dict:
         """Get database statistics"""
         try:

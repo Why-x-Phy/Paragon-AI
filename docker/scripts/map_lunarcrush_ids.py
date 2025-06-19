@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 def load_environment():
     """Load environment variables from .env files"""
-    env_files = ['../../.env.dev', '../../.env']
+    env_files = ['../../.env', '../../.env.dev']  # Prioritize .env over .env.dev
     env_vars = {}
     
     for env_file in env_files:

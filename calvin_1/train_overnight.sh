@@ -14,15 +14,15 @@ set -e  # Exit on any error
 
 # Token configurations: "TOKEN_ADDRESS:SYMBOL"
 TOKENS=(
-    "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R:RAY"
-    "85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ:W"
-    "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm:\$WIF"
+    "3iQL8BFS2vE7mww4ehAqQHAsbmRNCrPxizWAT2Zfyr9y:VIRTUAL"
+    "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE:ORCA"
+    "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5:MEW"
 )
 
 # Training parameters
 EPOCHS=175
 DAYS=100
-COOLING_MINUTES=5
+COOLING_MINUTES=2
 
 # =============================================================================
 # HELPER FUNCTIONS

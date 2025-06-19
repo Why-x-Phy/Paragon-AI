@@ -93,14 +93,14 @@ def test_model_registry():
             symbol=test_model.symbol,
             buy_threshold=0.025,  # 2.5%
             sell_threshold=0.035,  # 3.5%
-            confidence_threshold=0.75
+            confidence_threshold=0.10
         )
         
         # Verify updates
         updated_params = get_strategy_params(test_model.symbol)
         if (updated_params['buy_threshold'] == 0.025 and 
             updated_params['sell_threshold'] == 0.035 and
-            updated_params['confidence_threshold'] == 0.75):
+            updated_params['confidence_threshold'] == 0.10):
             logger.info("   ✅ Strategy parameters updated successfully")
         else:
             logger.error("   ❌ Strategy parameter update failed")

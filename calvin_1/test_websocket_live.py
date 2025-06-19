@@ -18,7 +18,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from data.websocket_feed import WebSocketPriceFeed, ConnectionConfig, PriceUpdate, ConnectionState
 
 # Load environment variables
-load_dotenv('../.env.dev')
+load_dotenv('../.env')
 
 # Configure logging
 logging.basicConfig(

@@ -39,7 +39,7 @@ log_error() {
 
 # Environment detection
 detect_environment() {
-    if [[ -f "$PROJECT_ROOT/.env.dev" ]]; then
+    if [[ -f "$PROJECT_ROOT/.env" ]]; then
         ENV="dev"
         COMPOSE_FILE="docker-compose.dev.yml"
         DB_CONTAINER="calvin-timescaledb-dev"
@@ -54,7 +54,7 @@ detect_environment() {
         DB_NAME="calvin_trading"
         DB_USER="calvin_prod"
     else
-        log_error "No environment configuration found (.env.dev or .env.prod)"
+        log_error "No environment configuration found (.env or .env.prod)"
         exit 1
     fi
     

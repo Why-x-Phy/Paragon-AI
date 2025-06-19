@@ -369,11 +369,11 @@ async def fetch_and_store_data(
     }
 
 async def fetch_data_for_all_tokens(
-    resolution: str = "5m",
+    resolution: str = "1H",
     days: int = 90,
     batch_size: int = 2000,
     delay_between_chunks: float = 1.0,
-    delay_between_tokens: float = 10.0,
+    delay_between_tokens: float = 1.0,
     max_workers: int = 5
 ):
     """Fetch historical OHLCV data for all active tokens in the database
@@ -505,7 +505,7 @@ async def main_async():
     parser.add_argument(
         "--resolution", 
         type=str, 
-        default="5m",
+        default="1H",
         choices=["1m", "5m", "15m", "1H", "4H", "1d"],
         help="Time resolution"
     )

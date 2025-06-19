@@ -58,16 +58,16 @@ class AdaptationMethod(Enum):
 class StrategyParameters:
     """Adaptive strategy parameters for a token"""
     symbol: str
-    buy_threshold: float = 2.0     # % predicted increase to trigger buy
-    sell_threshold: float = 3.0    # % predicted decrease to trigger sell
+    buy_threshold: float = 0.02    # FIXED: 2% as decimal fraction (was 2.0)
+    sell_threshold: float = 0.03   # FIXED: 3% as decimal fraction (was 3.0)
     confidence_threshold: float = 0.10  # Minimal threshold - strategy thresholds are primary
     position_size_pct: float = 10.0     # Position size as % of portfolio
     
-    # Adaptation ranges
-    min_buy_threshold: float = 0.5
-    max_buy_threshold: float = 5.0
-    min_sell_threshold: float = 1.0
-    max_sell_threshold: float = 8.0
+    # Adaptation ranges (also convert to decimal fractions)
+    min_buy_threshold: float = 0.005   # FIXED: 0.5% as decimal (was 0.5)
+    max_buy_threshold: float = 0.05    # FIXED: 5% as decimal (was 5.0)
+    min_sell_threshold: float = 0.01   # FIXED: 1% as decimal (was 1.0) 
+    max_sell_threshold: float = 0.08   # FIXED: 8% as decimal (was 8.0)
     min_confidence: float = 0.05  # Very low minimum
     max_confidence: float = 0.20  # Low maximum - strategy thresholds are primary
     
@@ -225,22 +225,27 @@ class AdaptiveStrategyEngine:
                 tracked_tokens = [token.strip() for token in tracked_tokens_str.split(',') if token.strip()]
             
             for symbol in tracked_tokens:
+                # FIXED: Normalize symbol to uppercase for consistent storage
+                normalized_symbol = symbol.upper()
+                
                 # Try to load from Redis
-                cached_params = await self._get_cached_parameters(symbol)
+                cached_params = await self._get_cached_parameters(normalized_symbol)
                 
                 if cached_params:
-                    self.strategy_parameters[symbol] = StrategyParameters(**cached_params)
+                    # FIXED: Ensure cached params use normalized symbol
+                    cached_params['symbol'] = normalized_symbol
+                    self.strategy_parameters[normalized_symbol] = StrategyParameters(**cached_params)
                 else:
-                    # Initialize with defaults
-                    self.strategy_parameters[symbol] = StrategyParameters(symbol=symbol)
-                    await self._cache_parameters(symbol, self.strategy_parameters[symbol])
+                    # Initialize with defaults using normalized symbol
+                    self.strategy_parameters[normalized_symbol] = StrategyParameters(symbol=normalized_symbol)
+                    await self._cache_parameters(normalized_symbol, self.strategy_parameters[normalized_symbol])
                 
-                # Initialize market conditions
-                self.market_conditions[symbol] = MarketConditions()
+                # Initialize market conditions with normalized symbol
+                self.market_conditions[normalized_symbol] = MarketConditions()
                 
-                logger.debug(f"Loaded parameters for {symbol}: "
-                           f"buy={self.strategy_parameters[symbol].buy_threshold:.2f}%, "
-                           f"sell={self.strategy_parameters[symbol].sell_threshold:.2f}%")
+                logger.debug(f"Loaded parameters for {normalized_symbol}: "
+                           f"buy={self.strategy_parameters[normalized_symbol].buy_threshold:.2f}%, "
+                           f"sell={self.strategy_parameters[normalized_symbol].sell_threshold:.2f}%")
             
         except Exception as e:
             logger.error(f"Failed to load strategy parameters: {e}")
@@ -249,7 +254,9 @@ class AdaptiveStrategyEngine:
     async def _get_cached_parameters(self, symbol: str) -> Optional[Dict]:
         """Get cached strategy parameters from Redis"""
         try:
-            key = f"adaptive_strategy_params:{symbol}"
+            # FIXED: Normalize symbol to uppercase for consistent Redis keys
+            normalized_symbol = symbol.upper()
+            key = f"adaptive_strategy_params:{normalized_symbol}"
             cached_data = self.redis_client.get(key)
             
             if cached_data:
@@ -263,14 +270,19 @@ class AdaptiveStrategyEngine:
     async def _cache_parameters(self, symbol: str, params: StrategyParameters):
         """Cache strategy parameters in Redis"""
         try:
-            key = f"adaptive_strategy_params:{symbol}"
+            # FIXED: Normalize symbol to uppercase for consistent Redis keys
+            normalized_symbol = symbol.upper()
+            key = f"adaptive_strategy_params:{normalized_symbol}"
+            
             # Convert datetime to ISO string for JSON serialization
             params_dict = asdict(params)
             params_dict['last_updated'] = params_dict['last_updated'].isoformat()
+            # FIXED: Ensure stored symbol is normalized
+            params_dict['symbol'] = normalized_symbol
             
             self.redis_client.setex(
                 key, 
-                timedelta(hours=24).total_seconds(),  # 24 hour TTL
+                int(timedelta(hours=24).total_seconds()),  # Convert to integer for Redis
                 json.dumps(params_dict)
             )
             
@@ -297,25 +309,69 @@ class AdaptiveStrategyEngine:
     async def analyze_market_conditions(self, symbol: str) -> MarketConditions:
         """Analyze current market conditions for a token"""
         try:
-            # Get recent price data
-            token_info = await self.db_manager.get_token_by_symbol(symbol)
-            if not token_info:
-                logger.warning(f"Token info not found for {symbol}")
-                return self.market_conditions.get(symbol, MarketConditions())
+            # FIXED: Normalize symbol to uppercase for consistent handling
+            normalized_symbol = symbol.upper()
             
+            # Ensure database manager is available
+            if not self.db_manager:
+                await self.initialize()
+            
+            # Get recent price data - FIXED: Ensure proper async handling
+            token_info = None
+            try:
+                token_info = await self.db_manager.get_token_by_symbol(normalized_symbol)
+            except Exception as db_error:
+                logger.warning(f"Database error getting token info for {normalized_symbol}: {db_error}")
+                # Fallback: return cached conditions or default
+                return self.market_conditions.get(normalized_symbol, MarketConditions(
+                    volatility_24h=0.02,  # Default 2% volatility
+                    volatility_7d=0.02,
+                    momentum_24h=0.0,     # Neutral momentum
+                    momentum_7d=0.0,
+                    trend_strength=0.5,   # Moderate trend
+                    regime=MarketRegime.NORMAL_VOLATILITY,
+                    last_updated=datetime.now()
+                ))
+            
+            if not token_info:
+                logger.warning(f"Token info not found for {normalized_symbol}")
+                return self.market_conditions.get(normalized_symbol, MarketConditions(
+                    volatility_24h=0.02,  # Default 2% volatility
+                    volatility_7d=0.02,
+                    momentum_24h=0.0,     # Neutral momentum
+                    momentum_7d=0.0,
+                    trend_strength=0.5,   # Moderate trend
+                    regime=MarketRegime.NORMAL_VOLATILITY,
+                    last_updated=datetime.now()
+                ))
+
             # Get 7 days of hourly data
             end_time = datetime.now()
             start_time = end_time - timedelta(days=7)
             
-            price_data = await self.db_manager.get_ohlcv_data(
-                token_id=token_info['token_id'], 
-                resolution='1h',
-                start_time=start_time, 
-                end_time=end_time
-            )
+            price_data = None
+            try:
+                price_data = await self.db_manager.get_ohlcv_data(
+                    token_id=token_info['token_id'], 
+                    resolution='1H',
+                    start_time=start_time, 
+                    end_time=end_time
+                )
+            except Exception as db_error:
+                logger.warning(f"Database error getting OHLCV data for {normalized_symbol}: {db_error}")
+                # Return cached conditions if database fails
+                return self.market_conditions.get(normalized_symbol, MarketConditions(
+                    volatility_24h=0.02,
+                    volatility_7d=0.02,
+                    momentum_24h=0.0,
+                    momentum_7d=0.0,
+                    trend_strength=0.5,
+                    regime=MarketRegime.NORMAL_VOLATILITY,
+                    last_updated=datetime.now()
+                ))
             
             if not price_data or len(price_data) < 24:
-                logger.warning(f"Insufficient price data for {symbol}: got {len(price_data) if price_data else 0}, need 24+")
+                logger.warning(f"Insufficient price data for {normalized_symbol}: got {len(price_data) if price_data else 0}, need 24+")
                 # Return a default market condition instead of the cached one to prevent test failures
                 return MarketConditions(
                     volatility_24h=0.02,  # Default 2% volatility
@@ -326,11 +382,18 @@ class AdaptiveStrategyEngine:
                     regime=MarketRegime.NORMAL_VOLATILITY,
                     last_updated=datetime.now()
                 )
-            
+
             # Convert to DataFrame for analysis
-            df = pd.DataFrame(price_data)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df = df.sort_values('timestamp')
+            df = pd.DataFrame([{
+                'time': record.time,
+                'open': record.open,
+                'high': record.high,
+                'low': record.low,
+                'close': record.close,
+                'volume': record.volume
+            } for record in price_data])
+            df['time'] = pd.to_datetime(df['time'])
+            df = df.sort_values('time')
             
             # Calculate returns
             df['returns'] = df['close'].pct_change()
@@ -367,16 +430,25 @@ class AdaptiveStrategyEngine:
                 last_updated=datetime.now()
             )
             
-            self.market_conditions[symbol] = conditions
+            self.market_conditions[normalized_symbol] = conditions
             
-            logger.debug(f"Market conditions for {symbol}: regime={regime.value}, "
+            logger.debug(f"Market conditions for {normalized_symbol}: regime={regime.value}, "
                        f"vol_24h={volatility_24h:.3f}, momentum={momentum_24h:.2f}%")
             
             return conditions
             
         except Exception as e:
             logger.error(f"Failed to analyze market conditions for {symbol}: {e}")
-            return self.market_conditions.get(symbol, MarketConditions())
+            # Return cached conditions or safe defaults
+            return self.market_conditions.get(symbol.upper(), MarketConditions(
+                volatility_24h=0.02,
+                volatility_7d=0.02,
+                momentum_24h=0.0,
+                momentum_7d=0.0,
+                trend_strength=0.5,
+                regime=MarketRegime.NORMAL_VOLATILITY,
+                last_updated=datetime.now()
+            ))
     
     def _classify_market_regime(self, volatility: float, momentum: float, trend_strength: float) -> MarketRegime:
         """Classify market regime based on volatility, momentum, and trend"""
@@ -403,20 +475,23 @@ class AdaptiveStrategyEngine:
     async def adapt_strategy_parameters(self, symbol: str) -> bool:
         """Adapt strategy parameters for a token based on market conditions and performance"""
         try:
+            # FIXED: Normalize symbol to uppercase for consistent handling
+            normalized_symbol = symbol.upper()
+            
             # Check if adaptation is due
-            last_adaptation = self.last_adaptation_time.get(symbol, datetime.min)
+            last_adaptation = self.last_adaptation_time.get(normalized_symbol, datetime.min)
             time_since_adaptation = datetime.now() - last_adaptation
             
             if time_since_adaptation.total_seconds() < self.config.adaptation_frequency_minutes * 60:
                 return False  # Not time for adaptation yet
             
             # Check if we have enough signals for meaningful adaptation
-            params = self.strategy_parameters[symbol]
+            params = self.strategy_parameters[normalized_symbol]
             if params.total_signals < self.config.min_signals_for_adaptation:
                 return False
             
             # Analyze current market conditions
-            conditions = await self.analyze_market_conditions(symbol)
+            conditions = await self.analyze_market_conditions(normalized_symbol)
             
             # Store original parameters for comparison
             original_params = StrategyParameters(**asdict(params))
@@ -425,32 +500,32 @@ class AdaptiveStrategyEngine:
             adapted = False
             
             if self.config.adaptation_method in [AdaptationMethod.VOLATILITY_BASED, AdaptationMethod.HYBRID]:
-                adapted |= await self._adapt_for_volatility(symbol, conditions)
+                adapted |= await self._adapt_for_volatility(normalized_symbol, conditions)
             
             if self.config.adaptation_method in [AdaptationMethod.PERFORMANCE_BASED, AdaptationMethod.HYBRID]:
-                adapted |= await self._adapt_for_performance(symbol)
+                adapted |= await self._adapt_for_performance(normalized_symbol)
             
             if self.config.adaptation_method in [AdaptationMethod.MOMENTUM_BASED, AdaptationMethod.HYBRID]:
-                adapted |= await self._adapt_for_momentum(symbol, conditions)
+                adapted |= await self._adapt_for_momentum(normalized_symbol, conditions)
             
             if self.config.adaptation_method in [AdaptationMethod.REGIME_SWITCHING, AdaptationMethod.HYBRID]:
-                adapted |= await self._adapt_for_regime(symbol, conditions)
+                adapted |= await self._adapt_for_regime(normalized_symbol, conditions)
             
             if adapted:
                 # Apply smoothing to prevent oscillation
                 smoothed_params = self._smooth_parameter_changes(original_params, params)
-                self.strategy_parameters[symbol] = smoothed_params
+                self.strategy_parameters[normalized_symbol] = smoothed_params
                 
                 # Cache updated parameters
-                await self._cache_parameters(symbol, smoothed_params)
+                await self._cache_parameters(normalized_symbol, smoothed_params)
                 
                 # Record adaptation
-                await self._record_adaptation(symbol, original_params, smoothed_params, conditions)
+                await self._record_adaptation(normalized_symbol, original_params, smoothed_params, conditions)
                 
-                self.last_adaptation_time[symbol] = datetime.now()
+                self.last_adaptation_time[normalized_symbol] = datetime.now()
                 self.stats['adaptations_made'] += 1
                 
-                logger.info(f"Adapted strategy for {symbol}: "
+                logger.info(f"Adapted strategy for {normalized_symbol}: "
                           f"buy {original_params.buy_threshold:.2f}% → {smoothed_params.buy_threshold:.2f}%, "
                           f"sell {original_params.sell_threshold:.2f}% → {smoothed_params.sell_threshold:.2f}%")
                 
@@ -464,7 +539,9 @@ class AdaptiveStrategyEngine:
     
     async def _adapt_for_volatility(self, symbol: str, conditions: MarketConditions) -> bool:
         """Adapt parameters based on market volatility"""
-        params = self.strategy_parameters[symbol]
+        # Symbol is already normalized by caller, but ensure consistency
+        normalized_symbol = symbol.upper()
+        params = self.strategy_parameters[normalized_symbol]
         original_buy = params.buy_threshold
         original_sell = params.sell_threshold
         
@@ -503,7 +580,9 @@ class AdaptiveStrategyEngine:
     
     async def _adapt_for_performance(self, symbol: str) -> bool:
         """Adapt parameters based on historical performance"""
-        params = self.strategy_parameters[symbol]
+        # Symbol is already normalized by caller, but ensure consistency
+        normalized_symbol = symbol.upper()
+        params = self.strategy_parameters[normalized_symbol]
         
         if params.total_signals < self.config.min_signals_for_adaptation:
             return False
@@ -530,7 +609,9 @@ class AdaptiveStrategyEngine:
     
     async def _adapt_for_momentum(self, symbol: str, conditions: MarketConditions) -> bool:
         """Adapt parameters based on market momentum"""
-        params = self.strategy_parameters[symbol]
+        # Symbol is already normalized by caller, but ensure consistency
+        normalized_symbol = symbol.upper()
+        params = self.strategy_parameters[normalized_symbol]
         original_buy = params.buy_threshold
         original_sell = params.sell_threshold
         
@@ -571,7 +652,9 @@ class AdaptiveStrategyEngine:
     
     async def _adapt_for_regime(self, symbol: str, conditions: MarketConditions) -> bool:
         """Adapt parameters based on market regime"""
-        params = self.strategy_parameters[symbol]
+        # Symbol is already normalized by caller, but ensure consistency
+        normalized_symbol = symbol.upper()
+        params = self.strategy_parameters[normalized_symbol]
         original_buy = params.buy_threshold
         original_sell = params.sell_threshold
         
@@ -639,24 +722,27 @@ class AdaptiveStrategyEngine:
                                 adapted: StrategyParameters, conditions: MarketConditions):
         """Record adaptation for analysis and monitoring"""
         try:
+            # FIXED: Normalize symbol to uppercase for consistent tracking
+            normalized_symbol = symbol.upper()
+            
             adaptation_record = {
                 'timestamp': datetime.now().isoformat(),
-                'symbol': symbol,
+                'symbol': normalized_symbol,
                 'original_params': asdict(original),
                 'adapted_params': asdict(adapted),
                 'market_conditions': asdict(conditions),
                 'adaptation_method': self.config.adaptation_method.value
             }
             
-            self.adaptation_history[symbol].append(adaptation_record)
+            self.adaptation_history[normalized_symbol].append(adaptation_record)
             
             # Cache in Redis for external monitoring
-            key = f"adaptation_history:{symbol}"
-            history = self.adaptation_history[symbol][-100:]  # Keep last 100 adaptations
+            key = f"adaptation_history:{normalized_symbol}"
+            history = self.adaptation_history[normalized_symbol][-100:]  # Keep last 100 adaptations
             
             self.redis_client.setex(
                 key,
-                timedelta(days=30).total_seconds(),
+                int(timedelta(days=30).total_seconds()),  # Convert to integer for Redis
                 json.dumps(history, default=str)  # default=str for datetime serialization
             )
             
@@ -665,14 +751,17 @@ class AdaptiveStrategyEngine:
     
     async def get_adapted_parameters(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get current adapted parameters for a symbol"""
-        if symbol not in self.strategy_parameters:
+        # FIXED: Normalize symbol to uppercase for consistent lookup
+        normalized_symbol = symbol.upper()
+        
+        if normalized_symbol not in self.strategy_parameters:
             return None
         
-        params = self.strategy_parameters[symbol]
-        conditions = self.market_conditions.get(symbol, MarketConditions())
+        params = self.strategy_parameters[normalized_symbol]
+        conditions = self.market_conditions.get(normalized_symbol, MarketConditions())
         
         return {
-            'symbol': symbol,
+            'symbol': normalized_symbol,
             'buy_threshold': params.buy_threshold,
             'sell_threshold': params.sell_threshold,
             'confidence_threshold': params.confidence_threshold,
@@ -685,14 +774,37 @@ class AdaptiveStrategyEngine:
             'last_updated': params.last_updated.isoformat()
         }
     
+    async def _get_current_strategy_params(self, symbol: str) -> Dict[str, float]:
+        """Get current strategy parameters for a symbol (used by test scripts)"""
+        # FIXED: Normalize symbol to uppercase for consistent lookup
+        normalized_symbol = symbol.upper()
+        
+        if normalized_symbol not in self.strategy_parameters:
+            # Return default parameters if symbol not found
+            return {
+                'buy_threshold': 0.02,  # 2%
+                'sell_threshold': 0.03,  # 3%
+                'confidence_threshold': 0.10  # 10%
+            }
+        
+        params = self.strategy_parameters[normalized_symbol]
+        return {
+            'buy_threshold': params.buy_threshold,
+            'sell_threshold': params.sell_threshold,
+            'confidence_threshold': params.confidence_threshold
+        }
+    
     async def update_signal_performance(self, symbol: str, signal: TradingSignal, 
                                        actual_return: float, success: bool):
         """Update performance tracking for a signal"""
         try:
-            if symbol not in self.strategy_parameters:
+            # FIXED: Normalize symbol to uppercase for consistent lookup
+            normalized_symbol = symbol.upper()
+            
+            if normalized_symbol not in self.strategy_parameters:
                 return
             
-            params = self.strategy_parameters[symbol]
+            params = self.strategy_parameters[normalized_symbol]
             
             # Update performance metrics
             params.total_signals += 1
@@ -722,20 +834,98 @@ class AdaptiveStrategyEngine:
                 'confidence': signal.confidence
             }
             
-            self.performance_history[symbol].append(performance_record)
+            self.performance_history[normalized_symbol].append(performance_record)
             
             # Cache updated parameters
-            await self._cache_parameters(symbol, params)
+            await self._cache_parameters(normalized_symbol, params)
             
             self.stats['total_signals_analyzed'] += 1
             
-            logger.debug(f"Updated performance for {symbol}: "
+            logger.debug(f"Updated performance for {normalized_symbol}: "
                        f"signals={params.total_signals}, "
                        f"win_rate={params.win_rate:.3f}, "
                        f"avg_return={params.avg_return:.3f}%")
             
         except Exception as e:
             logger.error(f"Failed to update signal performance for {symbol}: {e}")
+
+    async def update_performance_from_verified_trades(self):
+        """Update signal performance from verified trades in database"""
+        try:
+            if not self.db_manager:
+                return
+            
+            # Query verified trades from the last 24 hours
+            query = """
+                SELECT 
+                    tk.symbol,
+                    t.trade_type,
+                    t.signal_confidence,
+                    t.predicted_change_pct,
+                    t.execution_status,
+                    t.price as entry_price,
+                    t.actual_output_amount,
+                    t.value_usdc,
+                    t.confirmed_at
+                FROM trades t
+                JOIN tokens tk ON t.token_id = tk.token_id
+                WHERE t.execution_status IN ('confirmed', 'failed')
+                  AND t.confirmed_at >= NOW() - INTERVAL '24 hours'
+                  AND t.cycle_timestamp IS NOT NULL
+                  AND t.signal_confidence IS NOT NULL
+                ORDER BY t.confirmed_at DESC
+                LIMIT 100
+            """
+            
+            async with self.db_manager.pg_pool.acquire() as conn:
+                rows = await conn.fetch(query)
+            
+            if not rows:
+                return
+            
+            # Process verified trades and update strategy parameters
+            for row in rows:
+                symbol = row['symbol']
+                trade_successful = row['execution_status'] == 'confirmed'
+                predicted_change = row['predicted_change_pct'] or 0.0
+                
+                # Calculate actual return based on trade execution results
+                if trade_successful and row['actual_output_amount'] and row['value_usdc']:
+                    # For buy trades, calculate return based on tokens received vs USDC spent
+                    if row['trade_type'] == 'buy':
+                        # We spent value_usdc and got actual_output_amount tokens
+                        # Return is based on whether we got more/less tokens than expected
+                        expected_tokens = row['value_usdc'] / row['entry_price'] if row['entry_price'] > 0 else 0
+                        if expected_tokens > 0:
+                            actual_return = ((float(row['actual_output_amount']) - expected_tokens) / expected_tokens) * 100
+                        else:
+                            actual_return = 0.0
+                    else:
+                        # For sell trades, return is based on USDC received vs tokens sold
+                        actual_return = predicted_change  # Use predicted as proxy for now
+                else:
+                    # Trade failed or insufficient data
+                    actual_return = -abs(predicted_change) if predicted_change != 0 else -2.0
+                
+                # Create a mock signal for the update (we only need basic info)
+                from ..inference.strategy_engine import TradingSignal, SignalType, SignalStrength
+                mock_signal = TradingSignal(
+                    symbol=symbol,
+                    signal_type=SignalType.BUY if row['trade_type'] == 'buy' else SignalType.SELL,
+                    confidence=row['signal_confidence'] / 100.0,  # Convert from 0-100 to 0-1
+                    predicted_change_pct=predicted_change,
+                    strength=SignalStrength.MODERATE,
+                    timestamp=row['confirmed_at'],
+                    model_version="verified_trade"
+                )
+                
+                # Update signal performance
+                await self.update_signal_performance(symbol, mock_signal, actual_return, trade_successful)
+            
+            logger.info(f"🔄 Updated adaptive strategy performance from {len(rows)} verified trades")
+            
+        except Exception as e:
+            logger.error(f"Failed to update performance from verified trades: {e}")
     
     async def get_adaptation_stats(self) -> Dict[str, Any]:
         """Get adaptation statistics and performance metrics"""
@@ -788,6 +978,9 @@ class AdaptiveStrategyEngine:
         async def adaptation_task():
             while self.is_running:
                 try:
+                    # Update performance from verified trades first
+                    await self.update_performance_from_verified_trades()
+                    
                     # Adapt parameters for all tokens
                     for symbol in self.strategy_parameters.keys():
                         await self.adapt_strategy_parameters(symbol)

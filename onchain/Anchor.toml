@@ -5,13 +5,13 @@ package_manager = "yarn"
 resolution = true
 skip-lint = false
 
-[programs.localnet]
-calvin_staking = "GocZdo1RPcsQnbiQrFp6Ybgd3bWUp48Jd4wytN3QN3Vw"
-calvin_vault = "2nLsDVW67Qw5LXGvaTzUQ7xRxytY52APWJAz2c7aqqyJ"
-
 [programs.devnet]
-calvin_staking = "GocZdo1RPcsQnbiQrFp6Ybgd3bWUp48Jd4wytN3QN3Vw"
-calvin_vault = "2nLsDVW67Qw5LXGvaTzUQ7xRxytY52APWJAz2c7aqqyJ"
+calvin_staking = "FH8te8ebpGLRUc32pZHj4q6DUwzt3KykQYZyA4NQPsod"
+calvin_vault = "Evdjoh1AHQb6Ls1n7Td7buAiDA5ty7Ec8NCYt8eWEXFp"
+
+[programs.localnet]
+calvin_staking = "BMeQT4VD9X4RFYT8MAmofKJk14dFyFrBWqJJzTeNgGtW"
+calvin_vault = "7rky4NGhHtUREVJLKnAKwapDBmzCMbEno6VDcFZXyWxA"
 
 [registry]
 url = "https://api.apr.dev"
@@ -21,11 +21,4 @@ cluster = "https://devnet.helius-rpc.com/?api-key=acfda155-4d7f-4930-8ac4-ddd9ee
 wallet = "./devnet-test.json"
 
 [scripts]
-test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
-
-# Calvin AI Configuration
-[env]
-# Calvin AI Trading Authority (generated)
-CALVIN_AI_AUTHORITY = "AfN21qjyWjn8NtNoXMWKmxRwKnyfsaRJRK8KQz7p1Q1g"
-# Emergency Owner (your wallet)
-EMERGENCY_OWNER = "5TxXR173F6VzPSuuyKd57U3ff6dRL5JK7TL6ZPgSjE5D"
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/trade_instruction_test.ts"

@@ -286,6 +286,13 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         return Err(e.into());
     }
     
+    // 🎯 UPDATE HWM IF DEPOSIT PUSHES NAV ABOVE HWM
+    // Deposits shouldn't trigger performance fees, so adjust HWM upward
+    let new_nav_after_deposit = vault_nav.saturating_add(amount_after_fee);
+    if new_nav_after_deposit > vault.high_water_mark_nav {
+        vault.high_water_mark_nav = new_nav_after_deposit;
+    }
+    
     // Update vault state
     vault.total_shares = vault.total_shares
         .checked_add(shares_to_mint)

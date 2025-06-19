@@ -55,7 +55,7 @@ class Config:
         
         # ML model settings
         self.model_type = os.getenv("MODEL_TYPE", "lstm")
-        self.prediction_horizon = int(os.getenv("PREDICTION_HORIZON", 24))
+        self.prediction_horizon = int(os.getenv("PREDICTION_HORIZON", 1))
         self.training_interval_hours = int(os.getenv("TRAINING_INTERVAL_HOURS", 24))
         self.retraining_threshold = float(os.getenv("RETRAINING_THRESHOLD", 0.05))
         
@@ -68,6 +68,9 @@ class Config:
         self.REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
         self.REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
         self.REDIS_DB = int(os.getenv("REDIS_DB", 0))
+        
+        # Trading Strategy Configuration
+        self.MIN_PREDICTION_CONFIDENCE = float(os.getenv("MIN_PREDICTION_CONFIDENCE", 0.10))  # 10% minimal threshold
         
         # Logging
         self.log_level = os.getenv("LOG_LEVEL", "INFO")

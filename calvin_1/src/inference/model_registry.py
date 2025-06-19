@@ -74,7 +74,7 @@ class ModelMetadata:
     # Strategy parameters
     buy_threshold: float = 0.02  # Default 2%
     sell_threshold: float = 0.03  # Default 3%
-    confidence_threshold: float = 0.10  # Minimal threshold
+    confidence_threshold: float = 0.10  # Will be overridden by global config in practice
     
     # Model hash for integrity checking
     model_hash: Optional[str] = None
@@ -108,8 +108,11 @@ class LSTMModelRegistry:
         
         # Redis integration for caching
         self.redis_client = redis_client
+        self.redis_binary_client = None  # Separate client for binary data
+        
         if self.redis_client is None:
             try:
+                # Text client for JSON metadata (with decode_responses=True)
                 self.redis_client = redis.Redis(
                     host=config.REDIS_HOST or 'localhost',
                     port=config.REDIS_PORT or 6379,
@@ -117,12 +120,24 @@ class LSTMModelRegistry:
                     db=config.REDIS_DB or 0,
                     decode_responses=True
                 )
-                # Test connection
+                
+                # Binary client for model weights (with decode_responses=False)
+                self.redis_binary_client = redis.Redis(
+                    host=config.REDIS_HOST or 'localhost',
+                    port=config.REDIS_PORT or 6379,
+                    password=config.REDIS_PASSWORD,
+                    db=config.REDIS_DB or 0,
+                    decode_responses=False  # Keep binary data as bytes
+                )
+                
+                # Test connections
                 self.redis_client.ping()
-                logger.info("Connected to Redis for model caching")
+                self.redis_binary_client.ping()
+                logger.info("Connected to Redis for model caching (text + binary clients)")
             except Exception as e:
                 logger.warning(f"Redis connection failed, continuing without caching: {e}")
                 self.redis_client = None
+                self.redis_binary_client = None
         
         # In-memory model cache for hot swapping
         self._model_cache: Dict[str, tf.keras.Model] = {}
@@ -144,20 +159,98 @@ class LSTMModelRegistry:
         logger.info(f"Redis caching: {'enabled' if self.redis_client else 'disabled'}")
 
     def _initialize_registry(self):
-        """Initialize the registry by scanning existing models"""
+        """Initialize the registry by scanning existing models and only loading the latest version per symbol"""
         logger.info("Initializing model registry...")
         
         # Scan for existing .h5 files
         h5_files = list(self.models_dir.glob("*.h5"))
         logger.info(f"Found {len(h5_files)} .h5 model files")
         
+        if not h5_files:
+            logger.warning("No model files found to register")
+            return
+        
+        # 🆕 OPTIMIZATION: Parse all filenames first without loading models
+        parsed_models = {}  # symbol -> List[(file_path, parsed_data)]
+        
         for model_file in h5_files:
+            try:
+                filename = model_file.stem
+                parsed = self._parse_model_filename(filename)
+                
+                if not parsed:
+                    logger.warning(f"Could not parse model filename: {filename}")
+                    continue
+                
+                symbol = parsed['symbol']
+                if symbol not in parsed_models:
+                    parsed_models[symbol] = []
+                
+                parsed_models[symbol].append((model_file, parsed))
+                
+            except Exception as e:
+                logger.error(f"Failed to parse model filename {model_file}: {e}")
+        
+        # 🆕 OPTIMIZATION: For each symbol, find and register only the latest version
+        total_models_available = sum(len(models) for models in parsed_models.values())
+        models_to_register = []
+        
+        for symbol, symbol_models in parsed_models.items():
+            if not symbol_models:
+                continue
+            
+            # Sort models using the same priority logic as _find_model_key
+            def sort_key(item):
+                model_file, parsed = item
+                # Priority: new format first, then date (newest first), then semantic version
+                is_new = not parsed['is_legacy']
+                date_version = parsed['date_version']
+                semantic_parts = [0, 0, 0]  # Default for legacy
+                
+                if parsed['semantic_version']:
+                    try:
+                        # Parse semantic version (e.g., "v1.0.2" -> [1, 0, 2])
+                        version_str = parsed['semantic_version'][1:]  # Remove 'v'
+                        semantic_parts = [int(x) for x in version_str.split('.')]
+                    except (ValueError, IndexError):
+                        pass
+                
+                return (is_new, date_version, semantic_parts)
+            
+            # Get the latest model for this symbol
+            latest_model = max(symbol_models, key=sort_key)
+            models_to_register.append(latest_model)
+            
+            # Log what we're skipping for transparency
+            if len(symbol_models) > 1:
+                latest_file, latest_parsed = latest_model
+                skipped_count = len(symbol_models) - 1
+                logger.debug(f"📊 {symbol}: Selected latest model {latest_parsed['filename']}, skipping {skipped_count} older versions")
+        
+        # 🆕 REGISTER ONLY THE LATEST MODELS
+        logger.info(f"🎯 Optimization: Registering {len(models_to_register)} latest models (skipping {total_models_available - len(models_to_register)} older versions)")
+        
+        for model_file, parsed_data in models_to_register:
             try:
                 self._register_existing_model(model_file)
             except Exception as e:
-                logger.error(f"Failed to register model {model_file}: {e}")
+                logger.error(f"Failed to register latest model {model_file}: {e}")
         
-        logger.info(f"Registry initialization complete. {len(self._metadata_cache)} models registered.")
+        # 🎯 PERFORMANCE SUMMARY
+        symbols_loaded = len(models_to_register)
+        models_skipped = total_models_available - len(models_to_register)
+        efficiency_pct = (models_skipped / total_models_available * 100) if total_models_available > 0 else 0
+        
+        logger.info(f"✅ Registry initialization complete: {len(self._metadata_cache)} latest models registered")
+        logger.info(f"📈 Performance: {symbols_loaded} symbols loaded, {models_skipped} older models skipped ({efficiency_pct:.1f}% reduction)")
+        
+        # Log which symbols we have models for
+        symbols = list(set(parsed['symbol'] for _, parsed in models_to_register))
+        symbols.sort()
+        if len(symbols) <= 10:
+            logger.info(f"🎯 Available symbols: {', '.join(symbols)}")
+        else:
+            logger.info(f"🎯 Available symbols: {', '.join(symbols[:10])}... (and {len(symbols)-10} more)")
 
     def register_new_model(self, model_path: str, symbol: str, semantic_version: str, 
                           model_type: str = "lstm", **kwargs) -> bool:
@@ -539,7 +632,7 @@ class LSTMModelRegistry:
 
     def _cache_model_in_redis(self, model_key: str, model: tf.keras.Model):
         """Cache model in Redis for persistence across restarts"""
-        if not self.redis_client:
+        if not self.redis_binary_client:
             return
         
         try:
@@ -549,7 +642,8 @@ class LSTMModelRegistry:
             serialized_weights = pickle.dumps(weights_data)
             
             redis_key = f"model_weights:{model_key}"
-            self.redis_client.setex(redis_key, self.cache_ttl, serialized_weights)
+            # Use binary client to avoid UTF-8 decoding issues
+            self.redis_binary_client.setex(redis_key, self.cache_ttl, serialized_weights)
             
             logger.debug(f"Cached model weights in Redis: {model_key}")
         except Exception as e:
@@ -557,12 +651,13 @@ class LSTMModelRegistry:
 
     def _load_model_from_redis(self, model_key: str) -> Optional[tf.keras.Model]:
         """Load model from Redis cache"""
-        if not self.redis_client:
+        if not self.redis_binary_client:
             return None
         
         try:
             redis_key = f"model_weights:{model_key}"
-            serialized_weights = self.redis_client.get(redis_key)
+            # Use binary client to get raw bytes without UTF-8 decoding
+            serialized_weights = self.redis_binary_client.get(redis_key)
             
             if serialized_weights:
                 # Load model architecture from disk first
@@ -629,27 +724,79 @@ class LSTMModelRegistry:
     def get_strategy_parameters(self, symbol: str, version: Optional[str] = None) -> Dict[str, float]:
         """Get simple strategy parameters for a model"""
         metadata = self.get_model_metadata(symbol, version)
+        
+        # Always use global config for confidence threshold (ignore metadata)
+        from ..config.config import config
+        
         if not metadata:
             return {
                 'buy_threshold': 0.02,
                 'sell_threshold': 0.03,
-                'confidence_threshold': 0.70
+                'confidence_threshold': config.MIN_PREDICTION_CONFIDENCE  # Always use global config
             }
         
         return {
             'buy_threshold': metadata.buy_threshold,
             'sell_threshold': metadata.sell_threshold,
-            'confidence_threshold': metadata.confidence_threshold
+            'confidence_threshold': config.MIN_PREDICTION_CONFIDENCE  # ALWAYS use global config (ignore metadata)
         }
 
+    async def get_adaptive_strategy_parameters(self, symbol: str, version: Optional[str] = None) -> Dict[str, float]:
+        """
+        Get strategy parameters with adaptive engine integration
+        
+        This method first checks the adaptive strategy engine for dynamically adjusted parameters,
+        then falls back to static model metadata or global config defaults.
+        """
+        try:
+            # Try to get adaptive parameters from the adaptive strategy engine
+            try:
+                from . import adaptive_strategy
+                adaptive_engine = adaptive_strategy._adaptive_engine_instance
+                
+                if adaptive_engine and symbol in adaptive_engine.strategy_parameters:
+                    # Get adapted parameters with _adaptive flag
+                    adapted_params = await adaptive_engine.get_adapted_parameters(symbol)
+                    if adapted_params:
+                        return {
+                            'buy_threshold': adapted_params['buy_threshold'],
+                            'sell_threshold': adapted_params['sell_threshold'],
+                            'confidence_threshold': adapted_params['confidence_threshold'],
+                            '_adaptive': True  # Flag to indicate these are adaptive parameters
+                        }
+            except (ImportError, AttributeError) as e:
+                # Adaptive engine not available or not initialized
+                logger.debug(f"Adaptive strategy engine not available: {e}")
+            
+            # Fall back to static parameters
+            static_params = self.get_strategy_parameters(symbol, version)
+            static_params['_adaptive'] = False  # Flag to indicate these are static parameters
+            return static_params
+            
+        except Exception as e:
+            logger.error(f"Failed to get adaptive strategy parameters for {symbol}: {e}")
+            # Emergency fallback to global config
+            from ..config.config import config
+            return {
+                'buy_threshold': 0.02,
+                'sell_threshold': 0.03,
+                'confidence_threshold': config.MIN_PREDICTION_CONFIDENCE,  # Uses 0.10
+                '_adaptive': False
+            }
+
     def update_strategy_parameters(self, symbol: str, buy_threshold: float, 
-                                 sell_threshold: float, confidence_threshold: float = 0.10,
+                                 sell_threshold: float, confidence_threshold: Optional[float] = None,
                                  version: Optional[str] = None):
         """Update simple strategy parameters for a model"""
         model_key = self._find_model_key(symbol, version)
         if not model_key or model_key not in self._metadata_cache:
             logger.error(f"Model not found: {symbol}, version: {version}")
             return
+        
+        # Use global config if confidence_threshold not provided
+        if confidence_threshold is None:
+            from ..config.config import config
+            confidence_threshold = config.MIN_PREDICTION_CONFIDENCE
         
         metadata = self._metadata_cache[model_key]
         metadata.buy_threshold = buy_threshold

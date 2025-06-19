@@ -1,44 +1,10 @@
-// Mock data - will be replaced with smart contract calls
-export const MOCK_DATA = {
-  vaultBalance: {
-    title: "Vault's Balance",
-    balances: [
-      { label: '$CALVIN Staked', amount: '1,000,000,000.000' },
-      { label: '$USDC Locked', amount: '1,000,000.000' }
-    ]
-  },
-  userBalance: {
-    title: 'Your Balance',
-    balances: [
-      { label: '$CALVIN Staked', amount: '10,000.000' },
-      { label: '$USDC Locked', amount: '10.000' }
-    ]
-  },
-  vaultProfit: {
-    title: 'Vault Pnl (Monthly)',
-    profit: {
-        label: '$USDC:',
-        value: 2456000,
-        percentage: 40
-    }
-  },
-  userProfit: {
-    title: 'Your Pnl (Monthly)',
-    profit: {
-        label: '$USDC:',
-        value: 2654,
-        percentage: 40
-    }
-  }
-};
-
 // Smart Contract Configuration - Using environment variables for deployed programs
 export const CONTRACTS = {
-  // Calvin Staking Program (deployed)
-  CALVIN_STAKING_PROGRAM: process.env.NEXT_PUBLIC_CALVIN_STAKING_PROGRAM || 'GocZdo1RPcsQnbiQrFp6Ybgd3bWUp48Jd4wytN3QN3Vw',
+  // Calvin Staking Program (deployed) - FRESH DEVNET DEPLOYMENT
+  CALVIN_STAKING_PROGRAM: process.env.NEXT_PUBLIC_CALVIN_STAKING_PROGRAM || 'FH8te8ebpGLRUc32pZHj4q6DUwzt3KykQYZyA4NQPsod',
   
-  // Calvin Vault Program (deployed)
-  CALVIN_VAULT_PROGRAM: process.env.NEXT_PUBLIC_CALVIN_VAULT_PROGRAM || '2nLsDVW67Qw5LXGvaTzUQ7xRxytY52APWJAz2c7aqqyJ',
+  // Calvin Vault Program (deployed) - FRESH DEVNET DEPLOYMENT
+  CALVIN_VAULT_PROGRAM: process.env.NEXT_PUBLIC_CALVIN_VAULT_PROGRAM || 'Evdjoh1AHQb6Ls1n7Td7buAiDA5ty7Ec8NCYt8eWEXFp',
   
   // Token Addresses
   CALVIN_TOKEN: process.env.NEXT_PUBLIC_CALVIN_TOKEN || 'CrWbUJ4kMgduYDVRK8bDXhNBHr8cScixi79nGdGejnb1',

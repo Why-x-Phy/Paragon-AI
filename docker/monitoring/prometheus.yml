@@ -1,42 +1,59 @@
+# Prometheus Configuration for Calvin AI Production Monitoring
+
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
+  external_labels:
+    cluster: 'calvin-ai-prod'
+    environment: 'production'
 
 rule_files:
-  # - "first_rules.yml"
-  # - "second_rules.yml"
+  # - "alerts.yml"  # Add alert rules here
 
 scrape_configs:
-  # The job name is added as a label `job=<job_name>` to any timeseries scraped from this config.
+  # Prometheus self-monitoring
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
+    scrape_interval: 30s
 
-  # TimescaleDB monitoring (if postgres_exporter is added)
+  # TimescaleDB monitoring (requires postgres_exporter sidecar)
   - job_name: 'calvin-timescaledb'
     static_configs:
-      - targets: ['timescaledb-primary:5432']
+      - targets: ['timescaledb:9187']  # postgres_exporter port
     metrics_path: /metrics
     scrape_interval: 30s
+    scrape_timeout: 10s
 
-  # Redis monitoring (if redis_exporter is added)  
+  # Redis monitoring (requires redis_exporter sidecar)  
   - job_name: 'calvin-redis'
     static_configs:
-      - targets: ['redis-master:6379']
+      - targets: ['redis:9121']  # redis_exporter port
     metrics_path: /metrics
     scrape_interval: 30s
+    scrape_timeout: 10s
 
-  # Application metrics (when Calvin AI adds metrics endpoint)
+  # Calvin AI Application metrics (when implemented)
   - job_name: 'calvin-app'
     static_configs:
-      - targets: ['host.docker.internal:8000']  # Adjust port as needed
+      - targets: ['host.docker.internal:8080']  # Calvin AI metrics endpoint
     metrics_path: /metrics
     scrape_interval: 10s
     scrape_timeout: 5s
+    honor_labels: true
 
   # Docker container metrics (if cAdvisor is added)
   - job_name: 'cadvisor'
     static_configs:
       - targets: ['cadvisor:8080']
     metrics_path: /metrics
-    scrape_interval: 30s 
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  # Node/System metrics (if node_exporter is added)
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    metrics_path: /metrics
+    scrape_interval: 30s
+    scrape_timeout: 10s 

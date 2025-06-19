@@ -99,11 +99,13 @@ class PositionManager:
         self, 
         db_manager: Optional[ProductionDBManager] = None,
         realtime_storage: Optional[RealtimeDataStorage] = None,
-        risk_limits: Optional[RiskLimits] = None
+        risk_limits: Optional[RiskLimits] = None,
+        backtest_mode: bool = False
     ):
         self.db_manager = db_manager  # Will be set during initialization
         self.realtime_storage = realtime_storage  # Will be set during initialization
         self.logger = logging.getLogger(__name__)
+        self.backtest_mode = backtest_mode
         
         # Load configuration from environment
         self.config = config
@@ -222,6 +224,26 @@ class PositionManager:
         """Stop the position manager"""
         self.is_running = False
         self.logger.info("Position manager stopped")
+    
+    async def close(self):
+        """Close the position manager and clean up resources"""
+        try:
+            # Stop monitoring if running
+            if self.is_running:
+                await self.stop()
+            
+            # Clear callbacks
+            self.alert_callbacks.clear()
+            
+            # Clear position tracking
+            self.active_positions.clear()
+            self.position_by_token.clear()
+            self.alerts.clear()
+            
+            self.logger.info("Position manager closed and resources cleaned up")
+            
+        except Exception as e:
+            self.logger.error(f"Error closing position manager: {e}")
     
     # =========================================================================
     # POSITION LIFECYCLE MANAGEMENT
@@ -480,16 +502,19 @@ class PositionManager:
         if self.daily_pnl < -self.risk_limits.max_daily_loss_usdc:
             raise ValueError(f"Daily loss limit reached: ${self.daily_pnl:.2f}")
         
+        # Get portfolio value using async method for better performance
+        portfolio_value = await self.get_portfolio_value_async()
+        
         # Check token exposure
         token_exposure = await self._calculate_token_exposure(token_id)
-        max_token_exposure = self.risk_limits.max_single_token_exposure_pct / 100 * self._get_portfolio_value()
+        max_token_exposure = self.risk_limits.max_single_token_exposure_pct / 100 * portfolio_value
         
         if token_exposure + position_value > max_token_exposure:
             raise ValueError(f"Token exposure would exceed limit: ${token_exposure + position_value:.2f} > ${max_token_exposure:.2f}")
         
         # Check portfolio exposure
         portfolio_exposure = await self._calculate_portfolio_exposure()
-        max_portfolio_exposure = self.risk_limits.max_portfolio_exposure_pct / 100 * self._get_portfolio_value()
+        max_portfolio_exposure = self.risk_limits.max_portfolio_exposure_pct / 100 * portfolio_value
         
         if portfolio_exposure + position_value > max_portfolio_exposure:
             raise ValueError(f"Portfolio exposure would exceed limit: ${portfolio_exposure + position_value:.2f} > ${max_portfolio_exposure:.2f}")
@@ -520,15 +545,165 @@ class PositionManager:
     
     def _get_portfolio_value(self) -> float:
         """Get total portfolio value from vault smart contract"""
-        # TODO: Integrate with vault smart contract when Phase 3 is implemented
+        # In backtest mode, return a fixed portfolio value
+        if self.backtest_mode:
+            return float(getattr(self.config, 'PORTFOLIO_VALUE_USDC', 100000.0))
+        
+        # Real implementation: Query Calvin Vault Program for current portfolio value
         # 
-        # Real implementation should:
-        # 1. Query Calvin Vault Program for current total_usdc
-        # 2. Add unrealized P&L from external positions  
-        # 3. Add any pending settlement amounts
-        # 
-        # For now, use environment variable as fallback for development
-        return float(getattr(self.config, 'PORTFOLIO_VALUE_USDC', 100000.0))
+        # This integrates with the vault smart contract to get:
+        # 1. Current total_usdc from vault program
+        # 2. Unrealized P&L from external positions  
+        # 3. Any pending settlement amounts
+        
+        try:
+            # Import vault client here to avoid circular imports
+            from ..vault.vault_client import VaultClient
+            
+            # Create vault client instance
+            vault_client = VaultClient()
+            
+            # Get vault state asynchronously
+            # Note: This is a sync method calling async, so we need to handle it carefully
+            import asyncio
+            
+            try:
+                # Try to get the current event loop
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If we're already in an async context, we can't use run_until_complete
+                    # Fall back to environment variable for now and log a warning
+                    self.logger.warning("Cannot query vault state from sync context - using fallback value")
+                    return float(getattr(self.config, 'PORTFOLIO_VALUE_USDC', 100000.0))
+                else:
+                    # We can safely run the async operation
+                    vault_state = loop.run_until_complete(vault_client.get_vault_state())
+            except RuntimeError:
+                # No event loop running, create a new one
+                vault_state = asyncio.run(vault_client.get_vault_state())
+            
+            # Extract total USDC value from vault state
+            vault_total_usdc = vault_state.get('total_usdc', 0.0)
+            
+            # Add unrealized P&L from external positions (if any)
+            # This would include positions not managed by the vault
+            external_pnl = 0.0
+            for position in self.active_positions.values():
+                if hasattr(position, 'unrealized_pnl_usdc') and position.unrealized_pnl_usdc:
+                    external_pnl += position.unrealized_pnl_usdc
+            
+            total_portfolio_value = vault_total_usdc + external_pnl
+            
+            self.logger.debug(f"Portfolio value: Vault=${vault_total_usdc:,.2f}, External P&L=${external_pnl:,.2f}, Total=${total_portfolio_value:,.2f}")
+            
+            # Ensure we return a reasonable value (minimum $1000 for safety)
+            if total_portfolio_value < 1000.0:
+                self.logger.warning(f"Portfolio value unusually low: ${total_portfolio_value:,.2f} - using minimum $1000")
+                return 1000.0
+            
+            return total_portfolio_value
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get portfolio value from vault: {e}")
+            # Fall back to last known portfolio value from database
+            try:
+                if self.db_manager:
+                    # Get the most recent portfolio cycle data
+                    import asyncio
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            # Can't run async in sync context, use environment fallback
+                            self.logger.warning("Cannot query database from sync context - using environment fallback")
+                            fallback_value = float(getattr(self.config, 'PORTFOLIO_VALUE_USDC', 100000.0))
+                        else:
+                            latest_cycle = loop.run_until_complete(self.db_manager.get_latest_portfolio_cycle())
+                            if latest_cycle and latest_cycle.get('total_portfolio_value_usdc'):
+                                fallback_value = float(latest_cycle['total_portfolio_value_usdc'])
+                                self.logger.info(f"Using last known portfolio value from database: ${fallback_value:,.2f}")
+                            else:
+                                fallback_value = float(getattr(self.config, 'PORTFOLIO_VALUE_USDC', 100000.0))
+                                self.logger.warning("No portfolio history in database - using environment fallback")
+                    except RuntimeError:
+                        # No event loop, create one
+                        latest_cycle = asyncio.run(self.db_manager.get_latest_portfolio_cycle())
+                        if latest_cycle and latest_cycle.get('total_portfolio_value_usdc'):
+                            fallback_value = float(latest_cycle['total_portfolio_value_usdc'])
+                            self.logger.info(f"Using last known portfolio value from database: ${fallback_value:,.2f}")
+                        else:
+                            fallback_value = float(getattr(self.config, 'PORTFOLIO_VALUE_USDC', 100000.0))
+                            self.logger.warning("No portfolio history in database - using environment fallback")
+                else:
+                    fallback_value = float(getattr(self.config, 'PORTFOLIO_VALUE_USDC', 100000.0))
+                    self.logger.warning("No database manager available - using environment fallback")
+            except Exception as db_error:
+                self.logger.error(f"Failed to get portfolio value from database: {db_error}")
+                fallback_value = float(getattr(self.config, 'PORTFOLIO_VALUE_USDC', 100000.0))
+                self.logger.warning("Database fallback failed - using environment fallback")
+            
+            self.logger.warning(f"Using fallback portfolio value: ${fallback_value:,.2f}")
+            return fallback_value
+    
+    async def get_portfolio_value_async(self) -> float:
+        """Get total portfolio value from vault smart contract (async version)"""
+        try:
+            # Import vault client here to avoid circular imports
+            from ..vault.vault_client import VaultClient
+            
+            # Create and initialize vault client
+            vault_client = VaultClient()
+            await vault_client.initialize()
+            
+            # Get vault state
+            vault_state = await vault_client.get_vault_state()
+            
+            # Extract total USDC value from vault state
+            vault_total_usdc = vault_state.get('total_usdc', 0.0)
+            
+            # Add unrealized P&L from external positions (if any)
+            # This would include positions not managed by the vault
+            external_pnl = 0.0
+            for position in self.active_positions.values():
+                if hasattr(position, 'unrealized_pnl_usdc') and position.unrealized_pnl_usdc:
+                    external_pnl += position.unrealized_pnl_usdc
+            
+            total_portfolio_value = vault_total_usdc + external_pnl
+            
+            self.logger.debug(f"Portfolio value (async): Vault=${vault_total_usdc:,.2f}, External P&L=${external_pnl:,.2f}, Total=${total_portfolio_value:,.2f}")
+            
+            # Ensure we return a reasonable value (minimum $1000 for safety)
+            if total_portfolio_value < 1000.0:
+                self.logger.warning(f"Portfolio value unusually low: ${total_portfolio_value:,.2f} - using minimum $1000")
+                return 1000.0
+            
+            # Close vault client connection
+            await vault_client.close()
+            
+            return total_portfolio_value
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get portfolio value from vault (async): {e}")
+            # Fall back to last known portfolio value from database
+            try:
+                if self.db_manager:
+                    # Get the most recent portfolio cycle data (async version)
+                    latest_cycle = await self.db_manager.get_latest_portfolio_cycle()
+                    if latest_cycle and latest_cycle.get('total_portfolio_value_usdc'):
+                        fallback_value = float(latest_cycle['total_portfolio_value_usdc'])
+                        self.logger.info(f"Using last known portfolio value from database: ${fallback_value:,.2f}")
+                    else:
+                        fallback_value = float(getattr(self.config, 'PORTFOLIO_VALUE_USDC', 100000.0))
+                        self.logger.warning("No portfolio history in database - using environment fallback")
+                else:
+                    fallback_value = float(getattr(self.config, 'PORTFOLIO_VALUE_USDC', 100000.0))
+                    self.logger.warning("No database manager available - using environment fallback")
+            except Exception as db_error:
+                self.logger.error(f"Failed to get portfolio value from database: {db_error}")
+                fallback_value = float(getattr(self.config, 'PORTFOLIO_VALUE_USDC', 100000.0))
+                self.logger.warning("Database fallback failed - using environment fallback")
+            
+            self.logger.warning(f"Using fallback portfolio value: ${fallback_value:,.2f}")
+            return fallback_value
     
     # =========================================================================
     # P&L CALCULATION
@@ -631,9 +806,9 @@ class PositionManager:
                 )
                 await self._emit_alert(alert)
             
-            # Check portfolio exposure
+            # Check portfolio exposure using async method for better performance
             portfolio_exposure = await self._calculate_portfolio_exposure()
-            portfolio_value = self._get_portfolio_value()
+            portfolio_value = await self.get_portfolio_value_async()
             exposure_pct = (portfolio_exposure / portfolio_value) * 100
             
             if exposure_pct > self.risk_limits.max_portfolio_exposure_pct:
@@ -776,13 +951,14 @@ _position_manager_instance: Optional[PositionManager] = None
 async def get_position_manager(
     db_manager: Optional[ProductionDBManager] = None,
     realtime_storage: Optional[RealtimeDataStorage] = None,
-    risk_limits: Optional[RiskLimits] = None
+    risk_limits: Optional[RiskLimits] = None,
+    backtest_mode: bool = False
 ) -> PositionManager:
     """Get singleton position manager instance"""
     global _position_manager_instance
     
     if _position_manager_instance is None:
-        _position_manager_instance = PositionManager(db_manager, realtime_storage, risk_limits)
+        _position_manager_instance = PositionManager(db_manager, realtime_storage, risk_limits, backtest_mode)
         await _position_manager_instance.initialize()
     
     return _position_manager_instance

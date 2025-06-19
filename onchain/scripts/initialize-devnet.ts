@@ -33,8 +33,8 @@ async function initializePrograms() {
   anchor.setProvider(provider);
 
   // Program IDs from your deployed contracts
-  const STAKING_PROGRAM_ID = new PublicKey("GocZdo1RPcsQnbiQrFp6Ybgd3bWUp48Jd4wytN3QN3Vw");
-const VAULT_PROGRAM_ID = new PublicKey("2nLsDVW67Qw5LXGvaTzUQ7xRxytY52APWJAz2c7aqqyJ");
+  const STAKING_PROGRAM_ID = new PublicKey("FH8te8ebpGLRUc32pZHj4q6DUwzt3KykQYZyA4NQPsod");
+  const VAULT_PROGRAM_ID = new PublicKey("Evdjoh1AHQb6Ls1n7Td7buAiDA5ty7Ec8NCYt8eWEXFp");
   
   // Token addresses (Devnet)
   const CALVIN_MINT = new PublicKey("CrWbUJ4kMgduYDVRK8bDXhNBHr8cScixi79nGdGejnb1"); // Devnet CALVIN
@@ -47,7 +47,7 @@ const VAULT_PROGRAM_ID = new PublicKey("2nLsDVW67Qw5LXGvaTzUQ7xRxytY52APWJAz2c7a
   );
 
   const vaultProgram = new Program(
-    require("../target/idl/vault.json"), 
+    require("../target/idl/vault.json"),
     provider
   );
 

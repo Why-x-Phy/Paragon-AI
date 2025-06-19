@@ -28,7 +28,7 @@ from src.data.realtime_storage import RealtimeDataStorage
 from src.database.production_db import get_db_manager
 
 # Load environment variables
-load_dotenv('.env.dev')
+load_dotenv('../.env')
 
 # Configure logging
 logging.basicConfig(

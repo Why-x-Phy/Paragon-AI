@@ -12,8 +12,8 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
-# Load environment variables from .env.dev file
-load_dotenv('../.env.dev')
+# Load environment variables from .env file
+load_dotenv('../.env')
 
 def get_env_var(name, required=True):
     """Get environment variable with optional requirement check"""

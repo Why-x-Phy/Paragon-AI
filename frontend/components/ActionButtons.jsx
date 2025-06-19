@@ -83,29 +83,6 @@ export default function ActionButtons() {
     
     return (
         <>
-            {/* Tier Info Display */}
-            {tierInfo && (
-                <div className="bg-[#B73E15]/20 border border-[#B73E15]/30 rounded-lg p-4 mb-6">
-                    <div className="flex justify-between items-center">
-                        <div>
-                            <h3 className="text-white font-semibold">{tierInfo.name}</h3>
-                            <p className="text-white/60 text-sm">{tierInfo.role}</p>
-                        </div>
-                        <div className="text-right">
-                            <p className="text-white text-sm">
-                                Deposits: ${tierInfo.currentDeposits.toFixed(2)}
-                                {tierInfo.depositCap && ` / $${tierInfo.depositCap.toLocaleString()}`}
-                            </p>
-                            {tierInfo.remainingCap !== null && (
-                                <p className="text-[#B73E15] text-xs">
-                                    ${tierInfo.remainingCap.toFixed(2)} remaining
-                                </p>
-                            )}
-                        </div>
-                    </div>
-                </div>
-            )}
-
             {/* Primary Actions - Vault Operations */}
             <div className="flex gap-4 justify-between w-full mb-6">
                 <Button 

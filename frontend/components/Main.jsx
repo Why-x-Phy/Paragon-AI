@@ -3,6 +3,7 @@ import Image from 'next/image';
 import Navbar from './Navbar';
 import ActionButtons from './ActionButtons';
 import BalanceSection from './BalanceSection';
+import TradesTable from './TradesTable';
 
 const Main = () => {
   return (
@@ -13,8 +14,19 @@ const Main = () => {
             Welcome, <span className="text-[#B73E15]">{'Whale'}</span>. You have access to deposit into Calvin's private vault.
         </p>
       </div>
-      <ActionButtons />
-      <BalanceSection />
+      <div className="space-y-6">
+        <div className="flex flex-col items-center">
+          <ActionButtons />
+        </div>
+        <div className="flex flex-col items-center">
+          <BalanceSection />
+        </div>
+        <div className="flex flex-col items-center">
+          <div className="w-full max-w-4xl">
+            <TradesTable />
+          </div>
+        </div>
+      </div>
       
       {/* Calvin Character - Hidden on mobile, visible on larger screens */}
       <div className="hidden lg:block fixed bottom-0 right-8 z-10">

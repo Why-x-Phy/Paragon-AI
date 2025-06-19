@@ -58,17 +58,20 @@ class PortfolioConfig:
     max_single_asset_exposure_pct: float = 20.0  # Max % in single asset
     min_cash_reserve_pct: float = 20.0  # Min cash reserve
     
-    # Position sizing
-    default_position_size_pct: float = 10.0  # Default position size
-    min_position_size_usdc: float = 100.0  # Minimum position size
-    max_position_size_usdc: float = 5000.0  # Maximum position size
+    # Position sizing based on signal strength (percentage of portfolio value)
+    base_position_size_pct: float = 5.0  # Base position size for weak signals
+    strong_signal_multiplier: float = 1.5  # Additional % for strong signals
+    moderate_signal_multiplier: float = 1.2  # Additional % for moderate signals
+    weak_signal_multiplier: float = 0.8  # Additional % for weak signals
+    min_position_size_usdc: float = 100.0  # Minimum position size (absolute floor)
     
-    # Signal filtering
-    min_signal_confidence: float = 0.70  # Minimum confidence for trades
+    # Signal filtering  
+    min_signal_confidence: float = None  # Will use config.MIN_PREDICTION_CONFIDENCE
+    min_signal_strength_for_entry: str = 'weak'  # Minimum signal strength for entry
     signal_timeout_minutes: int = 15  # Signal validity timeout
     
-    # Allocation method
-    allocation_method: AllocationMethod = AllocationMethod.CONFIDENCE_WEIGHTED
+    # Allocation method (simplified - signal strength determines position size directly)
+    allocation_method: AllocationMethod = AllocationMethod.SIGNAL_STRENGTH
     
     # Performance tracking
     performance_lookback_days: int = 30  # Performance attribution period
@@ -79,8 +82,13 @@ class PortfolioConfig:
     max_drawdown_pct: float = 15.0  # Max portfolio drawdown
     
     # Token management
-    max_concurrent_positions: int = 10  # Max number of open positions
+    max_concurrent_positions: int = 18  # Max number of open positions
     min_liquidity_usdc: float = 1000.0  # Min daily volume for trading
+    
+    # Portfolio coordination
+    rebalance_threshold_pct: float = 5.0  # Rebalance threshold percentage
+    performance_window_hours: int = 168  # Performance window in hours (1 week)
+    attribution_update_frequency: int = 24  # Attribution update frequency in hours (daily)
 
 @dataclass
 class AssetAllocation:
@@ -175,38 +183,40 @@ class PortfolioCoordinator:
         tracked_tokens_str = os.getenv('TRACKED_TOKENS', '')
         self.tracked_tokens_addresses = [addr.strip() for addr in tracked_tokens_str.split(',') if addr.strip()]
         
+        # Get global config for confidence threshold
+        from ..config.config import config
+        
         return PortfolioConfig(
             # Portfolio risk limits from position manager env vars
             max_portfolio_exposure_pct=float(os.getenv('PORTFOLIO_MAX_EXPOSURE_PCT', 80.0)),
             max_single_asset_exposure_pct=float(os.getenv('TOKEN_MAX_EXPOSURE_PCT', 20.0)),
             min_cash_reserve_pct=100.0 - float(os.getenv('PORTFOLIO_MAX_EXPOSURE_PCT', 80.0)),
             
-            # Position sizing from env
-            default_position_size_pct=float(os.getenv('DEFAULT_POSITION_SIZE_PCT', 10.0)),
-            min_position_size_usdc=float(os.getenv('MIN_POSITION_SIZE_USDC', 100.0)),
-            max_position_size_usdc=float(os.getenv('MAX_POSITION_SIZE_USDC', 5000.0)),
+            # Position sizing based on signal strength
+            base_position_size_pct=float(os.getenv('BASE_POSITION_SIZE_PCT', 5.0)),
+            strong_signal_multiplier=float(os.getenv('STRONG_SIGNAL_MULTIPLIER', 1.5)),
+            moderate_signal_multiplier=float(os.getenv('MODERATE_SIGNAL_MULTIPLIER', 1.2)),
+            weak_signal_multiplier=float(os.getenv('WEAK_SIGNAL_MULTIPLIER', 0.8)),
             
-            # Signal filtering
-            min_signal_confidence=float(os.getenv('MIN_PREDICTION_CONFIDENCE', 0.70)),
-            signal_timeout_minutes=int(os.getenv('SIGNAL_TIMEOUT_MINUTES', 15)),
+            # Portfolio coordination - FIXED: Use signal_strength as default (matches enum)
+            allocation_method=AllocationMethod(os.getenv('PORTFOLIO_ALLOCATION_METHOD', 'signal_strength')),
+            rebalance_threshold_pct=float(os.getenv('PORTFOLIO_REBALANCE_THRESHOLD_PCT', 5.0)),
+            max_concurrent_positions=int(os.getenv('MAX_CONCURRENT_POSITIONS', 15)),
+            correlation_limit=float(os.getenv('PORTFOLIO_CORRELATION_LIMIT', 0.7)),
+            
+            # Signal filtering - Use global config for confidence threshold
+            min_signal_confidence=float(os.getenv('MIN_PREDICTION_CONFIDENCE') or config.MIN_PREDICTION_CONFIDENCE),
+            min_signal_strength_for_entry=os.getenv('MIN_SIGNAL_STRENGTH_FOR_ENTRY', 'weak'),
             
             # Performance tracking
-            performance_lookback_days=int(os.getenv('PERFORMANCE_LOOKBACK_DAYS', 30)),
-            rebalance_frequency_minutes=int(os.getenv('REBALANCE_FREQUENCY_MINUTES', 60)),
-            
-            # Risk management
-            max_drawdown_pct=float(os.getenv('MAX_DRAWDOWN_PCT', 15.0)),
-            max_concurrent_positions=int(os.getenv('MAX_CONCURRENT_POSITIONS', 10)),
-            min_liquidity_usdc=float(os.getenv('MIN_LIQUIDITY_USDC', 1000.0)),
-            
-            # Allocation method from env
-            allocation_method=AllocationMethod(os.getenv('ALLOCATION_METHOD', 'confidence_weighted'))
+            performance_window_hours=int(os.getenv('PERFORMANCE_WINDOW_HOURS', 168)),  # 1 week
+            attribution_update_frequency=int(os.getenv('ATTRIBUTION_UPDATE_FREQUENCY', 24)),  # Daily
         )
 
     def _create_risk_limits(self) -> RiskLimits:
         """Create risk limits for position manager integration"""
         return RiskLimits(
-            max_position_size_usdc=self.config.max_position_size_usdc,
+            max_position_size_usdc=50000.0,  # High limit since we use percentage-based sizing
             max_portfolio_exposure_pct=self.config.max_portfolio_exposure_pct,
             max_single_token_exposure_pct=self.config.max_single_asset_exposure_pct,
             max_drawdown_pct=self.config.max_drawdown_pct,
@@ -224,8 +234,12 @@ class PortfolioCoordinator:
             await self._load_tracked_symbols()
             
             # Initialize position manager with our risk limits
-            # Note: This will be integrated when PositionManager supports async initialization
-            # For now, we'll use database queries directly
+            from ..trading.position_manager import PositionManager
+            self.position_manager = PositionManager(risk_limits=self.risk_limits)
+            await self.position_manager.initialize()
+            
+            # 🆕 RECOVER PORTFOLIO STATE FROM DATABASE
+            await self._recover_portfolio_state()
             
             logger.info(f"Portfolio Coordinator initialized with {len(self.tracked_symbols)} tracked symbols")
             logger.info(f"Tracked symbols: {', '.join(self.tracked_symbols[:10])}{'...' if len(self.tracked_symbols) > 10 else ''}")
@@ -233,6 +247,123 @@ class PortfolioCoordinator:
         except Exception as e:
             logger.error(f"Failed to initialize Portfolio Coordinator: {e}")
             raise
+
+    async def _recover_portfolio_state(self):
+        """Recover portfolio state from database after restart"""
+        try:
+            # 1. Recover daily P&L tracking
+            await self._recover_daily_pnl_tracking()
+            
+            # 2. Recover performance attribution
+            await self._recover_performance_attribution()
+            
+            # 3. Recover recent portfolio history (last 10 cycles)
+            await self._recover_portfolio_history()
+            
+            logger.info("✅ Portfolio state recovered from database")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Portfolio state recovery failed (starting fresh): {e}")
+            # Continue with fresh state - not critical for operation
+    
+    async def _recover_daily_pnl_tracking(self):
+        """Recover daily P&L from health check records"""
+        try:
+            # Query latest daily P&L data from health checks
+            query = """
+                SELECT details
+                FROM system_health 
+                WHERE component = 'daily_pnl_tracking'
+                  AND status = 'healthy'
+                  AND check_time >= CURRENT_DATE
+                ORDER BY check_time DESC
+                LIMIT 1
+            """
+            
+            async with self.db_manager.pg_pool.acquire() as conn:
+                row = await conn.fetchrow(query)
+                
+            if row and row['details']:
+                pnl_data = row['details']
+                self.daily_pnl_by_asset = pnl_data.get('asset_pnl', {})
+                logger.info(f"📊 Recovered daily P&L for {len(self.daily_pnl_by_asset)} assets")
+                
+        except Exception as e:
+            logger.warning(f"Failed to recover daily P&L: {e}")
+            self.daily_pnl_by_asset = {}
+    
+    async def _recover_performance_attribution(self):
+        """Recover performance attribution from health check records"""
+        try:
+            # Query recent performance attribution data
+            query = """
+                SELECT details
+                FROM system_health 
+                WHERE component = 'portfolio_performance_attribution'
+                  AND status = 'healthy'
+                  AND check_time >= NOW() - INTERVAL '24 hours'
+                ORDER BY check_time DESC
+                LIMIT 50
+            """
+            
+            async with self.db_manager.pg_pool.acquire() as conn:
+                rows = await conn.fetch(query)
+            
+            # Rebuild performance attribution from recent data
+            for row in rows:
+                if row['details']:
+                    perf_data = row['details']
+                    symbol = perf_data.get('symbol')
+                    if symbol:
+                        self.performance_attribution[symbol] = {
+                            'total_signals': perf_data.get('total_signals', 0),
+                            'successful_signals': perf_data.get('successful_signals', 0),
+                            'total_pnl': perf_data.get('total_pnl', 0.0),
+                            'win_rate': perf_data.get('signal_generation_rate', 0.0),
+                            'avg_return': perf_data.get('avg_return', 0.0),
+                            'sharpe_ratio': perf_data.get('sharpe_ratio', 0.0),
+                            'max_drawdown': 0.0,
+                            'last_updated': datetime.now()
+                        }
+            
+            logger.info(f"📈 Recovered performance attribution for {len(self.performance_attribution)} assets")
+            
+        except Exception as e:
+            logger.warning(f"Failed to recover performance attribution: {e}")
+            self.performance_attribution = {}
+    
+    async def _recover_portfolio_history(self):
+        """Recover recent portfolio history from portfolio_cycles table"""
+        try:
+            # Get recent portfolio cycles to rebuild history
+            recent_cycles = await self.db_manager.get_recent_portfolio_cycles(limit=10)
+            
+            for cycle in recent_cycles:
+                # Create a simplified PortfolioSignal from cycle data
+                portfolio_signal = PortfolioSignal(
+                    timestamp=cycle['cycle_timestamp'],
+                    total_cash_available=cycle.get('available_cash_usdc', 0.0),
+                    portfolio_value=cycle.get('total_portfolio_value_usdc', 0.0),
+                    current_exposure_pct=cycle.get('max_position_size_pct', 0.0),
+                    buy_signals=[],  # Can't recover exact signals, but that's OK
+                    sell_signals=[],
+                    asset_allocations={},  # Can't recover exact allocations
+                    cash_allocation_pct=100.0,
+                    portfolio_risk_score=cycle.get('portfolio_risk_score', 0.0),
+                    correlation_risk=cycle.get('correlation_risk', 0.0),
+                    concentration_risk=0.0,
+                    execution_priority=5
+                )
+                self.portfolio_history.append(portfolio_signal)
+            
+            # Sort by timestamp
+            self.portfolio_history.sort(key=lambda x: x.timestamp)
+            
+            logger.info(f"📊 Recovered {len(self.portfolio_history)} recent portfolio cycles")
+            
+        except Exception as e:
+            logger.warning(f"Failed to recover portfolio history: {e}")
+            self.portfolio_history = []
 
     async def _load_tracked_symbols(self):
         """Load tracked symbols from database using token addresses"""
@@ -260,7 +391,7 @@ class PortfolioCoordinator:
             # Fallback to basic symbols
             self.tracked_symbols = ['BONK', 'JUP', 'SOL', 'Fartcoin']
 
-    async def generate_portfolio_signals(self) -> Optional[PortfolioSignal]:
+    async def generate_portfolio_signals(self, simulation_time: Optional[datetime] = None, override_portfolio_state: Optional[Dict[str, Any]] = None) -> Optional[PortfolioSignal]:
         """
         Generate coordinated portfolio signals across all tracked assets
         
@@ -270,14 +401,18 @@ class PortfolioCoordinator:
         try:
             start_time = datetime.now()
             
-            # 1. Get current portfolio state
-            portfolio_state = await self._get_portfolio_state()
-            if not portfolio_state:
-                logger.error("Failed to get portfolio state")
-                return None
+            # 1. Get current portfolio state (use override for backtest mode)
+            if override_portfolio_state:
+                portfolio_state = override_portfolio_state
+                logger.debug(f"Using override portfolio state: ${portfolio_state['portfolio_value']:,.2f} portfolio value")
+            else:
+                portfolio_state = await self._get_portfolio_state()
+                if not portfolio_state:
+                    logger.error("Failed to get portfolio state")
+                    return None
             
             # 2. Generate individual signals for each tracked symbol
-            individual_signals = await self._generate_individual_signals()
+            individual_signals = await self._generate_individual_signals(simulation_time)
             
             # 3. Filter and validate signals
             valid_signals = self._filter_signals(individual_signals)
@@ -309,6 +444,9 @@ class PortfolioCoordinator:
             # 7. Cache and track performance
             self._update_performance_tracking(portfolio_signal)
             
+            # 8. Update signal performance from verified trades (simple database query)
+            await self._update_signal_performance_from_verified_trades()
+            
             processing_time = (datetime.now() - start_time).total_seconds() * 1000
             logger.info(f"Generated portfolio signals for {len(self.tracked_symbols)} assets in {processing_time:.1f}ms")
             logger.info(f"Signals: {len(portfolio_signal.buy_signals)} BUY, {len(portfolio_signal.sell_signals)} SELL, "
@@ -321,18 +459,17 @@ class PortfolioCoordinator:
             return None
 
     async def _get_portfolio_state(self) -> Optional[Dict[str, Any]]:
-        """Get current portfolio state from database"""
+        """Get current portfolio state from position manager and vault"""
         try:
-            # Get total portfolio value from environment (vault integration pending)
-            portfolio_value = float(os.getenv('PORTFOLIO_VALUE_USDC', 100000.0))
+            # Get total portfolio value from position manager (which integrates with vault)
+            portfolio_value = self.position_manager._get_portfolio_value()
             
-            # Get current positions (when position manager is integrated)
-            # For now, calculate based on database
-            total_position_value = 0.0
-            position_count = 0
+            # Get current positions from position manager
+            open_positions = self.position_manager.get_active_positions()
             
-            # This would be replaced with position manager integration:
-            # open_positions = await self.position_manager.get_open_positions()
+            # Calculate position metrics
+            total_position_value = sum(pos.current_value for pos in open_positions.values())
+            position_count = len(open_positions)
             
             # Calculate exposure
             cash_balance = portfolio_value - total_position_value
@@ -344,39 +481,52 @@ class PortfolioCoordinator:
                 'total_position_value': total_position_value,
                 'position_count': position_count,
                 'exposure_pct': exposure_pct,
-                'available_buying_power': cash_balance * (self.config.max_portfolio_exposure_pct / 100)
+                'available_buying_power': cash_balance * (self.config.max_portfolio_exposure_pct / 100),
+                'open_positions': {symbol: {
+                    'size': pos.size,
+                    'entry_price': pos.average_price,
+                    'current_value': pos.current_value,
+                    'unrealized_pnl': pos.unrealized_pnl
+                } for symbol, pos in open_positions.items()}
             }
             
         except Exception as e:
             logger.error(f"Failed to get portfolio state: {e}")
             return None
 
-    async def _generate_individual_signals(self) -> List[TradingSignal]:
-        """Generate trading signals for all tracked symbols"""
+    async def _generate_individual_signals(self, simulation_time: Optional[datetime] = None) -> List[TradingSignal]:
+        """Generate trading signals for all tracked symbols SEQUENTIALLY to avoid DataProcessor race conditions"""
         signals = []
         
-        # Generate signals in parallel for better performance
-        signal_tasks = []
+        logger.debug(f"Generating signals sequentially for {len(self.tracked_symbols)} symbols")
+        
+        # Generate signals one by one (no race conditions, simple and reliable)
         for symbol in self.tracked_symbols:
-            task = self.strategy_engine.generate_signal(symbol)
-            signal_tasks.append(task)
-        
-        # Wait for all signals to complete
-        signal_results = await asyncio.gather(*signal_tasks, return_exceptions=True)
-        
-        # Process results
-        for i, result in enumerate(signal_results):
-            symbol = self.tracked_symbols[i]
-            
-            if isinstance(result, Exception):
-                logger.warning(f"Signal generation failed for {symbol}: {result}")
+            try:
+                signal = await self.strategy_engine.generate_signal(symbol, simulation_time=simulation_time)
+                
+                if signal is not None:
+                    signals.append(signal)
+                    self.last_signals[symbol] = signal
+                    logger.debug(f"Generated {signal.signal_type.value} signal for {symbol}: {signal.confidence:.3f} confidence")
+                else:
+                    logger.debug(f"No signal generated for {symbol}")
+                    
+            except Exception as e:
+                logger.warning(f"Signal generation failed for {symbol}: {e}")
                 continue
-            
-            if result is not None:
-                signals.append(result)
-                self.last_signals[symbol] = result
-            
-        logger.debug(f"Generated {len(signals)} individual signals from {len(self.tracked_symbols)} symbols")
+        
+        # Sort signals by strength (confidence * predicted_change magnitude) - BEST SIGNALS FIRST
+        actionable_signals = [s for s in signals if s.signal_type != SignalType.HOLD]
+        actionable_signals.sort(
+            key=lambda s: s.confidence * abs(s.predicted_change_pct), 
+            reverse=True
+        )
+        
+        logger.debug(f"Generated {len(signals)} total signals ({len(actionable_signals)} actionable) from {len(self.tracked_symbols)} symbols")
+        if actionable_signals:
+            logger.info(f"Top signals: {[(s.symbol, s.signal_type.value, f'{s.confidence:.2f}', f'{s.predicted_change_pct:.1f}%') for s in actionable_signals[:3]]}")
+        
         return signals
 
     def _filter_signals(self, signals: List[TradingSignal]) -> List[TradingSignal]:
@@ -446,9 +596,9 @@ class PortfolioCoordinator:
         for signal in signals:
             if signal.signal_type in [SignalType.BUY]:
                 # Calculate position size based on signal strength and confidence
-                base_size = self.config.default_position_size_pct / 100
+                base_size = self.config.base_position_size_pct / 100
                 confidence_multiplier = signal.confidence
-                strength_multiplier = {'weak': 0.5, 'moderate': 1.0, 'strong': 1.5}.get(
+                strength_multiplier = {'weak': self.config.weak_signal_multiplier, 'moderate': self.config.moderate_signal_multiplier, 'strong': self.config.strong_signal_multiplier}.get(
                     signal.strength.value, 1.0
                 )
                 
@@ -505,11 +655,12 @@ class PortfolioCoordinator:
     async def _calculate_asset_allocations(self, signals: List[TradingSignal], 
                                          portfolio_state: Dict[str, Any],
                                          risk_assessment: Dict[str, float]) -> Dict[str, AssetAllocation]:
-        """Calculate optimal asset allocations based on signals and risk"""
+        """Calculate asset allocations based on signal strength and portfolio percentage"""
         allocations = {}
         
         try:
-            # Get available buying power
+            # Get portfolio metrics
+            portfolio_value = portfolio_state['portfolio_value']
             available_cash = portfolio_state['available_buying_power']
             
             # Filter to actionable signals
@@ -519,36 +670,62 @@ class PortfolioCoordinator:
                 logger.debug("No buy signals to allocate")
                 return allocations
             
-            # Calculate allocation weights based on method
-            weights = self._calculate_allocation_weights(buy_signals, risk_assessment)
+            logger.debug(f"Calculating allocations for {len(buy_signals)} buy signals")
+            logger.debug(f"Portfolio value: ${portfolio_value:,.2f}, Available cash: ${available_cash:,.2f}")
             
-            # Calculate position sizes
-            for signal, weight in zip(buy_signals, weights):
-                # Get token info
-                token_info = await self.db_manager.get_token_by_symbol(signal.symbol)
-                if not token_info:
-                    logger.warning(f"Token info not found for {signal.symbol}")
+            # Calculate position sizes based on signal strength
+            for signal in buy_signals:
+                try:
+                    # Get token info
+                    token_info = await self.db_manager.get_token_by_symbol(signal.symbol)
+                    if not token_info:
+                        logger.warning(f"Token info not found for {signal.symbol}")
+                        continue
+                    
+                    # Calculate position size based on signal strength
+                    if signal.strength == SignalStrength.WEAK:
+                        position_pct = self.config.weak_signal_multiplier
+                    elif signal.strength == SignalStrength.MODERATE:
+                        position_pct = self.config.moderate_signal_multiplier
+                    elif signal.strength == SignalStrength.STRONG:
+                        position_pct = self.config.strong_signal_multiplier
+                    else:
+                        position_pct = 1.0  # Default to 100%
+                    
+                    # Calculate target position value
+                    target_position_value = portfolio_value * (position_pct / 100.0)
+                    
+                    # Apply minimum position size constraint
+                    target_position_value = max(target_position_value, self.config.min_position_size_usdc)
+                    
+                    # Check if we have enough available cash
+                    if target_position_value > available_cash:
+                        logger.info(f"Insufficient cash for {signal.symbol}: need ${target_position_value:,.2f}, have ${available_cash:,.2f} - skipping trade")
+                        continue
+                    
+                    # Create allocation
+                    allocation = AssetAllocation(
+                        symbol=signal.symbol,
+                        token_id=token_info['token_id'],
+                        current_exposure_pct=0.0,  # Would get from position manager
+                        target_exposure_pct=position_pct,
+                        position_value_usdc=target_position_value,
+                        signal=signal,
+                        last_updated=datetime.now()
+                    )
+                    
+                    allocations[signal.symbol] = allocation
+                    
+                    # Reduce available cash for next allocation
+                    available_cash -= target_position_value
+                    
+                    logger.debug(f"Allocated {signal.symbol}: {signal.strength.value} signal = {position_pct:.2f}% = ${target_position_value:,.2f}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to calculate allocation for {signal.symbol}: {e}")
                     continue
-                
-                # Calculate target allocation
-                target_position_value = available_cash * weight
-                target_position_value = min(target_position_value, self.config.max_position_size_usdc)
-                target_position_value = max(target_position_value, self.config.min_position_size_usdc)
-                
-                # Create allocation
-                allocation = AssetAllocation(
-                    symbol=signal.symbol,
-                    token_id=token_info['token_id'],
-                    current_exposure_pct=0.0,  # Would get from position manager
-                    target_exposure_pct=(target_position_value / portfolio_state['portfolio_value']) * 100,
-                    position_value_usdc=target_position_value,
-                    signal=signal,
-                    last_updated=datetime.now()
-                )
-                
-                allocations[signal.symbol] = allocation
             
-            logger.debug(f"Calculated allocations for {len(allocations)} assets")
+            logger.info(f"Portfolio allocations calculated: {len(allocations)} positions, total value: ${sum(a.position_value_usdc for a in allocations.values()):,.2f}")
             return allocations
             
         except Exception as e:
@@ -557,31 +734,13 @@ class PortfolioCoordinator:
 
     def _calculate_allocation_weights(self, signals: List[TradingSignal], 
                                     risk_assessment: Dict[str, float]) -> List[float]:
-        """Calculate allocation weights based on configured method"""
+        """Calculate allocation weights - simplified since we use percentage-based sizing"""
         if not signals:
             return []
         
-        if self.config.allocation_method == AllocationMethod.EQUAL_WEIGHT:
-            return [1.0 / len(signals)] * len(signals)
-        
-        elif self.config.allocation_method == AllocationMethod.CONFIDENCE_WEIGHTED:
-            confidences = [s.confidence for s in signals]
-            total_confidence = sum(confidences)
-            return [conf / total_confidence for conf in confidences] if total_confidence > 0 else [1.0 / len(signals)] * len(signals)
-        
-        elif self.config.allocation_method == AllocationMethod.SIGNAL_STRENGTH:
-            strength_scores = []
-            for signal in signals:
-                score = {'weak': 1.0, 'moderate': 2.0, 'strong': 3.0}.get(signal.strength.value, 1.0)
-                strength_scores.append(score)
-            
-            total_score = sum(strength_scores)
-            return [score / total_score for score in strength_scores] if total_score > 0 else [1.0 / len(signals)] * len(signals)
-        
-        else:  # Default to confidence weighted
-            confidences = [s.confidence for s in signals]
-            total_confidence = sum(confidences)
-            return [conf / total_confidence for conf in confidences] if total_confidence > 0 else [1.0 / len(signals)] * len(signals)
+        # With percentage-based sizing, we don't need complex weighting
+        # Signal strength determines position size directly in _calculate_asset_allocations
+        return [1.0 / len(signals)] * len(signals)  # Equal weights for any remaining usage
 
     def _calculate_target_cash_allocation(self, asset_allocations: Dict[str, AssetAllocation]) -> float:
         """Calculate target cash allocation percentage"""
@@ -619,11 +778,257 @@ class PortfolioCoordinator:
             if len(self.portfolio_history) > max_history:
                 self.portfolio_history = self.portfolio_history[-max_history:]
             
-            # Update daily PnL tracking (placeholder for now)
-            # This would integrate with actual position tracking
+            # Update daily PnL tracking with actual position data
+            self._update_daily_pnl_tracking(portfolio_signal)
+            
+            # Update performance attribution per asset
+            self._update_asset_performance_attribution(portfolio_signal)
             
         except Exception as e:
             logger.error(f"Performance tracking update failed: {e}")
+
+    def _update_daily_pnl_tracking(self, portfolio_signal: PortfolioSignal):
+        """Update daily P&L tracking for portfolio and individual assets"""
+        try:
+            current_date = datetime.now().date()
+            
+            # Calculate portfolio-level P&L
+            if len(self.portfolio_history) >= 2:
+                previous_signal = self.portfolio_history[-2]
+                portfolio_pnl_change = portfolio_signal.portfolio_value - previous_signal.portfolio_value
+                portfolio_pnl_pct = (portfolio_pnl_change / previous_signal.portfolio_value) * 100 if previous_signal.portfolio_value > 0 else 0.0
+                
+                # Update daily P&L by asset
+                for symbol, allocation in portfolio_signal.asset_allocations.items():
+                    if symbol not in self.daily_pnl_by_asset:
+                        self.daily_pnl_by_asset[symbol] = 0.0
+                    
+                    # Calculate asset contribution to portfolio P&L
+                    asset_weight = allocation.position_value_usdc / portfolio_signal.portfolio_value if portfolio_signal.portfolio_value > 0 else 0.0
+                    asset_pnl_contribution = portfolio_pnl_change * asset_weight
+                    
+                    self.daily_pnl_by_asset[symbol] += asset_pnl_contribution
+                
+                logger.debug(f"📊 Portfolio P&L: ${portfolio_pnl_change:.2f} ({portfolio_pnl_pct:.2f}%)")
+            
+            # Reset daily P&L at midnight
+            if not hasattr(self, '_last_pnl_reset_date') or self._last_pnl_reset_date != current_date:
+                # Store yesterday's data before reset
+                if hasattr(self, '_last_pnl_reset_date') and self.daily_pnl_by_asset:
+                    # Schedule async storage (don't await in sync context)
+                    import asyncio
+                    asyncio.create_task(self._store_daily_pnl_data())
+                
+                self.daily_pnl_by_asset.clear()
+                self._last_pnl_reset_date = current_date
+                logger.debug("🔄 Daily P&L tracking reset")
+                
+        except Exception as e:
+            logger.error(f"Daily P&L tracking update failed: {e}")
+
+    def _update_asset_performance_attribution(self, portfolio_signal: PortfolioSignal):
+        """Update performance attribution metrics for individual assets"""
+        try:
+            for symbol, allocation in portfolio_signal.asset_allocations.items():
+                if symbol not in self.performance_attribution:
+                    self.performance_attribution[symbol] = {
+                        'total_signals': 0,
+                        'successful_signals': 0,
+                        'total_pnl': 0.0,
+                        'win_rate': 0.0,
+                        'avg_return': 0.0,
+                        'sharpe_ratio': 0.0,
+                        'max_drawdown': 0.0,
+                        'last_updated': datetime.now()
+                    }
+                
+                perf = self.performance_attribution[symbol]
+                
+                # Update signal tracking
+                if allocation.signal:
+                    perf['total_signals'] += 1
+                    
+                    # Note: Actual trade success tracking is handled by trade_verifier.py
+                    # This tracks signal generation success only
+                    signal_generated_successfully = allocation.signal.confidence > self.config.min_signal_confidence
+                    if signal_generated_successfully:
+                        perf['successful_signals'] += 1
+                    
+                    # Update signal generation rate (not trade success rate)
+                    perf['win_rate'] = perf['successful_signals'] / perf['total_signals'] if perf['total_signals'] > 0 else 0.0
+                
+                # Update P&L tracking
+                perf['total_pnl'] += allocation.daily_pnl
+                
+                # Update allocation object with performance metrics
+                allocation.total_pnl = perf['total_pnl']
+                allocation.win_rate = perf['win_rate']
+                
+                # Calculate simple Sharpe ratio (returns / volatility)
+                if len(self.portfolio_history) >= 10:
+                    recent_returns = []
+                    for i in range(1, min(31, len(self.portfolio_history))):  # Last 30 periods
+                        prev_signal = self.portfolio_history[-(i+1)]
+                        curr_signal = self.portfolio_history[-i]
+                        
+                        if symbol in prev_signal.asset_allocations and symbol in curr_signal.asset_allocations:
+                            prev_value = prev_signal.asset_allocations[symbol].position_value_usdc
+                            curr_value = curr_signal.asset_allocations[symbol].position_value_usdc
+                            
+                            if prev_value > 0:
+                                period_return = (curr_value - prev_value) / prev_value
+                                recent_returns.append(period_return)
+                    
+                    if len(recent_returns) >= 5:
+                        import statistics
+                        avg_return = statistics.mean(recent_returns)
+                        return_volatility = statistics.stdev(recent_returns) if len(recent_returns) > 1 else 0.0
+                        
+                        perf['avg_return'] = avg_return
+                        perf['sharpe_ratio'] = avg_return / return_volatility if return_volatility > 0 else 0.0
+                        allocation.sharpe_ratio = perf['sharpe_ratio']
+                
+                perf['last_updated'] = datetime.now()
+                
+                # Store performance attribution in database (schedule async task)
+                import asyncio
+                asyncio.create_task(self._store_performance_attribution(symbol, perf, allocation))
+                
+        except Exception as e:
+            logger.error(f"Asset performance attribution update failed: {e}")
+
+    async def _store_performance_attribution(self, symbol: str, perf: Dict[str, Any], allocation: AssetAllocation):
+        """Store performance attribution data in database"""
+        try:
+            if not self.db_manager:
+                return
+            
+            # Store in portfolio_performance table (if exists) or create custom table
+            performance_data = {
+                'symbol': symbol,
+                'timestamp': datetime.now(),
+                'total_signals': perf['total_signals'],
+                'successful_signals': perf['successful_signals'],
+                'signal_generation_rate': perf['win_rate'],
+                'total_pnl': perf['total_pnl'],
+                'avg_return': perf.get('avg_return', 0.0),
+                'sharpe_ratio': perf.get('sharpe_ratio', 0.0),
+                'current_position_value': allocation.position_value_usdc,
+                'target_exposure_pct': allocation.target_exposure_pct
+            }
+            
+            # Record in system health for now (until dedicated performance table is created)
+            # Convert datetime to string for JSON serialization
+            performance_data_json = {
+                **performance_data,
+                'timestamp': performance_data['timestamp'].isoformat()
+            }
+            await self.db_manager.record_health_check(
+                'portfolio_performance_attribution',
+                'healthy',
+                performance_data_json
+            )
+            
+            logger.debug(f"📊 Stored performance attribution for {symbol}")
+            
+        except Exception as e:
+            logger.error(f"Failed to store performance attribution for {symbol}: {e}")
+
+    async def _store_daily_pnl_data(self):
+        """Store daily P&L data in database"""
+        try:
+            if not self.db_manager or not self.daily_pnl_by_asset:
+                return
+            
+            # Store daily P&L summary
+            pnl_summary = {
+                'date': datetime.now().date().isoformat(),
+                'total_assets': len(self.daily_pnl_by_asset),
+                'total_pnl': sum(self.daily_pnl_by_asset.values()),
+                'asset_pnl': dict(self.daily_pnl_by_asset),
+                'portfolio_value': getattr(self, '_last_portfolio_value', 0.0)
+            }
+            
+            # Record in system health for monitoring
+            await self.db_manager.record_health_check(
+                'daily_pnl_tracking',
+                'updated',
+                pnl_summary
+            )
+            
+            logger.debug(f"📊 Stored daily P&L data for {len(self.daily_pnl_by_asset)} assets")
+            
+        except Exception as e:
+            logger.error(f"Failed to store daily P&L data: {e}")
+
+    async def _update_signal_performance_from_verified_trades(self):
+        """Update signal performance tracking based on verified trade results from database"""
+        try:
+            if not self.db_manager:
+                return
+            
+            # Query verified trades from the last 24 hours
+            query = """
+                SELECT 
+                    t.trade_id,
+                    tk.symbol,
+                    t.trade_type,
+                    t.signal_confidence,
+                    t.predicted_change_pct,
+                    t.execution_status,
+                    t.confirmed_at,
+                    t.value_usdc,
+                    t.actual_output_amount
+                FROM trades t
+                JOIN tokens tk ON t.token_id = tk.token_id
+                WHERE t.execution_status IN ('confirmed', 'failed')
+                  AND t.confirmed_at >= NOW() - INTERVAL '24 hours'
+                  AND t.cycle_timestamp IS NOT NULL
+                ORDER BY t.confirmed_at DESC
+                LIMIT 100
+            """
+            
+            async with self.db_manager.pg_pool.acquire() as conn:
+                rows = await conn.fetch(query)
+            
+            if not rows:
+                return
+            
+            # Process verified trades and update performance attribution
+            for row in rows:
+                symbol = row['symbol']
+                trade_successful = row['execution_status'] == 'confirmed'
+                
+                # Initialize performance tracking if not exists
+                if symbol not in self.performance_attribution:
+                    self.performance_attribution[symbol] = {
+                        'total_signals': 0,
+                        'successful_signals': 0,
+                        'total_pnl': 0.0,
+                        'win_rate': 0.0,
+                        'avg_return': 0.0,
+                        'sharpe_ratio': 0.0,
+                        'max_drawdown': 0.0,
+                        'last_updated': datetime.now()
+                    }
+                
+                perf = self.performance_attribution[symbol]
+                
+                # Update actual trade execution success (not just signal generation)
+                perf['total_signals'] += 1
+                if trade_successful:
+                    perf['successful_signals'] += 1
+                
+                # Calculate actual trade success rate
+                perf['win_rate'] = perf['successful_signals'] / perf['total_signals'] if perf['total_signals'] > 0 else 0.0
+                perf['last_updated'] = datetime.now()
+                
+                logger.debug(f"📈 Updated trade performance for {symbol}: {perf['win_rate']:.1%} success rate ({perf['successful_signals']}/{perf['total_signals']})")
+            
+            logger.info(f"🔄 Updated signal performance from {len(rows)} verified trades")
+            
+        except Exception as e:
+            logger.error(f"Failed to update signal performance from verified trades: {e}")
 
     async def get_portfolio_status(self) -> Dict[str, Any]:
         """Get current portfolio status and performance metrics"""
@@ -658,8 +1063,12 @@ class PortfolioCoordinator:
     async def close(self):
         """Clean up resources"""
         try:
+            if self.position_manager:
+                await self.position_manager.close()
+            
             if self.db_manager:
                 await self.db_manager.close()
+                
             logger.info("Portfolio Coordinator closed")
         except Exception as e:
             logger.error(f"Error closing Portfolio Coordinator: {e}")
@@ -676,10 +1085,10 @@ async def get_portfolio_coordinator() -> PortfolioCoordinator:
     return _coordinator_instance
 
 # Convenience functions for easy integration
-async def generate_portfolio_signals() -> Optional[PortfolioSignal]:
+async def generate_portfolio_signals(simulation_time: Optional[datetime] = None, override_portfolio_state: Optional[Dict[str, Any]] = None) -> Optional[PortfolioSignal]:
     """Convenience function to generate portfolio signals"""
     coordinator = await get_portfolio_coordinator()
-    return await coordinator.generate_portfolio_signals()
+    return await coordinator.generate_portfolio_signals(simulation_time, override_portfolio_state)
 
 async def get_portfolio_status() -> Dict[str, Any]:
     """Convenience function to get portfolio status"""

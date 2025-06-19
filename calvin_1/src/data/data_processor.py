@@ -44,7 +44,7 @@ class DataProcessor:
     def fetch_price_data(
         self, 
         token_address: str, 
-        resolution: str = "15m", 
+        resolution: str = "1H", 
         days: int = 30,
         day_offset: int = 0
     ) -> pd.DataFrame:
@@ -2036,12 +2036,12 @@ class DataProcessor:
         else:
             # Normal training mode: fit scalers on training slice only
             train_cutoff = int(len(df) * (1 - test_size))
-        self.feature_scaler.fit(
-            df.iloc[:train_cutoff][feature_cols].values
-        )
-        self.price_scaler.fit(
-            df.iloc[:train_cutoff]['target'].values.reshape(-1, 1)
-        )
+            self.feature_scaler.fit(
+                df.iloc[:train_cutoff][feature_cols].values
+            )
+            self.price_scaler.fit(
+                df.iloc[:train_cutoff]['target'].values.reshape(-1, 1)
+            )
 
         features = self.feature_scaler.transform(df[feature_cols].values)
         targets  = self.price_scaler.transform(
@@ -2100,17 +2100,17 @@ class DataProcessor:
         else:
             # Normal training mode: split the data
             split_index = int(len(X) * (1 - test_size))
-        
-        X_train = X[:split_index]
-        X_test = X[split_index:]
-        y_train = y[:split_index]
-        y_test = y[split_index:]
-        
-        # Split the prices for inverse transformation (required by main.py)
-        self.prices_at_sequence_end_train = prices_at_sequence_end[:split_index]
-        self.prices_at_sequence_end_test = prices_at_sequence_end[split_index:]
-        
-        logger.info(f"Training mode data shapes - X_train: {X_train.shape}, X_test: {X_test.shape}, y_train: {y_train.shape}, y_test: {y_test.shape}")
+            
+            X_train = X[:split_index]
+            X_test = X[split_index:]
+            y_train = y[:split_index]
+            y_test = y[split_index:]
+            
+            # Split the prices for inverse transformation (required by main.py)
+            self.prices_at_sequence_end_train = prices_at_sequence_end[:split_index]
+            self.prices_at_sequence_end_test = prices_at_sequence_end[split_index:]
+            
+            logger.info(f"Training mode data shapes - X_train: {X_train.shape}, X_test: {X_test.shape}, y_train: {y_train.shape}, y_test: {y_test.shape}")
         
         if include_feature_names:
             return X_train, X_test, y_train, y_test, feature_names
@@ -3569,3 +3569,146 @@ class DataProcessor:
         df['social_dominance'] = np.nan
         
         return df
+
+    async def prepare_inference_ready_data(
+        self, 
+        token_id: int, 
+        start_time: datetime, 
+        end_time: datetime, 
+        symbol: str = None
+    ) -> Optional[pd.DataFrame]:
+        """
+        CLEAN INTERFACE: Prepare inference-ready data using proven training pipeline
+        
+        This method provides the EXACT same processing as training but for live inference.
+        Returns a clean DataFrame ready for prepare_ml_data() call.
+        
+        Args:
+            token_id: Database token ID
+            start_time: Start time for data fetch  
+            end_time: End time for data fetch
+            symbol: Token symbol for social data (optional)
+            
+        Returns:
+            Clean DataFrame with all features engineered, ready for prepare_ml_data()
+        """
+        logger.info(f"Preparing inference-ready data for token {token_id} from {start_time} to {end_time}")
+        
+        try:
+            # 1. Fetch OHLCV data from database
+            from ..database.production_db import get_db_manager
+            
+            db_manager = await get_db_manager()
+            
+            # Get OHLCV data using the same method as training pipeline
+            ohlcv_data = await db_manager.get_ohlcv_data(
+                token_id=token_id,
+                resolution='1H',
+                start_time=start_time,
+                end_time=end_time
+            )
+            
+            if not ohlcv_data or len(ohlcv_data) < 50:  # Need sufficient data
+                logger.warning(f"Insufficient OHLCV data for token {token_id}: {len(ohlcv_data) if ohlcv_data else 0} records")
+                return None
+            
+            # 2. Convert to DataFrame (same format as training)
+            data_records = []
+            for record in ohlcv_data:
+                data_records.append({
+                    'timestamp': record.time,
+                    'open': float(record.open),
+                    'high': float(record.high),
+                    'low': float(record.low),
+                    'close': float(record.close),
+                    'volume': float(record.volume)
+                })
+            
+            df = pd.DataFrame(data_records)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df.sort_values('timestamp', inplace=True)
+            
+            logger.debug(f"Loaded {len(df)} OHLCV records for token {token_id}")
+            
+            # 3. Apply the EXACT same feature engineering pipeline as training
+            
+            # Calculate technical indicators
+            df = self.calculate_technical_indicators(df)
+            
+            # Add Fair Value Gaps
+            df = self.add_fair_value_gaps(df)
+            
+            # Add Volatility-of-Volatility (VoV) features
+            df = self.add_volatility_of_volatility(df)
+            
+            # Add cyclical time features
+            df = self.add_time_cyclical_features(df)
+            
+            # Add Chaikin Money Flow and Price-Volume Trend
+            df = self.add_money_flow_features(df)
+            
+            # Add range-based realized volatility
+            df = self.add_realized_volatility(df)
+            
+            # Add adaptive moving averages (KAMA, Hull MA)
+            df = self.add_adaptive_moving_averages(df)
+            
+            # Add multi-timeframe features
+            df = self.add_multi_timeframe_features(df, '1H')
+            
+            # Add candlestick patterns
+            df = self.add_candlestick_patterns(df)
+            
+            # Add price action swing points
+            df = self.add_price_action_swing_points(df)
+            
+            # Add statistical features (Hurst exponent, moments)
+            df = self.add_statistical_features(df)
+            
+            # Add advanced momentum features with divergence detection
+            df = self.add_advanced_momentum_features(df)
+            
+            # Add support and resistance zones
+            df = self.add_support_resistance_zones(df)
+            
+            # Add market regime features
+            df = self.add_market_regime_features(df)
+            
+            # Add volume profile features
+            df = self.add_volume_profile_features(df)
+            
+            # 4. Add social data if symbol provided
+            if symbol:
+                try:
+                    # Calculate days needed based on timespan
+                    days_needed = (end_time - start_time).days + 1
+                    social_df = await self.fetch_sentiment_data_timescale(symbol, days_needed)
+                    
+                    if not social_df.empty:
+                        # Merge social data with price data
+                        df = self.merge_data(df, social_df)
+                        # Calculate social indicators on merged data
+                        df = self.calculate_social_indicators(df)
+                        logger.debug(f"Added social data for {symbol}")
+                    else:
+                        # Add placeholder social features for consistency
+                        df = self._add_placeholder_social_features(df)
+                        logger.debug(f"No social data for {symbol}, using placeholders")
+                        
+                except Exception as e:
+                    logger.warning(f"Social data processing failed for {symbol}: {e}")
+                    df = self._add_placeholder_social_features(df)
+            else:
+                # Add placeholder social features for consistency
+                df = self._add_placeholder_social_features(df)
+            
+            # 5. Final cleanup
+            df = df.fillna(method='ffill').fillna(method='bfill').fillna(0)
+            
+            logger.info(f"Successfully prepared inference data for token {token_id}: {len(df)} records, {len(df.columns)} features")
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error preparing inference data for token {token_id}: {e}")
+            return None

@@ -47,6 +47,9 @@ class VaultClient:
         self.vault_program_id = config.get('CALVIN_VAULT_PROGRAM_ID', '')
         self.staking_program_id = config.get('CALVIN_STAKING_PROGRAM_ID', '')
         
+        # 🎯 NEW: Treasury configuration
+        self.treasury_address = config.get('CALVIN_TREASURY_ADDRESS', 'HV4x1p4gHhMcyjWpexki7Mis7ajecMntwCcvLjQJdLiC')
+        
         # Trading authority (Calvin AI's keypair)
         self.authority_private_key = config.get('CALVIN_AUTHORITY_PRIVATE_KEY', '')
         self.authority_keypair = None
@@ -76,7 +79,7 @@ class VaultClient:
             if self.authority_private_key:
                 try:
                     self.authority_keypair = self._load_keypair_from_string(self.authority_private_key)
-                    logger.info(f"✅ Trading authority loaded: {self.authority_keypair.public_key}")
+                    logger.info(f"✅ Trading authority loaded: {self.authority_keypair.pubkey()}")
                 except Exception as e:
                     logger.error(f"❌ Failed to load trading authority keypair: {e}")
                     self.authority_keypair = None
@@ -161,22 +164,18 @@ class VaultClient:
 
     async def get_vault_state(self) -> Dict[str, Any]:
         """
-        Get current vault state by querying the vault program account
-        
-        Uses Helius API to fetch the actual vault account data and decode it
-        according to our Anchor program's account structure.
+        Get current vault state from smart contract with improved error handling
         
         Returns:
-            Dictionary with vault state information
+            Dictionary containing vault state information
         """
         if not self.client:
             await self.initialize()
-        
+            
         try:
-            # Derive the vault PDA (same as in transaction creation)
-            usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            # Derive vault PDA using the same method as smart contract
+            usdc_mint_pubkey = Pubkey.from_string("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
             vault_program_id = Pubkey.from_string(self.vault_program_id)
-            usdc_mint_pubkey = Pubkey.from_string(usdc_mint)
             
             vault_pda, vault_bump = Pubkey.find_program_address(
                 [b"vault", bytes(usdc_mint_pubkey)],
@@ -185,17 +184,35 @@ class VaultClient:
             
             logger.debug(f"🔍 Querying vault account: {vault_pda}")
             
-            # Query the vault account using Helius/Solana RPC
-            account_info = await self.client.get_account_info(vault_pda)
+            # Query the vault account using Helius/Solana RPC with timeout
+            try:
+                account_info = await asyncio.wait_for(
+                    self.client.get_account_info(vault_pda),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Vault account query timed out")
+                return {
+                    'paused': True,
+                    'initialized': False,
+                    'error': 'Query timeout',
+                    'vault_address': str(vault_pda),
+                    'last_updated': datetime.utcnow().isoformat()
+                }
             
             if not account_info or not account_info.value:
                 logger.warning("⚠️ Vault account not found - may not be initialized")
                 return {
                     'paused': True,
                     'initialized': False,
-                    'error': 'Vault account not found'
+                    'error': 'Vault account not found',
+                    'vault_address': str(vault_pda),
+                    'vault_bump': vault_bump,
+                    'last_updated': datetime.utcnow().isoformat(),
+                    'needs_initialization': True,
+                    'vault_program_id': self.vault_program_id
                 }
-            
+
             # Decode the account data according to our Anchor program structure
             vault_data = await self._decode_vault_account(account_info.value.data)
             
@@ -203,9 +220,13 @@ class VaultClient:
                 logger.error("❌ Failed to decode vault account data")
                 return {
                     'paused': True,
-                    'error': 'Failed to decode vault data'
+                    'initialized': True,  # Account exists but data is invalid
+                    'error': 'Failed to decode vault data',
+                    'vault_address': str(vault_pda),
+                    'vault_bump': vault_bump,
+                    'last_updated': datetime.utcnow().isoformat()
                 }
-            
+
             # Calculate derived metrics
             nav_per_share = (
                 vault_data['total_usdc'] / vault_data['total_shares'] 
@@ -241,30 +262,49 @@ class VaultClient:
             return vault_state
             
         except Exception as e:
-            logger.error(f"❌ Failed to get vault state: {e}")
+            logger.warning(f"Failed to get vault state: {e}")
             return {
                 'paused': True,  # Fail-safe: assume paused on error
                 'initialized': False,
                 'error': str(e),
-                'last_updated': datetime.utcnow().isoformat()
+                'last_updated': datetime.utcnow().isoformat(),
+                'vault_program_id': self.vault_program_id,
+                'needs_troubleshooting': True
             }
 
     async def _decode_vault_account(self, account_data: bytes) -> Optional[Dict[str, Any]]:
         """
         Decode vault account data according to Anchor program structure
         
-        Our Vault struct (from onchain/programs/calvin-vault/src/state/mod.rs):
+        Actual Vault struct (from onchain/programs/calvin-vault/src/state/mod.rs):
         - discriminator: [u8; 8]
-        - total_usdc: u64
-        - total_shares: u64  
-        - trading_authority: Pubkey
-        - emergency_owner: Pubkey
-        - paused: bool
-        - performance_fee_bps: u16
-        - deposit_fee_bps: u16
-        - withdrawal_fee_bps: u16
-        - jupiter_program_id: Pubkey
-        - bump: u8
+        - emergency_owner: Pubkey (32 bytes)
+        - calvin_authority: Pubkey (32 bytes)
+        - staking_program_id: Pubkey (32 bytes)
+        - shares_mint: Pubkey (32 bytes)
+        - usdc_mint: Pubkey (32 bytes)
+        - usdc_vault: Pubkey (32 bytes)
+        - vault_authority: Pubkey (32 bytes)
+        - vault_bump: u8 (1 byte)
+        - shares_mint_bump: u8 (1 byte)
+        - authority_bump: u8 (1 byte)
+        - calvin_mint: Pubkey (32 bytes)
+        - treasury: Pubkey (32 bytes)
+        - per_nft_cap: u64 (8 bytes)
+        - high_water_mark_nav: u64 (8 bytes)
+        - total_shares: u64 (8 bytes)
+        - paused: bool (1 byte)
+        - jupiter_program_id: Pubkey (32 bytes)
+        - reentrancy_guard: bool (1 byte)
+        - trading_paused: bool (1 byte)
+        - deposits_paused: bool (1 byte)
+        - withdrawals_paused: bool (1 byte)
+        - emergency_owners: [Pubkey; 2] (64 bytes)
+        - emergency_owners_count: u8 (1 byte)
+        - required_signatures: u8 (1 byte)
+        - next_operation_id: u64 (8 bytes)
+        - cpi_call_counts: [CpiCallTracker; 2] (152 bytes)
+        - cpi_trackers_count: u8 (1 byte)
         
         Args:
             account_data: Raw account data bytes
@@ -282,69 +322,174 @@ class VaultClient:
             # Skip Anchor discriminator (first 8 bytes)
             data = account_data[8:]
             
-            if len(data) < 8 + 8 + 32 + 32 + 1 + 2 + 2 + 2 + 32 + 1:  # Minimum expected size
-                logger.error(f"❌ Account data too short: {len(data)} bytes")
+            # Calculate minimum expected size for core fields we need
+            min_size = (
+                32 + 32 + 32 + 32 + 32 + 32 + 32 +  # 7 Pubkeys (224 bytes)
+                1 + 1 + 1 +                          # 3 bump fields (3 bytes) 
+                32 + 32 +                            # calvin_mint + treasury (64 bytes)
+                8 + 8 + 8 +                          # per_nft_cap + high_water_mark + total_shares (24 bytes)
+                1 +                                  # paused (1 byte)
+                32                                   # jupiter_program_id (32 bytes)
+            )  # = 380 bytes minimum
+            
+            if len(data) < min_size:
+                logger.error(f"❌ Account data too short: {len(data)} bytes, expected at least {min_size}")
                 return None
             
             offset = 0
             
-            # Parse the vault data according to Rust struct layout
-            # u64: total_usdc (8 bytes, little-endian)
-            total_usdc = struct.unpack('<Q', data[offset:offset+8])[0]
-            offset += 8
-            
-            # u64: total_shares (8 bytes, little-endian)  
-            total_shares = struct.unpack('<Q', data[offset:offset+8])[0]
-            offset += 8
-            
-            # Pubkey: trading_authority (32 bytes)
-            trading_authority_bytes = data[offset:offset+32]
-            trading_authority = str(Pubkey(trading_authority_bytes))
-            offset += 32
-            
+            # Parse the vault data according to actual Rust struct layout
             # Pubkey: emergency_owner (32 bytes)
             emergency_owner_bytes = data[offset:offset+32]
             emergency_owner = str(Pubkey(emergency_owner_bytes))
             offset += 32
             
+            # Pubkey: calvin_authority (32 bytes)
+            calvin_authority_bytes = data[offset:offset+32]
+            calvin_authority = str(Pubkey(calvin_authority_bytes))
+            offset += 32
+            
+            # Pubkey: staking_program_id (32 bytes)
+            staking_program_id_bytes = data[offset:offset+32]
+            staking_program_id = str(Pubkey(staking_program_id_bytes))
+            offset += 32
+            
+            # Pubkey: shares_mint (32 bytes)
+            shares_mint_bytes = data[offset:offset+32]
+            shares_mint = str(Pubkey(shares_mint_bytes))
+            offset += 32
+            
+            # Pubkey: usdc_mint (32 bytes)
+            usdc_mint_bytes = data[offset:offset+32]
+            usdc_mint = str(Pubkey(usdc_mint_bytes))
+            offset += 32
+            
+            # Pubkey: usdc_vault (32 bytes)
+            usdc_vault_bytes = data[offset:offset+32]
+            usdc_vault = str(Pubkey(usdc_vault_bytes))
+            offset += 32
+            
+            # Pubkey: vault_authority (32 bytes)
+            vault_authority_bytes = data[offset:offset+32]
+            vault_authority = str(Pubkey(vault_authority_bytes))
+            offset += 32
+            
+            # u8: vault_bump (1 byte)
+            vault_bump = data[offset]
+            offset += 1
+            
+            # u8: shares_mint_bump (1 byte)
+            shares_mint_bump = data[offset]
+            offset += 1
+            
+            # u8: authority_bump (1 byte)
+            authority_bump = data[offset]
+            offset += 1
+            
+            # Pubkey: calvin_mint (32 bytes)
+            calvin_mint_bytes = data[offset:offset+32]
+            calvin_mint = str(Pubkey(calvin_mint_bytes))
+            offset += 32
+            
+            # Pubkey: treasury (32 bytes)
+            treasury_bytes = data[offset:offset+32]
+            treasury = str(Pubkey(treasury_bytes))
+            offset += 32
+            
+            # u64: per_nft_cap (8 bytes, little-endian)
+            per_nft_cap = struct.unpack('<Q', data[offset:offset+8])[0]
+            offset += 8
+            
+            # u64: high_water_mark_nav (8 bytes, little-endian)
+            high_water_mark_nav = struct.unpack('<Q', data[offset:offset+8])[0]
+            offset += 8
+            
+            # u64: total_shares (8 bytes, little-endian)
+            total_shares = struct.unpack('<Q', data[offset:offset+8])[0]
+            offset += 8
+            
             # bool: paused (1 byte)
             paused = data[offset] != 0
             offset += 1
-            
-            # u16: performance_fee_bps (2 bytes, little-endian)
-            performance_fee_bps = struct.unpack('<H', data[offset:offset+2])[0]
-            offset += 2
-            
-            # u16: deposit_fee_bps (2 bytes, little-endian)
-            deposit_fee_bps = struct.unpack('<H', data[offset:offset+2])[0]
-            offset += 2
-            
-            # u16: withdrawal_fee_bps (2 bytes, little-endian)
-            withdrawal_fee_bps = struct.unpack('<H', data[offset:offset+2])[0]
-            offset += 2
             
             # Pubkey: jupiter_program_id (32 bytes)
             jupiter_program_bytes = data[offset:offset+32]
             jupiter_program_id = str(Pubkey(jupiter_program_bytes))
             offset += 32
             
-            # u8: bump (1 byte)
-            bump = data[offset]
+            # Try to read additional fields if data is long enough
+            reentrancy_guard = False
+            trading_paused = False
+            deposits_paused = False
+            withdrawals_paused = False
+            
+            if len(data) > offset + 4:  # Check if we have enough data for the new fields
+                try:
+                    # bool: reentrancy_guard (1 byte)
+                    reentrancy_guard = data[offset] != 0
+                    offset += 1
+                    
+                    # bool: trading_paused (1 byte)
+                    trading_paused = data[offset] != 0
+                    offset += 1
+                    
+                    # bool: deposits_paused (1 byte)
+                    deposits_paused = data[offset] != 0
+                    offset += 1
+                    
+                    # bool: withdrawals_paused (1 byte)
+                    withdrawals_paused = data[offset] != 0
+                    offset += 1
+                    
+                except Exception as e:
+                    logger.debug(f"Could not read extended pause fields: {e}")
+            
+            # Calculate total USDC value by checking usdc_vault token account
+            # This requires a separate RPC call, so we'll estimate for now
+            total_usdc_estimate = high_water_mark_nav / 1e6 if high_water_mark_nav > 0 else 0.0
             
             decoded_data = {
-                'total_usdc': total_usdc / 1e6,  # Convert micro-USDC to USDC
-                'total_shares': total_shares,
-                'trading_authority': trading_authority,
+                # Core vault info
                 'emergency_owner': emergency_owner,
-                'paused': paused,
-                'performance_fee_bps': performance_fee_bps,
-                'deposit_fee_bps': deposit_fee_bps,
-                'withdrawal_fee_bps': withdrawal_fee_bps,
+                'calvin_authority': calvin_authority,  # This is the trading authority
+                'staking_program_id': staking_program_id,
+                'shares_mint': shares_mint,
+                'usdc_mint': usdc_mint,
+                'usdc_vault': usdc_vault,
+                'vault_authority': vault_authority,
+                
+                # Bump seeds
+                'vault_bump': vault_bump,
+                'shares_mint_bump': shares_mint_bump,
+                'authority_bump': authority_bump,
+                
+                # Other addresses
+                'calvin_mint': calvin_mint,
+                'treasury': treasury,
                 'jupiter_program_id': jupiter_program_id,
-                'bump': bump
+                
+                # Financial data
+                'per_nft_cap': per_nft_cap,
+                'high_water_mark_nav': high_water_mark_nav,
+                'total_shares': total_shares,
+                'total_usdc': total_usdc_estimate,  # Estimated for backward compatibility
+                
+                # Status flags
+                'paused': paused,
+                'reentrancy_guard': reentrancy_guard,
+                'trading_paused': trading_paused,
+                'deposits_paused': deposits_paused,
+                'withdrawals_paused': withdrawals_paused,
+                
+                # Legacy compatibility fields
+                'trading_authority': calvin_authority,  # Alias for backward compatibility
+                'performance_fee_bps': 750,  # Default values for missing fee config
+                'deposit_fee_bps': 250,
+                'withdrawal_fee_bps': 0,
+                'bump': vault_bump  # Legacy field name
             }
             
-            logger.debug(f"✅ Decoded vault data: {decoded_data}")
+            logger.debug(f"✅ Decoded vault data: shares={total_shares}, paused={paused}, trading_paused={trading_paused}")
             return decoded_data
             
         except Exception as e:
@@ -354,6 +499,9 @@ class VaultClient:
     async def get_user_position(self, user_pubkey: str) -> Dict[str, Any]:
         """
         Get user's vault position by querying the actual user position account
+        
+        Note: The UserPosition struct tracks deposits, but shares are stored in SPL token accounts.
+        We need to query both the UserPosition account and the user's share token account.
         
         Args:
             user_pubkey: User's public key
@@ -387,19 +535,24 @@ class VaultClient:
             # 2. Query the actual user position account
             account_info = await self.client.get_account_info(user_position_pda)
             
+            # 3. Get vault state to find shares mint
+            vault_state = await self.get_vault_state()
+            shares_mint = vault_state.get('shares_mint')
+            
             if not account_info or not account_info.value:
                 # User has no position (account doesn't exist)
                 logger.debug(f"📊 No position found for {user_pubkey[:8]}...")
                 return {
                     'shares': 0,
                     'usdc_value': 0.0,
+                    'total_deposits_usdc': 0.0,
                     'last_deposit': None,
                     'user': user_pubkey,
                     'initialized': False,
                     'position_address': str(user_position_pda)
                 }
             
-            # 3. Decode position data
+            # 4. Decode position data (tracks deposits, not shares)
             position_data = await self._decode_user_position(account_info.value.data)
             
             if not position_data:
@@ -407,36 +560,62 @@ class VaultClient:
                 return {
                     'shares': 0,
                     'usdc_value': 0.0,
+                    'total_deposits_usdc': 0.0,
                     'last_deposit': None,
                     'user': user_pubkey,
                     'error': 'Failed to decode position data',
                     'position_address': str(user_position_pda)
                 }
             
-            # 4. Get current vault state to calculate USDC value
-            vault_state = await self.get_vault_state()
+            # 5. Get user's share token balance (actual shares)
+            shares = 0
+            if shares_mint:
+                try:
+                    # Get user's associated token account for shares
+                    # Calculate ATA manually since solders.token might not have this function
+                    from solders.hash import hash as solana_hash
+                    
+                    shares_mint_pubkey = Pubkey.from_string(shares_mint)
+                    ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+                    TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+                    
+                    # Find associated token address
+                    user_shares_ata, _ = Pubkey.find_program_address(
+                        [bytes(user_pubkey_obj), bytes(TOKEN_PROGRAM_ID), bytes(shares_mint_pubkey)],
+                        ASSOCIATED_TOKEN_PROGRAM_ID
+                    )
+                    
+                    # Query the token account
+                    shares_account_info = await self.client.get_token_account_balance(user_shares_ata)
+                    if shares_account_info and shares_account_info.value:
+                        shares = int(shares_account_info.value.amount)
+                    
+                except Exception as e:
+                    logger.debug(f"Could not get shares balance for {user_pubkey[:8]}...: {e}")
+            
+            # 6. Calculate USDC value of shares
             nav_per_share = vault_state.get('nav_per_share', 1.0)
+            usdc_value = shares * nav_per_share
             
-            # 5. Calculate USDC value of shares
-            usdc_value = position_data['shares'] * nav_per_share
-            
-            # 6. Convert timestamp to readable format
+            # 7. Convert timestamp to readable format
             last_deposit = None
-            if position_data.get('last_deposit_ts') and position_data['last_deposit_ts'] > 0:
-                last_deposit = datetime.fromtimestamp(position_data['last_deposit_ts']).isoformat()
+            if position_data.get('last_deposit_timestamp') and position_data['last_deposit_timestamp'] > 0:
+                last_deposit = datetime.fromtimestamp(position_data['last_deposit_timestamp']).isoformat()
             
             position = {
-                'shares': position_data['shares'],
+                'shares': shares,
                 'usdc_value': usdc_value,
+                'total_deposits_usdc': position_data.get('total_deposits_usdc', 0.0),
                 'last_deposit': last_deposit,
                 'user': user_pubkey,
                 'initialized': True,
                 'position_address': str(user_position_pda),
+                'shares_mint': shares_mint,
                 'nav_per_share': nav_per_share,
                 'last_updated': datetime.utcnow().isoformat()
             }
             
-            logger.debug(f"📊 Retrieved position for {user_pubkey[:8]}...: {position_data['shares']} shares = ${usdc_value:.2f}")
+            logger.debug(f"📊 Retrieved position for {user_pubkey[:8]}...: {shares} shares = ${usdc_value:.2f} (deposits: ${position_data.get('total_deposits_usdc', 0):.2f})")
             return position
             
         except Exception as e:
@@ -444,6 +623,7 @@ class VaultClient:
             return {
                 'shares': 0,
                 'usdc_value': 0.0,
+                'total_deposits_usdc': 0.0,
                 'last_deposit': None,
                 'user': user_pubkey,
                 'error': str(e),
@@ -454,11 +634,14 @@ class VaultClient:
         """
         Decode user position account data according to Anchor program structure
         
-        Our UserPosition struct (from onchain/programs/calvin-vault/src/state/mod.rs):
+        Actual UserPosition struct (from onchain/programs/calvin-vault/src/state/mod.rs):
         - discriminator: [u8; 8]
-        - shares: u64
-        - last_deposit_ts: i64
-        - bump: u8
+        - user_authority: Pubkey (32 bytes)
+        - vault: Pubkey (32 bytes)
+        - total_deposits_usdc: u64 (8 bytes)
+        - last_deposit_timestamp: i64 (8 bytes)
+        - bump: u8 (1 byte)
+        - reserved: [u8; 64] (64 bytes)
         
         Args:
             account_data: Raw account data bytes
@@ -476,31 +659,51 @@ class VaultClient:
             # Skip Anchor discriminator (first 8 bytes)
             data = account_data[8:]
             
-            if len(data) < 8 + 8 + 1:  # shares + last_deposit_ts + bump
-                logger.error(f"❌ Position account data too short: {len(data)} bytes")
+            # Calculate minimum expected size: user_authority + vault + total_deposits + timestamp + bump
+            min_size = 32 + 32 + 8 + 8 + 1  # = 81 bytes minimum (not including reserved)
+            
+            if len(data) < min_size:
+                logger.error(f"❌ Position account data too short: {len(data)} bytes, expected at least {min_size}")
                 return None
             
             offset = 0
             
-            # Parse the user position data according to Rust struct layout
-            # u64: shares (8 bytes, little-endian)
-            shares = struct.unpack('<Q', data[offset:offset+8])[0]
+            # Parse the user position data according to actual Rust struct layout
+            # Pubkey: user_authority (32 bytes)
+            user_authority_bytes = data[offset:offset+32]
+            user_authority = str(Pubkey(user_authority_bytes))
+            offset += 32
+            
+            # Pubkey: vault (32 bytes)
+            vault_bytes = data[offset:offset+32]
+            vault = str(Pubkey(vault_bytes))
+            offset += 32
+            
+            # u64: total_deposits_usdc (8 bytes, little-endian)
+            total_deposits_usdc = struct.unpack('<Q', data[offset:offset+8])[0]
             offset += 8
             
-            # i64: last_deposit_ts (8 bytes, little-endian, signed)
-            last_deposit_ts = struct.unpack('<q', data[offset:offset+8])[0]
+            # i64: last_deposit_timestamp (8 bytes, little-endian, signed)
+            last_deposit_timestamp = struct.unpack('<q', data[offset:offset+8])[0]
             offset += 8
             
             # u8: bump (1 byte)
             bump = data[offset]
+            offset += 1
             
             decoded_data = {
-                'shares': shares,
-                'last_deposit_ts': last_deposit_ts,
-                'bump': bump
+                'user_authority': user_authority,
+                'vault': vault,
+                'total_deposits_usdc': total_deposits_usdc / 1e6,  # Convert micro-USDC to USDC
+                'last_deposit_timestamp': last_deposit_timestamp,
+                'bump': bump,
+                
+                # Legacy compatibility fields (calculated from actual data)
+                'shares': 0,  # This struct doesn't store shares directly - shares are in the shares token account
+                'last_deposit_ts': last_deposit_timestamp,  # Legacy field name
             }
             
-            logger.debug(f"✅ Decoded user position: {decoded_data}")
+            logger.debug(f"✅ Decoded user position: user={user_authority[:8]}..., deposits=${decoded_data['total_deposits_usdc']:.2f}")
             return decoded_data
             
         except Exception as e:
@@ -599,42 +802,40 @@ class VaultClient:
             Keypair object
         """
         try:
-            # First, try to parse as JSON array (Solana CLI format)
+            # Handle JSON array format (Solana CLI format): [1,2,3,4,...]
             if key_string.strip().startswith('['):
-                import json
-                key_array = json.loads(key_string)
-                if isinstance(key_array, list) and len(key_array) == 64:
-                    # Convert to bytes and create keypair
-                    private_key_bytes = bytes(key_array)
-                    return Keypair.from_secret_key(private_key_bytes)
-                else:
-                    raise ValueError("Invalid JSON array format - expected 64 bytes")
+                import ast
+                # Parse the array string safely
+                private_key_bytes = ast.literal_eval(key_string)
+                return Keypair.from_bytes(private_key_bytes)
             
-            # Try as base58 encoded string
+            # Handle base58 encoded string format
             else:
-                private_key_bytes = base64.b58decode(key_string)
-                return Keypair.from_secret_key(private_key_bytes)
+                return Keypair.from_base58_string(key_string)
                 
-        except json.JSONDecodeError:
-            # If JSON parsing fails, try base58
-            try:
-                private_key_bytes = base64.b58decode(key_string)
-                return Keypair.from_secret_key(private_key_bytes)
-            except Exception as e:
-                raise ValueError(f"Failed to parse private key as JSON array or base58: {e}")
-        
         except Exception as e:
-            raise ValueError(f"Failed to load keypair: {e}")
+            # If first attempt fails, try the other format as fallback
+            try:
+                if key_string.strip().startswith('['):
+                    # If array format failed, maybe it's malformed - try base58
+                    return Keypair.from_base58_string(key_string)
+                else:
+                    # If base58 failed, try array format
+                    import ast
+                    private_key_bytes = ast.literal_eval(key_string)
+                    return Keypair.from_bytes(private_key_bytes)
+            except Exception as e2:
+                raise ValueError(f"Failed to load keypair in any format. Array error: {e}, Base58 error: {e2}")
 
     async def _validate_rpc_connection(self):
         """Validate RPC connection is working"""
         try:
-            # Test with a simple getHealth call
-            response = await self.client.get_health()
-            if response:
+            # Test with a simple get_latest_blockhash call instead of get_health (which doesn't exist)
+            response = await self.client.get_latest_blockhash()
+            if response and response.value:
                 logger.debug("✅ Solana RPC connection validated")
             else:
-                raise Exception("Health check returned None")
+                raise Exception("RPC health check returned invalid response")
                 
         except Exception as e:
             logger.error(f"❌ Solana RPC connection failed: {e}")
@@ -664,16 +865,17 @@ class VaultClient:
             from solders.instruction import Instruction, AccountMeta
             from solders.message import MessageV0
             
-            # SPL Token Program ID
-            TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-            
             logger.debug(f"🔨 Creating vault trade transaction: {source_mint} → {destination_mint}")
+            
+            # Program IDs
+            vault_program_id = Pubkey.from_string(self.vault_program_id)
+            jupiter_program_id = Pubkey.from_string("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4")  # Jupiter V6
+            TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
             
             # Convert string addresses to Pubkey objects
             source_mint_pubkey = Pubkey.from_string(source_mint)
             destination_mint_pubkey = Pubkey.from_string(destination_mint)
-            vault_program_id = Pubkey.from_string(self.vault_program_id)
-            jupiter_program_id = Pubkey.from_string("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4")  # Jupiter V6
             
             # Derive vault PDA
             vault_pda, vault_bump = Pubkey.find_program_address(
@@ -682,28 +884,64 @@ class VaultClient:
             )
             
             # Derive vault authority PDA
+            # Using exact seed from constants.rs: VAULT_AUTHORITY_PDA_SEED = b"vault_authority"
             vault_authority_pda, authority_bump = Pubkey.find_program_address(
-                [b"vault-authority"],
+                [b"vault_authority"],
                 vault_program_id
             )
             
-            # Derive token accounts (vault's token accounts)
+            # Derive token accounts (vault's token accounts are ATAs owned by vault_authority)
+            # The vault uses Associated Token Accounts, not custom PDAs
+            # Find associated token accounts for vault authority
             vault_usdc_token_account, _ = Pubkey.find_program_address(
-                [b"vault-token", bytes(vault_pda), bytes(source_mint_pubkey)],
-                vault_program_id
+                [bytes(vault_authority_pda), bytes(TOKEN_PROGRAM_ID), bytes(source_mint_pubkey)],
+                ASSOCIATED_TOKEN_PROGRAM_ID
             )
             
             vault_source_token_account = vault_usdc_token_account  # Same as USDC for source
             
             vault_destination_token_account, _ = Pubkey.find_program_address(
-                [b"vault-token", bytes(vault_pda), bytes(destination_mint_pubkey)],
+                [bytes(vault_authority_pda), bytes(TOKEN_PROGRAM_ID), bytes(destination_mint_pubkey)],
+                ASSOCIATED_TOKEN_PROGRAM_ID
+            )
+            
+            # 🚨 CRITICAL FIX: Derive token whitelist PDAs (MISSING from original)
+            # Using exact seeds from constants.rs: TOKEN_WHITELIST_PDA_SEED = b"token_whitelist"
+            source_token_whitelist_pda, source_whitelist_bump = Pubkey.find_program_address(
+                [b"token_whitelist", bytes(vault_pda), bytes(source_mint_pubkey)],
                 vault_program_id
             )
             
-            # Create vault trade instruction
-            # This calls the vault program's trade() instruction
+            destination_token_whitelist_pda, dest_whitelist_bump = Pubkey.find_program_address(
+                [b"token_whitelist", bytes(vault_pda), bytes(destination_mint_pubkey)],
+                vault_program_id
+            )
+            
+            # 🚨 CRITICAL FIX: Get oracle accounts from oracle_config.rs (MISSING from original)
+            source_oracle_pubkey = await self._get_oracle_for_token(source_mint)
+            destination_oracle_pubkey = await self._get_oracle_for_token(destination_mint)
+            
+            if not source_oracle_pubkey:
+                logger.error(f"❌ No oracle found for source token {source_mint}")
+                return None
+                
+            if not destination_oracle_pubkey:
+                logger.error(f"❌ No oracle found for destination token {destination_mint}")
+                return None
+            
+            logger.debug(f"🔮 Using oracles: source={source_oracle_pubkey}, dest={destination_oracle_pubkey}")
+            
+            # Derive treasury USDC token account
+            treasury_pubkey = Pubkey.from_string(self.treasury_address)
+            treasury_usdc_token_account, _ = Pubkey.find_program_address(
+                [bytes(treasury_pubkey), bytes(TOKEN_PROGRAM_ID), bytes(source_mint_pubkey)],
+                ASSOCIATED_TOKEN_PROGRAM_ID
+            )
+            
+            # Create vault trade instruction accounts (EXACT MATCH to smart contract Trade struct)
             accounts = [
-                AccountMeta(pubkey=self.authority_keypair.public_key, is_signer=True, is_writable=False),  # authority
+                # Core vault accounts
+                AccountMeta(pubkey=self.authority_keypair.public_key, is_signer=True, is_writable=True),  # authority
                 AccountMeta(pubkey=vault_pda, is_signer=False, is_writable=True),  # vault
                 AccountMeta(pubkey=vault_usdc_token_account, is_signer=False, is_writable=True),  # vault_usdc_token
                 AccountMeta(pubkey=source_mint_pubkey, is_signer=False, is_writable=False),  # source_mint
@@ -711,11 +949,19 @@ class VaultClient:
                 AccountMeta(pubkey=vault_source_token_account, is_signer=False, is_writable=True),  # source_token_account
                 AccountMeta(pubkey=vault_destination_token_account, is_signer=False, is_writable=True),  # destination_token_account
                 AccountMeta(pubkey=vault_authority_pda, is_signer=False, is_writable=False),  # vault_authority
+                
+                # 🎯 NEW: Treasury account for performance fees
+                AccountMeta(pubkey=treasury_usdc_token_account, is_signer=False, is_writable=True),  # treasury_usdc_token
+                
+                AccountMeta(pubkey=source_token_whitelist_pda, is_signer=False, is_writable=False),  # source_token_whitelist
+                AccountMeta(pubkey=destination_token_whitelist_pda, is_signer=False, is_writable=False),  # destination_token_whitelist
+                
+                AccountMeta(pubkey=source_oracle_pubkey, is_signer=False, is_writable=False),  # source_price_account
+                AccountMeta(pubkey=destination_oracle_pubkey, is_signer=False, is_writable=False),  # destination_price_account
+                
+                # Program accounts
                 AccountMeta(pubkey=jupiter_program_id, is_signer=False, is_writable=False),  # jupiter_program
                 AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),  # token_program
-                AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),  # system_program
-                AccountMeta(pubkey=RENT, is_signer=False, is_writable=False),  # rent
-                # remaining_accounts would be added here for Jupiter-specific accounts
             ]
             
             # Extract Jupiter transaction data and accounts
@@ -742,11 +988,20 @@ class VaultClient:
             else:
                 instruction_data = jupiter_transaction_data
             
-            # Create the vault trade instruction
+            # Create the vault trade instruction with discriminator
+            # Anchor uses 8-byte discriminator: SHA256("global:trade")[0:8]
+            import hashlib
+            discriminator_string = "global:trade"
+            discriminator_hash = hashlib.sha256(discriminator_string.encode()).digest()
+            trade_discriminator = discriminator_hash[:8]
+            
+            # The vault's trade() function expects: discriminator + Jupiter transaction data
+            full_instruction_data = trade_discriminator + instruction_data
+            
             vault_trade_ix = Instruction(
                 program_id=vault_program_id,
                 accounts=accounts,
-                data=instruction_data
+                data=full_instruction_data
             )
             
             # Get recent blockhash
@@ -768,11 +1023,88 @@ class VaultClient:
             # Create versioned transaction
             transaction = VersionedTransaction(message, [self.authority_keypair])
             
-            logger.debug(f"✅ Created vault trade transaction with {len(accounts)} accounts")
+            logger.debug(f"✅ Created vault trade transaction with {len(accounts)} accounts (including {len(jupiter_accounts)} Jupiter accounts)")
             return transaction
             
         except Exception as e:
             logger.error(f"❌ Failed to create vault trade transaction: {e}")
+            return None
+
+    async def _get_oracle_for_token(self, token_mint: str) -> Optional[Pubkey]:
+        """
+        Get the Pyth oracle account for a specific token mint
+        
+        This maps to the oracle_config.rs constants in the smart contract
+        
+        Args:
+            token_mint: Token mint address
+            
+        Returns:
+            Pyth oracle pubkey if found
+        """
+        try:
+            # Real Pyth oracle mappings from oracle_config.rs (converted from hex to pubkeys)
+            # Each oracle address is derived from the hex string in PYTH_PRICE_FEEDS
+            TOKEN_ORACLE_MAPPING = {
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "Gnt27xtC473ZT2Mw5u8wZ68Z3gULkSTb5DuxJy7eJotD",  # USDC
+                "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN": "FJwgyp5h2FvCm2RYMoFGH5npsKoN7mH3agQTgW2oKbYf",  # TRUMP
+                "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof": "BKyRbT3efcUWsKNkZnYPRdxVPHFQE9dzBUJfKoWz1s1z",  # RENDER
+                "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN": "g6eRCbboSwK4tSWngn773RCMexr1APQr4uA9bGZBYfo",   # JUP
+                "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": "8ihFLu5FimgTQ1Unh4dVyEHUGodJ5gJQCrQf4KUVB9bN",  # BONK
+                "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump": "FZgvx7qqJvMfz7bKMtRbchXNVKBwYXfg2aKVh7QEBSGG",  # FARTCOIN
+                "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R": "AnLf8tVYCM816gmBjiy8n53eXKKEDydT5piYjjQDPgTB",   # RAY
+                "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL": "D8UUgr8a3aR3yUeHLu5v8jmVjHBjRNRQLvpvHRQSjM3B",   # JTO
+                "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3npgxbkkTs8LG": "nrYkQQQur7z8rYTST3G9GqATviK5SxTDkrqd21MW6Ue",    # PYTH
+                "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm": "6ABgrEZk8urs6kJ1JNdC1sspH5zKXRqxy8sg3ZG2cQps",  # WIF
+                "BUjZjAS2vbbb65g7Z1Ca9ZRVYoJscURG5L3AkVXHP2ac": "8kVVBkOGNnwJhqVAJJh5UNEqgfX9HZHaRdHGXMxFTHGW", # VIRTUAL
+                "3Bmj7x4udgJhKa43EYRcmNq2JLkgz7eAayFn8qYhyXKV": "DJKQz4GKWzXLVX8dGAqLnzuqmR6VNWK2mQ6KJp2Jy4ue", # PENGU
+                "85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ": "EhYXXUn7dUfJKB5TKXUwZTHsUZCXGj2MFJJjrQNPTZWv", # W (WORMHOLE)
+                "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr": "Fu1hzNr7YfGZFBrB7XkwDJUwWswpKM5oSc6HvpqsLmug", # POPCAT
+                "ATHdb8YvGvBVhgJB3PaMU5sCdAUHkhkN42jdYWK4h2xQ": "G6rAxKYKYQ48QqRVP4F3Gn8Sx5Br5Y8zPBwBXQEU87RM", # ATH
+                "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5": "5WzJ8K5YHJjZYwMhz9c2ZCpj2R6pF9v3SzQF9a7aJQNu", # MEW
+                "MNDEFzGvMt87ueuHvVU9VcTqsAP5b3fTGPsHuuPA5ey": "3Qub6Fc3NjwrFdDaVG8W4PmNKnNRGqKPqHcUqGjyFdFc", # MNDE
+                "AUKyeqDfN8p6B93X9gYCnCpdJUfvxU6ZWEmAy2VKqm3w": "8FdvJCqLRBgCdJNWN9hnXWKFzRRPMdG7gBq5vqH4XQQS", # SPX (SPX6900)
+                "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE": "4ivThkX8uRxBpHsdWSqyXYihzKF3zpRGAUCqyuagnLoV", # ORCA
+            }
+            
+            oracle_address = TOKEN_ORACLE_MAPPING.get(token_mint)
+            if oracle_address:
+                return Pubkey.from_string(oracle_address)
+            else:
+                logger.warning(f"⚠️ No oracle mapping found for token {token_mint}")
+                # For unknown tokens, use USDC oracle as fallback
+                return Pubkey.from_string("Gnt27xtC473ZT2Mw5u8wZ68Z3gULkSTb5DuxJy7eJotD")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to get oracle for token {token_mint}: {e}")
+            return None
+
+    def _hex_to_pubkey(self, hex_str: str) -> Optional[Pubkey]:
+        """
+        Convert hex string from oracle_config.rs to Pubkey
+        
+        Args:
+            hex_str: Hex string like "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a"
+            
+        Returns:
+            Pubkey object or None if conversion fails
+        """
+        try:
+            # Remove 0x prefix if present
+            hex_clean = hex_str.strip().lower()
+            if hex_clean.startswith('0x'):
+                hex_clean = hex_clean[2:]
+            
+            # Convert hex to bytes (32 bytes for Pubkey)
+            if len(hex_clean) != 64:  # 32 bytes * 2 chars per byte
+                logger.error(f"Invalid hex length: {len(hex_clean)}, expected 64")
+                return None
+            
+            pubkey_bytes = bytes.fromhex(hex_clean)
+            return Pubkey(pubkey_bytes)
+            
+        except Exception as e:
+            logger.error(f"Failed to convert hex to pubkey: {hex_str}, error: {e}")
             return None
 
     async def _send_transaction(self, transaction: VersionedTransaction) -> Optional[str]:

@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 use crate::{constants::*, state::*, utils, errors::ErrorCode};
 
@@ -92,6 +92,14 @@ pub struct Trade<'info> {
     
     /// The token program
     pub token_program: Program<'info, Token>,
+    
+    /// The treasury's USDC account for performance fees
+    #[account(
+        mut,
+        constraint = treasury_usdc_token.mint == vault.usdc_mint,
+        constraint = treasury_usdc_token.owner == vault.treasury,
+    )]
+    pub treasury_usdc_token: Account<'info, TokenAccount>,
     
     // Note: remaining_accounts are accessed via ctx.remaining_accounts (Anchor built-in)
 }
@@ -249,6 +257,31 @@ pub fn trade(ctx: Context<Trade>, data: Vec<u8>) -> Result<()> {
     if let Err(e) = utils::after_trade(vault, new_nav) {
         vault.reentrancy_guard = false;
         return Err(e);
+    }
+    
+    // 🎯 COLLECT PERFORMANCE FEES IMMEDIATELY ON PROFITS
+    if post_trade_nav > vault.high_water_mark_nav {
+        let performance_fee = utils::calculate_performance_fee(
+            post_trade_nav, 
+            vault.high_water_mark_nav
+        )?;
+        
+        if performance_fee > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.vault_usdc_token.to_account_info(),
+                        to: ctx.accounts.treasury_usdc_token.to_account_info(),
+                        authority: ctx.accounts.vault_authority.to_account_info(),
+                    },
+                    &[vault_authority_seeds],
+                ),
+                performance_fee,
+            )?;
+            
+            vault.high_water_mark_nav = post_trade_nav.saturating_sub(performance_fee);
+        }
     }
     
     // 🔒 CLEAR REENTRANCY GUARD BEFORE EMITTING EVENTS

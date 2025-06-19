@@ -21,7 +21,8 @@ from enum import Enum
 import time
 
 from ..data.websocket_feed import BirdEyeWebSocketFeed, ConnectionConfig, PriceSubscription, PriceUpdate, ConnectionState
-from ..trading.position_manager import PositionManager, Position
+from ..trading.position_manager import PositionManager
+from ..database.production_db import PositionData
 from .vault_client import VaultClient
 from ..config.config import config
 from ..utils.logger import log
@@ -153,113 +154,302 @@ class EmergencyStopLossMonitor:
         """Initialize emergency monitoring components"""
         try:
             # Initialize database manager
-            self.db_manager = await get_db_manager()
+            if not self.db_manager:
+                from ..database.production_db import get_db_manager
+                self.db_manager = await get_db_manager()
             
             # Initialize vault client
             await self.vault_client.initialize()
-            logger.info("✅ Vault client initialized for emergency monitoring")
             
-            # Initialize WebSocket feed
-            api_key = config.get('BIRDEYE_API_KEY')
-            if not api_key:
-                raise ValueError("BIRDEYE_API_KEY is required for emergency monitoring")
+            # Initialize position manager
+            await self.position_manager.initialize()
             
-            ws_config = ConnectionConfig(
-                api_key=api_key,
-                chain="solana",
-                reconnect_delay=2.0,
-                max_reconnect_attempts=10,  # More attempts for emergency monitoring
-                heartbeat_interval=30.0,
-                message_queue_size=2000     # Larger queue for price updates
-            )
+            # 🆕 RECOVER EMERGENCY STATE FROM DATABASE
+            await self._recover_emergency_state()
             
-            self.websocket_feed = BirdEyeWebSocketFeed(ws_config)
-            
-            # Set up WebSocket event handlers
-            self.websocket_feed.add_price_update_handler(self._on_price_update)
-            self.websocket_feed.add_connection_handler(self._on_connection_state_change)
-            self.websocket_feed.add_error_handler(self._on_websocket_error)
-            
-            logger.info("✅ Emergency monitoring initialized")
+            logger.info("✅ Emergency Monitor initialized with state recovery")
             
         except Exception as e:
-            logger.error(f"❌ Failed to initialize emergency monitoring: {e}")
+            logger.error(f"Failed to initialize Emergency Monitor: {e}")
             raise
 
-    async def start_monitoring(self, vault_positions: Optional[Dict[str, Position]] = None):
-        """
-        Start emergency monitoring for vault positions
-        
-        Args:
-            vault_positions: Optional dict of positions to monitor. If None, will fetch from position manager
-        """
+    async def _recover_emergency_state(self):
+        """Recover emergency monitor state from database after restart"""
+        try:
+            # 1. Recover daily emergency exit count from today's emergency events
+            await self._recover_daily_exit_count()
+            
+            # 2. Recover active emergency monitoring settings from health checks
+            await self._recover_monitoring_settings()
+            
+            logger.info("✅ Emergency Monitor state recovered from database")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Emergency state recovery failed (starting fresh): {e}")
+            # Continue with default state - not critical for operation
+    
+    async def _recover_daily_exit_count(self):
+        """Recover today's emergency exit count from emergency_events table"""
+        try:
+            # Query today's emergency events that resulted in exits
+            query = """
+                SELECT COUNT(*)
+                FROM emergency_events 
+                WHERE event_timestamp >= CURRENT_DATE
+                  AND action_taken IN ('position_exit', 'portfolio_exit', 'emergency_liquidation')
+                  AND action_successful = true
+            """
+            
+            async with self.db_manager.pg_pool.acquire() as conn:
+                row = await conn.fetchrow(query)
+                
+            if row:
+                self.emergency_exits_today = row['count']
+                logger.info(f"🔄 Recovered daily emergency exits: {self.emergency_exits_today}/{self.thresholds.max_daily_exits}")
+                
+                # Log warning if approaching limit
+                if self.emergency_exits_today >= self.thresholds.max_daily_exits * 0.8:
+                    logger.warning(f"⚠️ Daily emergency exits approaching limit: {self.emergency_exits_today}/{self.thresholds.max_daily_exits}")
+                
+        except Exception as e:
+            logger.warning(f"Failed to recover daily exit count: {e}")
+            self.emergency_exits_today = 0
+    
+    async def _recover_monitoring_settings(self):
+        """Recover emergency monitoring settings from health checks"""
+        try:
+            # Query recent emergency monitor health check to get last known state
+            query = """
+                SELECT details
+                FROM system_health 
+                WHERE component = 'emergency_monitor'
+                  AND status = 'healthy'
+                  AND check_time >= NOW() - INTERVAL '6 hours'
+                ORDER BY check_time DESC
+                LIMIT 1
+            """
+            
+            async with self.db_manager.pg_pool.acquire() as conn:
+                row = await conn.fetchrow(query)
+                
+            if row and row['details']:
+                # Parse JSON string from database
+                import json
+                try:
+                    if isinstance(row['details'], str):
+                        state_data = json.loads(row['details'])
+                    else:
+                        state_data = row['details']  # Already parsed
+                    
+                    # Restore monitoring statistics if available (using the correct stats attribute)
+                    if isinstance(state_data, dict):
+                        self.stats.update({
+                            'total_alerts_today': state_data.get('total_alerts_today', 0),
+                            'portfolio_checks_today': state_data.get('portfolio_checks_today', 0),
+                            'position_checks_today': state_data.get('position_checks_today', 0)
+                        })
+                        
+                        logger.info(f"🔄 Recovered emergency monitoring stats: {self.stats['total_alerts_today']} alerts today")
+                    else:
+                        logger.warning(f"⚠️ Invalid state data format: {type(state_data)}")
+                        
+                except (json.JSONDecodeError, TypeError) as json_error:
+                    logger.warning(f"⚠️ Failed to parse monitoring settings JSON: {json_error}")
+                    # Continue with default settings
+                
+        except Exception as e:
+            logger.warning(f"Failed to recover monitoring settings: {e}")
+            # Use default settings
+
+    async def start_monitoring(self, vault_positions: Optional[Dict[str, PositionData]] = None):
+        """Start emergency monitoring with enhanced startup validation"""
         try:
             if self.is_monitoring:
-                logger.warning("⚠️ Emergency monitoring already running")
+                logger.warning("Emergency monitoring is already running")
                 return
-            
+
             logger.info("🚨 Starting emergency stop loss monitoring...")
             
-            # Get vault positions to monitor
-            if vault_positions is None:
+            # Enhanced startup validation
+            startup_issues = await self._validate_startup_conditions()
+            if startup_issues:
+                for issue in startup_issues:
+                    logger.warning(f"⚠️ Startup validation issue: {issue}")
+            
+            # Attempt to recover from previous state
+            await self._recover_emergency_state()
+            
+            # Get vault positions (with improved error handling)
+            if not vault_positions:
                 vault_positions = await self._get_vault_positions()
             
             if not vault_positions:
                 logger.warning("⚠️ No vault positions found to monitor")
+                # Still start monitoring for future positions
+                self.is_monitoring = True
                 return
             
             # Setup position monitors
             await self._setup_position_monitors(vault_positions)
             
-            # Subscribe to price feeds for all position tokens
+            # Subscribe to price feeds
             await self._subscribe_to_position_prices()
-            
-            # Start WebSocket feed
-            if self.websocket_feed:
-                await self.websocket_feed.start()
-                logger.info("✅ WebSocket price feed started")
             
             # Start monitoring tasks
             self.is_monitoring = True
-            monitoring_tasks = [
-                asyncio.create_task(self._portfolio_monitoring_loop()),
-                asyncio.create_task(self._health_monitoring_loop()),
-                asyncio.create_task(self._statistics_update_loop())
-            ]
             
-            logger.info(f"🔥 Emergency monitoring active for {len(vault_positions)} positions")
+            # Start monitoring loops with error recovery
+            asyncio.create_task(self._position_monitoring_loop_with_recovery())
+            asyncio.create_task(self._portfolio_monitoring_loop_with_recovery())
+            asyncio.create_task(self._health_monitoring_loop_with_recovery())
+            asyncio.create_task(self._statistics_update_loop_with_recovery())
             
-            # Wait for monitoring tasks
-            await asyncio.gather(*monitoring_tasks, return_exceptions=True)
+            logger.info(f"✅ Emergency monitoring started with {len(self.position_monitors)} positions")
             
         except Exception as e:
-            logger.error(f"❌ Emergency monitoring failed to start: {e}")
-            await self.stop_monitoring()
+            logger.error(f"❌ Failed to start emergency monitoring: {e}")
+            self.is_monitoring = False
             raise
 
-    async def stop_monitoring(self):
-        """Stop emergency monitoring"""
-        logger.info("🛑 Stopping emergency stop loss monitoring...")
-        
-        self.is_monitoring = False
+    async def _validate_startup_conditions(self) -> List[str]:
+        """Validate startup conditions and return list of issues"""
+        issues = []
         
         try:
-            # Stop WebSocket feed
-            if self.websocket_feed:
-                await self.websocket_feed.stop()
-                logger.info("✅ WebSocket feed stopped")
+            # Check database connectivity
+            if not self.db_manager:
+                try:
+                    from ..database.production_db import get_db_manager
+                    self.db_manager = await asyncio.wait_for(get_db_manager(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    issues.append("Database manager initialization timed out")
+                except Exception as e:
+                    issues.append(f"Database manager initialization failed: {e}")
             
-            # Close database connections
             if self.db_manager:
-                await self.db_manager.close()
+                try:
+                    health_ok = await asyncio.wait_for(self.db_manager.health_check(), timeout=5.0)
+                    if not health_ok:
+                        issues.append("Database health check failed")
+                except asyncio.TimeoutError:
+                    issues.append("Database health check timed out")
+                except Exception as e:
+                    issues.append(f"Database health check error: {e}")
             
-            # Close vault client
-            await self.vault_client.close()
+            # Check vault client connectivity
+            try:
+                vault_state = await asyncio.wait_for(self.vault_client.get_vault_state(), timeout=10.0)
+                if vault_state.get('error'):
+                    issues.append(f"Vault state error: {vault_state['error']}")
+                if not vault_state.get('initialized', False):
+                    issues.append("Vault is not initialized")
+            except asyncio.TimeoutError:
+                issues.append("Vault state query timed out")
+            except Exception as e:
+                issues.append(f"Vault client error: {e}")
             
-            logger.info("🏁 Emergency monitoring stopped")
-            
+            # Check WebSocket feed
+            if self.websocket_feed:
+                try:
+                    connection_state = getattr(self.websocket_feed, 'connection_state', None)
+                    if connection_state != ConnectionState.CONNECTED:
+                        issues.append(f"WebSocket not connected: {connection_state}")
+                except Exception as e:
+                    issues.append(f"WebSocket state check error: {e}")
+            else:
+                issues.append("WebSocket feed not available")
+                
         except Exception as e:
-            logger.error(f"❌ Error stopping emergency monitoring: {e}")
+            issues.append(f"Startup validation error: {e}")
+        
+        return issues
+
+    async def _position_monitoring_loop_with_recovery(self):
+        """Position monitoring loop with error recovery"""
+        while self.is_monitoring:
+            try:
+                await asyncio.sleep(self.thresholds.price_check_interval)
+                
+                # Check individual stop losses for all positions
+                for symbol in list(self.position_monitors.keys()):
+                    try:
+                        await self._check_individual_stop_loss(symbol)
+                    except Exception as e:
+                        logger.error(f"Error checking stop loss for {symbol}: {e}")
+                        # Continue with other positions
+                        continue
+                
+            except Exception as e:
+                logger.error(f"Position monitoring loop error: {e}")
+                await asyncio.sleep(30)  # Longer delay on error
+
+    async def _portfolio_monitoring_loop_with_recovery(self):
+        """Portfolio monitoring loop with error recovery"""
+        while self.is_monitoring:
+            try:
+                await asyncio.sleep(self.thresholds.portfolio_check_interval)
+                
+                await self._check_portfolio_stop_loss()
+                await self._check_volatility_conditions()
+                await self._update_portfolio_stats()
+                
+            except Exception as e:
+                logger.error(f"Portfolio monitoring loop error: {e}")
+                await asyncio.sleep(60)  # Longer delay on error
+
+    async def _health_monitoring_loop_with_recovery(self):
+        """Health monitoring loop with error recovery"""
+        while self.is_monitoring:
+            try:
+                await asyncio.sleep(self.thresholds.health_check_interval)
+                
+                # Check WebSocket connection health
+                if self.websocket_feed and self.websocket_feed.connection_state != ConnectionState.CONNECTED:
+                    logger.warning("⚠️ WebSocket connection not healthy - attempting reconnect")
+                
+                # Check database connectivity
+                if self.db_manager:
+                    try:
+                        db_healthy = await asyncio.wait_for(self.db_manager.health_check(), timeout=5.0)
+                        if not db_healthy:
+                            logger.warning("⚠️ Database health check failed")
+                    except asyncio.TimeoutError:
+                        logger.warning("⚠️ Database health check timed out")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Database health check error: {e}")
+                
+                # Log health status
+                logger.debug(f"💊 Emergency monitor health: {len(self.position_monitors)} positions, {len(self.subscribed_tokens)} subscriptions")
+                
+                self.last_health_check = datetime.utcnow()
+                
+            except Exception as e:
+                logger.error(f"❌ Health monitoring error: {e}")
+                await asyncio.sleep(30)
+
+    async def _statistics_update_loop_with_recovery(self):
+        """Statistics update loop with error recovery"""
+        while self.is_monitoring:
+            try:
+                await asyncio.sleep(60)  # Update every minute
+                
+                # Update portfolio value
+                portfolio_value = sum(
+                    monitor.current_price * monitor.position_size 
+                    for monitor in self.position_monitors.values()
+                )
+                
+                self.stats['last_portfolio_value'] = portfolio_value
+                
+                # Track drawdown
+                if portfolio_value > 0:
+                    portfolio_pnl = await self._calculate_portfolio_pnl()
+                    if portfolio_pnl < self.stats['max_drawdown_today']:
+                        self.stats['max_drawdown_today'] = portfolio_pnl
+                
+            except Exception as e:
+                logger.error(f"❌ Statistics update error: {e}")
+                await asyncio.sleep(60)  # Continue despite errors
 
     async def _on_price_update(self, price_update: PriceUpdate):
         """Handle incoming price updates from WebSocket"""
@@ -307,25 +497,17 @@ class EmergencyStopLossMonitor:
             logger.error(f"❌ Individual stop loss check failed for {symbol}: {e}")
 
     async def _portfolio_monitoring_loop(self):
-        """Main portfolio monitoring loop"""
+        """Original portfolio monitoring loop for backward compatibility"""
         while self.is_monitoring:
             try:
                 await asyncio.sleep(self.thresholds.portfolio_check_interval)
                 
-                # Check portfolio-level stop loss
                 await self._check_portfolio_stop_loss()
-                
-                # Check volatility conditions
                 await self._check_volatility_conditions()
-                
-                # Update portfolio statistics
-                await self._update_portfolio_stats()
-                
-                self.last_portfolio_check = datetime.utcnow()
                 
             except Exception as e:
                 logger.error(f"❌ Portfolio monitoring loop error: {e}")
-                await asyncio.sleep(10)  # Brief pause before retry
+                await asyncio.sleep(60)
 
     async def _check_portfolio_stop_loss(self):
         """Check portfolio-level stop loss conditions"""
@@ -467,7 +649,7 @@ class EmergencyStopLossMonitor:
             event.action_taken = f"portfolio_exit_error: {str(e)}"
             await self._record_emergency_event(event)
 
-    async def _setup_position_monitors(self, vault_positions: Dict[str, Position]):
+    async def _setup_position_monitors(self, vault_positions: Dict[str, PositionData]):
         """Setup position monitors for vault positions"""
         self.position_monitors.clear()
         
@@ -492,10 +674,18 @@ class EmergencyStopLossMonitor:
             logger.error("❌ No WebSocket feed available")
             return
         
+        subscription_count = 0
         for symbol in self.position_monitors.keys():
             try:
-                # Get token address from database
-                token_info = await self.db_manager.get_token_by_symbol(symbol)
+                # Get token address from database with error handling
+                token_info = None
+                try:
+                    if self.db_manager:
+                        token_info = await self.db_manager.get_token_by_symbol(symbol)
+                except Exception as db_error:
+                    logger.warning(f"Database error getting token info for {symbol}: {db_error}")
+                    continue
+                
                 if token_info:
                     subscription = PriceSubscription(
                         query_type="simple",
@@ -504,32 +694,125 @@ class EmergencyStopLossMonitor:
                         currency="usd"
                     )
                     
-                    success = await self.websocket_feed.subscribe_price(subscription)
-                    if success:
-                        self.subscribed_tokens.add(symbol)
-                        logger.debug(f"✅ Subscribed to {symbol} price updates")
-                    else:
-                        logger.warning(f"⚠️ Failed to subscribe to {symbol} prices")
+                    try:
+                        success = await self.websocket_feed.subscribe_price(subscription)
+                        if success:
+                            self.subscribed_tokens.add(symbol)
+                            subscription_count += 1
+                            logger.debug(f"✅ Subscribed to {symbol} price updates")
+                        else:
+                            logger.warning(f"⚠️ Failed to subscribe to {symbol} prices")
+                    except Exception as sub_error:
+                        logger.warning(f"Subscription error for {symbol}: {sub_error}")
                 else:
                     logger.warning(f"⚠️ Token address not found for {symbol}")
                     
             except Exception as e:
                 logger.error(f"❌ Failed to subscribe to {symbol} prices: {e}")
         
-        logger.info(f"📡 Subscribed to {len(self.subscribed_tokens)} token price feeds")
+        logger.info(f"📡 Subscribed to {subscription_count} token price feeds")
 
-    async def _get_vault_positions(self) -> Dict[str, Position]:
+    async def _get_vault_positions(self) -> Dict[str, PositionData]:
         """Get current vault positions from position manager"""
         try:
-            # This would integrate with the position manager to get active vault positions
-            # For now, return empty dict as placeholder
             positions = {}
             
-            # In real implementation, this would:
-            # 1. Query vault client for user positions
-            # 2. Convert to Position objects
-            # 3. Return dict of symbol -> Position
+            # Get vault state to check if we have any token positions
+            vault_state = None
+            try:
+                vault_state = await self.vault_client.get_vault_state()
+            except Exception as vault_error:
+                logger.warning(f"Failed to get vault state: {vault_error}")
+                # Continue with empty vault state for graceful degradation
+                vault_state = {'paused': True, 'initialized': False}
             
+            if not vault_state or vault_state.get('paused', True) or not vault_state.get('initialized', False):
+                logger.debug("Vault is paused, not initialized, or unavailable - no positions to monitor")
+                return positions
+            
+            # Ensure database manager is available with connection retry
+            if not self.db_manager:
+                try:
+                    from ..database.production_db import get_db_manager
+                    self.db_manager = await get_db_manager()
+                except Exception as db_init_error:
+                    logger.error(f"Failed to initialize database manager: {db_init_error}")
+                    return positions
+            
+            # Get active positions from position manager
+            if hasattr(self.position_manager, 'get_active_positions'):
+                try:
+                    open_positions = self.position_manager.get_active_positions()
+                    
+                    for position_id, position_data in open_positions.items():
+                        # Get token symbol from database with error handling
+                        if hasattr(position_data, 'token_id'):
+                            try:
+                                token_info = await self.db_manager.get_token_by_id(position_data.token_id)
+                                if token_info:
+                                    symbol = token_info.get('symbol', f'TOKEN_{position_data.token_id}')
+                                    
+                                    # Create Position object for emergency monitoring
+                                    from ..trading.position_manager import Position
+                                    position = Position(
+                                        symbol=symbol,
+                                        size=getattr(position_data, 'size', 0.0),
+                                        average_price=getattr(position_data, 'average_price', 0.0),
+                                        current_price=getattr(position_data, 'current_price', 0.0),
+                                        unrealized_pnl=getattr(position_data, 'unrealized_pnl_usdc', 0.0),
+                                        entry_time=getattr(position_data, 'entry_time', datetime.utcnow())
+                                    )
+                                    
+                                    positions[symbol] = position
+                                    logger.debug(f"📊 Found vault position: {symbol} - ${position.size:.2f} @ ${position.average_price:.6f}")
+                            except Exception as token_error:
+                                logger.warning(f"Failed to get token info for position {position_id}: {token_error}")
+                                continue
+                except Exception as position_error:
+                    logger.warning(f"Failed to get active positions from position manager: {position_error}")
+            
+            # Alternative: Query vault client directly for token balances
+            if not positions and hasattr(self.vault_client, 'get_vault_token_balances'):
+                try:
+                    token_balances = await self.vault_client.get_vault_token_balances()
+                    
+                    for token_address, balance_info in token_balances.items():
+                        if balance_info.get('balance', 0) > 0:
+                            # Get token info from database with error handling
+                            try:
+                                token_info = await self.db_manager.get_token_by_address(token_address)
+                                if token_info:
+                                    symbol = token_info.get('symbol', token_address[:8])
+                                    
+                                    # Get current price with fallback
+                                    current_price = 0.0
+                                    try:
+                                        current_price = await self.db_manager.get_latest_price(token_info['token_id'])
+                                        current_price = current_price or 0.0
+                                    except Exception as price_error:
+                                        logger.debug(f"Could not get current price for {symbol}: {price_error}")
+                                    
+                                    # Create position from vault balance
+                                    from ..trading.position_manager import Position
+                                    position = Position(
+                                        symbol=symbol,
+                                        size=balance_info['balance'],
+                                        average_price=balance_info.get('average_price', current_price),
+                                        current_price=current_price,
+                                        unrealized_pnl=0.0,  # Will be calculated
+                                        entry_time=datetime.utcnow()
+                                    )
+                                    
+                                    positions[symbol] = position
+                                    logger.debug(f"📊 Found vault token balance: {symbol} - {balance_info['balance']:.6f} tokens")
+                            except Exception as token_error:
+                                logger.warning(f"Failed to get token info for address {token_address}: {token_error}")
+                                continue
+                                
+                except Exception as balance_error:
+                    logger.debug(f"Could not get vault token balances: {balance_error}")
+            
+            logger.info(f"📊 Retrieved {len(positions)} vault positions for emergency monitoring")
             return positions
             
         except Exception as e:
@@ -616,48 +899,6 @@ class EmergencyStopLossMonitor:
         except Exception as e:
             logger.error(f"❌ Failed to record emergency event: {e}")
 
-    async def _health_monitoring_loop(self):
-        """Health monitoring loop"""
-        while self.is_monitoring:
-            try:
-                await asyncio.sleep(self.thresholds.health_check_interval)
-                
-                # Check WebSocket connection health
-                if self.websocket_feed and self.websocket_feed.connection_state != ConnectionState.CONNECTED:
-                    logger.warning("⚠️ WebSocket connection not healthy - attempting reconnect")
-                
-                # Log health status
-                logger.debug(f"💊 Emergency monitor health: {len(self.position_monitors)} positions, {len(self.subscribed_tokens)} subscriptions")
-                
-                self.last_health_check = datetime.utcnow()
-                
-            except Exception as e:
-                logger.error(f"❌ Health monitoring error: {e}")
-                await asyncio.sleep(30)
-
-    async def _statistics_update_loop(self):
-        """Update statistics periodically"""
-        while self.is_monitoring:
-            try:
-                await asyncio.sleep(60)  # Update every minute
-                
-                # Update portfolio value
-                portfolio_value = sum(
-                    monitor.current_price * monitor.position_size 
-                    for monitor in self.position_monitors.values()
-                )
-                
-                self.stats['last_portfolio_value'] = portfolio_value
-                
-                # Track drawdown
-                if portfolio_value > 0:
-                    portfolio_pnl = await self._calculate_portfolio_pnl()
-                    if portfolio_pnl < self.stats['max_drawdown_today']:
-                        self.stats['max_drawdown_today'] = portfolio_pnl
-                
-            except Exception as e:
-                logger.error(f"❌ Statistics update error: {e}")
-
     async def _update_portfolio_stats(self):
         """Update portfolio statistics"""
         try:
@@ -669,6 +910,9 @@ class EmergencyStopLossMonitor:
             
             self.portfolio_value_history.append((current_time, portfolio_value))
             
+            # Store portfolio monitoring data in database
+            await self._store_portfolio_monitoring_data(current_time, portfolio_value)
+            
             # Keep only last 24 hours
             cutoff_time = current_time - timedelta(hours=24)
             self.portfolio_value_history = [
@@ -677,6 +921,37 @@ class EmergencyStopLossMonitor:
             
         except Exception as e:
             logger.error(f"❌ Portfolio stats update failed: {e}")
+
+    async def _store_portfolio_monitoring_data(self, timestamp: datetime, portfolio_value: float):
+        """Store portfolio monitoring data in database"""
+        try:
+            if not self.db_manager:
+                return
+            
+            # Calculate portfolio P&L
+            portfolio_pnl_pct = await self._calculate_portfolio_pnl()
+            
+            # Store monitoring data
+            monitoring_data = {
+                'timestamp': timestamp.isoformat(),
+                'portfolio_value': portfolio_value,
+                'portfolio_pnl_pct': portfolio_pnl_pct,
+                'positions_monitored': len(self.position_monitors),
+                'emergency_exits_today': self.emergency_exits_today,
+                'max_drawdown_today': self.stats.get('max_drawdown_today', 0.0)
+            }
+            
+            # Record in system health for monitoring
+            await self.db_manager.record_health_check(
+                'emergency_portfolio_monitoring',
+                'updated',
+                monitoring_data
+            )
+            
+            logger.debug(f"📊 Stored portfolio monitoring data: ${portfolio_value:.2f} ({portfolio_pnl_pct:+.2f}%)")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to store portfolio monitoring data: {e}")
 
     def _on_connection_state_change(self, state: ConnectionState):
         """Handle WebSocket connection state changes"""
@@ -747,4 +1022,37 @@ class EmergencyStopLossMonitor:
             
         except Exception as e:
             logger.error(f"❌ Manual emergency exit failed for {symbol}: {e}")
-            return False 
+            return False
+
+    async def stop_monitoring(self):
+        """Stop emergency monitoring with proper cleanup"""
+        logger.info("🛑 Stopping emergency stop loss monitoring...")
+        
+        self.is_monitoring = False
+        
+        try:
+            # Stop WebSocket feed
+            if self.websocket_feed:
+                try:
+                    await self.websocket_feed.stop()
+                    logger.info("✅ WebSocket feed stopped")
+                except Exception as e:
+                    logger.warning(f"Error stopping WebSocket feed: {e}")
+            
+            # Close database connections
+            if self.db_manager:
+                try:
+                    await self.db_manager.close()
+                except Exception as e:
+                    logger.warning(f"Error closing database manager: {e}")
+            
+            # Close vault client
+            try:
+                await self.vault_client.close()
+            except Exception as e:
+                logger.warning(f"Error closing vault client: {e}")
+            
+            logger.info("🏁 Emergency monitoring stopped")
+            
+        except Exception as e:
+            logger.error(f"❌ Error stopping emergency monitoring: {e}") 

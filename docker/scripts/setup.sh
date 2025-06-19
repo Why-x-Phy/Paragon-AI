@@ -36,7 +36,7 @@ log_error() {
 
 # Load environment variables
 load_environment() {
-    local env_file="$PROJECT_ROOT/.env.dev"
+    local env_file="$PROJECT_ROOT/.env"
     
     if [[ -f "$env_file" ]]; then
         log_info "Loading environment from $env_file"

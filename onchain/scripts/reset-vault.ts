@@ -3,78 +3,116 @@ import { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransa
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import fs from 'fs';
 
-// Program IDs
-const VAULT_PROGRAM_ID = new PublicKey("2nLsDVW67Qw5LXGvaTzUQ7xRxytY52APWJAz2c7aqqyJ");
-const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+// ✅ CORRECT Program IDs for devnet
+const STAKING_PROGRAM_ID = new PublicKey("BMeQT4VD9X4RFYT8MAmofKJk14dFyFrBWqJJzTeNgGtW");
+const VAULT_PROGRAM_ID = new PublicKey("7rky4NGhHtUREVJLKnAKwapDBmzCMbEno6VDcFZXyWxA");
+const USDC_MINT = new PublicKey("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
 
 async function resetVault() {
-  console.log("🧹 Resetting corrupted vault account...");
+  console.log("🧹 Analyzing vault account state...");
   
   // Set up connection and authority
-  const connection = new Connection("https://api.devnet.solana.com", "confirmed");
+  const connection = new Connection("https://devnet.helius-rpc.com/?api-key=acfda155-4d7f-4930-8ac4-ddd9eebfb70d", "confirmed");
   
   // Load authority keypair
-  const authorityPath = "/home/lincolnb/.config/solana/id.json";
+  const authorityPath = "./devnet-test.json";
   const authorityKeypair = anchor.web3.Keypair.fromSecretKey(
     new Uint8Array(JSON.parse(fs.readFileSync(authorityPath, "utf8")))
   );
   
   console.log("Authority:", authorityKeypair.publicKey.toBase58());
+  console.log("Vault Program:", VAULT_PROGRAM_ID.toBase58());
+  console.log("Staking Program:", STAKING_PROGRAM_ID.toBase58());
   
-  // Calculate the existing corrupted vault PDA (using old seeds)
-  const [oldVault] = PublicKey.findProgramAddressSync(
-    [Buffer.from("vault"), Buffer.from("v2")], // OLD INCORRECT SEEDS
+  // ✅ Calculate PDAs with CORRECT seeds
+  const [vault] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault"), USDC_MINT.toBuffer()], // CORRECT: vault + usdc_mint
     VAULT_PROGRAM_ID
   );
   
-  // Calculate the correct vault PDA (using correct seeds)
-  const [newVault] = PublicKey.findProgramAddressSync(
-    [Buffer.from("vault")], // CORRECT SEEDS
+  const [vaultConfig] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault-config"), USDC_MINT.toBuffer()], // CORRECT: vault-config + usdc_mint
     VAULT_PROGRAM_ID
   );
   
-  console.log("Old corrupted vault PDA:", oldVault.toBase58());
-  console.log("New correct vault PDA:", newVault.toBase58());
+  const [stakeConfig] = PublicKey.findProgramAddressSync(
+    [Buffer.from("stake_config")], // CORRECT: stake_config
+    STAKING_PROGRAM_ID
+  );
   
-  // Check if old vault exists and has incorrect data
+  console.log("\n📍 PDA Addresses:");
+  console.log("Vault PDA:", vault.toBase58());
+  console.log("Vault Config PDA:", vaultConfig.toBase58());
+  console.log("Stake Config PDA:", stakeConfig.toBase58());
+  
+  // Check vault account state
   try {
-    const oldVaultInfo = await connection.getAccountInfo(oldVault);
-    if (oldVaultInfo) {
-      console.log(`📋 Old vault account exists with ${oldVaultInfo.data.length} bytes`);
-      console.log("💰 SOL balance:", oldVaultInfo.lamports / 1e9);
+    const vaultInfo = await connection.getAccountInfo(vault);
+    if (vaultInfo) {
+      console.log(`\n📋 Vault account exists:`);
+      console.log(`   Data length: ${vaultInfo.data.length} bytes`);
+      console.log(`   SOL balance: ${vaultInfo.lamports / 1e9} SOL`);
+      console.log(`   Owner: ${vaultInfo.owner.toBase58()}`);
       
-      if (oldVaultInfo.data.length === 420) {
-        console.log("⚠️ This appears to be the corrupted vault account (420 bytes)");
+      // Check if it's owned by our vault program
+      if (vaultInfo.owner.equals(VAULT_PROGRAM_ID)) {
+        console.log("✅ Owned by vault program");
         
-        // We can't directly close this account since it belongs to the program
-        // Instead, we'll let the initialize instruction handle it
-        console.log("ℹ️ The initialize instruction should overwrite this account");
+        // Try to deserialize to see if it's corrupted
+        try {
+          // We can't actually deserialize without the IDL, but we can check data length
+          if (vaultInfo.data.length > 0) {
+            console.log("⚠️ Account has data - may be corrupted from old deployment");
+            console.log("💡 This account needs to be reinitialized");
+          }
+        } catch (error) {
+          console.log("❌ Account data appears corrupted");
+        }
+      } else {
+        console.log("❌ Owned by different program:", vaultInfo.owner.toBase58());
       }
     } else {
-      console.log("ℹ️ Old vault account doesn't exist");
+      console.log("\n✅ Vault account doesn't exist - ready for fresh initialization");
     }
   } catch (error) {
-    console.log("ℹ️ Could not fetch old vault account info");
+    console.log("\n❌ Could not fetch vault account info:", error.message);
   }
   
-  // Check if new vault exists
+  // Check vault config account state
   try {
-    const newVaultInfo = await connection.getAccountInfo(newVault);
-    if (newVaultInfo) {
-      console.log(`📋 New vault account already exists with ${newVaultInfo.data.length} bytes`);
-      console.log("💰 SOL balance:", newVaultInfo.lamports / 1e9);
-      
-      // This shouldn't exist yet, but if it does, we need to close it first
-      console.log("⚠️ New vault account already exists - may need manual intervention");
+    const vaultConfigInfo = await connection.getAccountInfo(vaultConfig);
+    if (vaultConfigInfo) {
+      console.log(`\n📋 Vault Config account exists:`);
+      console.log(`   Data length: ${vaultConfigInfo.data.length} bytes`);
+      console.log(`   SOL balance: ${vaultConfigInfo.lamports / 1e9} SOL`);
+      console.log(`   Owner: ${vaultConfigInfo.owner.toBase58()}`);
     } else {
-      console.log("✅ New vault PDA is clean and ready for initialization");
+      console.log("\n✅ Vault Config account doesn't exist - ready for fresh initialization");
     }
   } catch (error) {
-    console.log("ℹ️ Could not fetch new vault account info");
+    console.log("\n❌ Could not fetch vault config account info:", error.message);
   }
   
-  console.log("\n🎯 Ready to run initialize script with correct seeds");
-  console.log("Run: npx ts-node scripts/initialize-devnet.ts");
+  // Check stake config account state
+  try {
+    const stakeConfigInfo = await connection.getAccountInfo(stakeConfig);
+    if (stakeConfigInfo) {
+      console.log(`\n📋 Stake Config account exists:`);
+      console.log(`   Data length: ${stakeConfigInfo.data.length} bytes`);
+      console.log(`   SOL balance: ${stakeConfigInfo.lamports / 1e9} SOL`);
+      console.log(`   Owner: ${stakeConfigInfo.owner.toBase58()}`);
+    } else {
+      console.log("\n✅ Stake Config account doesn't exist - ready for fresh initialization");
+    }
+  } catch (error) {
+    console.log("\n❌ Could not fetch stake config account info:", error.message);
+  }
+  
+  console.log("\n🎯 RECOMMENDATIONS:");
+  console.log("1. If accounts exist with data, they may have old structure");
+  console.log("2. Run the initialize script - it should handle reinitialization");
+  console.log("3. If initialization fails, accounts may need manual closure");
+  console.log("\n▶️ Next step: npx ts-node scripts/initialize-devnet.ts");
 }
 
 // Run the reset

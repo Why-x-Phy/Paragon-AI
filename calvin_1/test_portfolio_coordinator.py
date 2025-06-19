@@ -360,7 +360,7 @@ class PortfolioCoordinatorTester:
                 timestamp=datetime.now(),
                 buy_threshold=0.02,
                 sell_threshold=0.03,
-                confidence_threshold=0.70,
+                confidence_threshold=0.10,
                 model_version="test",
                 processing_time_ms=100.0,
                 raw_prediction=0.05
@@ -379,7 +379,7 @@ class PortfolioCoordinatorTester:
                 timestamp=datetime.now(),
                 buy_threshold=0.02,
                 sell_threshold=0.03,
-                confidence_threshold=0.70,
+                confidence_threshold=0.10,
                 model_version="test",
                 processing_time_ms=100.0,
                 raw_prediction=-0.05
@@ -398,7 +398,7 @@ class PortfolioCoordinatorTester:
                 timestamp=datetime.now() - timedelta(minutes=30),  # Too old
                 buy_threshold=0.02,
                 sell_threshold=0.03,
-                confidence_threshold=0.70,
+                confidence_threshold=0.10,
                 model_version="test",
                 processing_time_ms=100.0,
                 raw_prediction=0.05
@@ -682,7 +682,7 @@ class PortfolioCoordinatorTester:
                 timestamp=datetime.now(),
                 buy_threshold=0.02,
                 sell_threshold=0.03,
-                confidence_threshold=0.70,
+                confidence_threshold=0.10,
                 model_version="test_v1",
                 processing_time_ms=150.0,
                 raw_prediction=config['predicted_change_pct']

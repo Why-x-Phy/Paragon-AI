@@ -80,7 +80,7 @@ class SimpleTradesAPI:
                 INNER JOIN tokens tok ON t.token_id = tok.token_id
                 WHERE t.execution_time >= NOW() - INTERVAL '24 hours'
                 ORDER BY t.execution_time DESC
-                LIMIT %s
+                LIMIT $1
             ),
             running_stats AS (
                 SELECT 
@@ -100,7 +100,7 @@ class SimpleTradesAPI:
             ORDER BY execution_time DESC
             """
             
-            async with self.db_manager.pool.acquire() as conn:
+            async with self.db_manager.pg_pool.acquire() as conn:
                 rows = await conn.fetch(query, limit)
                 
                 trades = []

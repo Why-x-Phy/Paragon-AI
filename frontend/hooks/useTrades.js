@@ -12,77 +12,48 @@ export const useTrades = () => {
       setLoading(true);
       setError(null);
       
-      // Mock data for now - replace with actual API call
-      const mockData = {
-        trades: [
-          {
-            id: 1,
-            time: '14:32:15',
-            trade: 'BUY BONK',
-            amount: '$1,250.00',
-            pnl: 125.50,
-            pnl_formatted: '+$125.50',
-            is_profitable: true,
-            win_rate: 68.5,
-            tx_hash: 'ABC123...'
-          },
-          {
-            id: 2,
-            time: '13:45:22',
-            trade: 'SELL JUP',
-            amount: '$850.00',
-            pnl: -45.25,
-            pnl_formatted: '-$45.25',
-            is_profitable: false,
-            win_rate: 67.2,
-            tx_hash: 'DEF456...'
-          },
-          {
-            id: 3,
-            time: '12:15:08',
-            trade: 'BUY SOL',
-            amount: '$2,100.00',
-            pnl: 0,
-            pnl_formatted: 'Pending',
-            is_profitable: null,
-            win_rate: 67.8,
-            tx_hash: 'GHI789...'
-          },
-          {
-            id: 4,
-            time: '11:30:45',
-            trade: 'BUY FARTCOIN',
-            amount: '$500.00',
-            pnl: 67.80,
-            pnl_formatted: '+$67.80',
-            is_profitable: true,
-            win_rate: 69.1,
-            tx_hash: 'JKL012...'
-          },
-          {
-            id: 5,
-            time: '10:55:12',
-            trade: 'SELL BONK',
-            amount: '$1,100.00',
-            pnl: -23.40,
-            pnl_formatted: '-$23.40',
-            is_profitable: false,
-            win_rate: 68.3,
-            tx_hash: 'MNO345...'
-          }
-        ],
+      // Call the real trades API
+      const response = await fetch('/api/trades', {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status} ${response.statusText}`);
+      }
+
+      const apiData = await response.json();
+      
+      // Ensure data structure matches what the component expects
+      const formattedData = {
+        trades: apiData.trades || [],
         stats: {
-          total_trades: 25,
-          current_win_rate: 67.5,
-          total_pnl: 1250.75,
-          profitable_trades: 17
+          total_trades: apiData.stats?.total_trades || 0,
+          current_win_rate: apiData.stats?.current_win_rate || 0,
+          total_pnl: apiData.stats?.total_pnl || 0,
+          profitable_trades: apiData.stats?.profitable_trades || 0
         }
       };
       
-      setData(mockData);
+      setData(formattedData);
+      console.log('✅ Trades data fetched:', formattedData);
       
     } catch (err) {
+      console.error('❌ Failed to fetch trades:', err);
       setError(err.message);
+      
+      // Fallback to empty state on error
+      setData({ 
+        trades: [], 
+        stats: { 
+          total_trades: 0, 
+          current_win_rate: 0, 
+          total_pnl: 0, 
+          profitable_trades: 0 
+        } 
+      });
     } finally {
       setLoading(false);
     }
@@ -91,7 +62,7 @@ export const useTrades = () => {
   useEffect(() => {
     fetchTrades();
     
-    // Auto-refresh every 30 seconds
+    // Auto-refresh every 30 seconds for live updates
     const interval = setInterval(fetchTrades, 30000);
     return () => clearInterval(interval);
   }, [fetchTrades]);

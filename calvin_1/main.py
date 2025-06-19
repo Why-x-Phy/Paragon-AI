@@ -1151,6 +1151,44 @@ async def plot_price_comparison_cmd(args: Dict[str, Any]) -> None:
     logger.info(f"Price comparison plot generated: {output_file}")
 
 
+async def run_api_server(args: Dict[str, Any]) -> None:
+    """Run the Calvin AI Trades API server for frontend integration"""
+    logger.info("🚀 Starting Calvin AI Trades API Server")
+    
+    try:
+        # Import uvicorn here to avoid import issues if not needed
+        import uvicorn
+        
+        # Get configuration from arguments
+        host = args.get('host', '0.0.0.0')
+        port = args.get('port', 8000)
+        reload = args.get('reload', False)
+        log_level = args.get('log_level', 'info')
+        
+        logger.info(f"🌐 Server configuration:")
+        logger.info(f"   Host: {host}")
+        logger.info(f"   Port: {port}")
+        logger.info(f"   Reload: {reload}")
+        logger.info(f"   Log Level: {log_level}")
+        
+        # Run the FastAPI server
+        uvicorn.run(
+            "api_server:app",
+            host=host,
+            port=port,
+            reload=reload,
+            log_level=log_level,
+            access_log=True
+        )
+        
+    except ImportError:
+        logger.error("❌ FastAPI/Uvicorn not installed. Install with: pip install fastapi uvicorn[standard]")
+        raise
+    except Exception as e:
+        logger.error(f"❌ Failed to start API server: {e}")
+        raise
+
+
 def parse_arguments():
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(description="Solana Trading Bot")
@@ -1217,6 +1255,13 @@ def parse_arguments():
     vault_system_parser.add_argument('--social-interval', type=int, default=60, help='Social data fetch interval in minutes (hourly for model features)')
     vault_system_parser.add_argument('--min-viable-tokens', type=int, default=5, help='Minimum tokens ready for inference to trigger trading')
     
+    # NEW: API Server command for frontend integration
+    api_server_parser = subparsers.add_parser('run-api-server', help='Run the Calvin AI Trades API server for frontend integration')
+    api_server_parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind the API server to')
+    api_server_parser.add_argument('--port', type=int, default=8000, help='Port to bind the API server to')
+    api_server_parser.add_argument('--reload', action='store_true', help='Enable auto-reload for development')
+    api_server_parser.add_argument('--log-level', type=str, default='info', choices=['debug', 'info', 'warning', 'error'], help='Logging level')
+    
     return parser.parse_args()
 
 def main():
@@ -1243,6 +1288,8 @@ def main():
             asyncio.run(plot_price_comparison_cmd(args_dict))
         elif command == 'run-vault-system':
             asyncio.run(run_vault_system(args_dict))
+        elif command == 'run-api-server':
+            asyncio.run(run_api_server(args_dict))
         else:
             logger.error(f"Unknown command: {command}")
     except KeyboardInterrupt:

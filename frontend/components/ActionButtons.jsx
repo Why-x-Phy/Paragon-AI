@@ -79,7 +79,8 @@ export default function ActionButtons() {
     }
 
     // Show main action buttons for qualified users
-    const hasVaultShares = userVaultPosition && parseFloat(userVaultPosition.sharesFormatted) > 0;
+    // Use raw shares value to detect even very small amounts
+    const hasVaultShares = userVaultPosition && parseFloat(userVaultPosition.shares || '0') > 0;
     
     return (
         <>

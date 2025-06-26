@@ -106,7 +106,8 @@ export default function StakeModal({ isOpen, onClose }) {
 
   const walletCalvin = userTokenBalances ? parseFloat(userTokenBalances.calvinFormatted) : 0;
   const stakedCalvin = userStakeInfo ? parseFloat(userStakeInfo.totalStakedFormatted) : 0;
-  const hasVaultShares = userVaultPosition && parseFloat(userVaultPosition.sharesFormatted) > 0;
+  // Use raw shares value to detect even very small amounts
+  const hasVaultShares = userVaultPosition && parseFloat(userVaultPosition.shares || '0') > 0;
 
   return (
     <Modal

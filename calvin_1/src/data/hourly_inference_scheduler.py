@@ -185,7 +185,8 @@ class HourlyInferenceScheduler:
             # 🚨 IMPORTANT: Run initial cycle after short delay to avoid startup timing issues
             def delayed_initial_run():
                 time.sleep(5)  # 5-second startup buffer
-                self._run_data_and_trading_cycle()
+                # Run the async method in a new event loop since we're in a thread
+                asyncio.run(self._run_data_and_trading_cycle_async())
             
             initial_thread = threading.Thread(target=delayed_initial_run)
             initial_thread.daemon = True
@@ -1265,11 +1266,15 @@ class HourlyInferenceScheduler:
         self.logger.info("🧠 Starting adaptive strategy parameter updates")
         
         try:
-            # FIXED: Use asyncio.run() to create new event loop for async operation
+            # Simply run the async method with asyncio.run() from the thread
+            # This creates a new event loop specific to this thread, avoiding conflicts
             asyncio.run(self._run_adaptive_strategy_updates_async())
             
         except Exception as e:
-            self.logger.error(f"Error starting adaptive strategy updates: {e}")
+            self.logger.error(f"Error in adaptive strategy updates: {e}")
+            # Import traceback for better error logging
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
     
     async def _run_adaptive_strategy_updates_async(self):
         """Async adaptive strategy parameter updates"""
@@ -1285,12 +1290,13 @@ class HourlyInferenceScheduler:
             
             for token_address in self.config.active_tokens:
                 try:
-                    # Get token symbol from database
-                    token_info = await self.db_manager.get_token_by_address(token_address)
+                    # FIXED: get_token_by_address is synchronous and returns TokenInfo object
+                    token_info = self.db_manager.get_token_by_address(token_address)
                     if not token_info:
                         continue
                     
-                    symbol = token_info['symbol']
+                    # FIXED: Access TokenInfo object attributes directly (not dictionary keys)
+                    symbol = token_info.symbol
                     
                     # Run adaptive strategy update
                     was_adapted = await adaptive_engine.adapt_strategy_parameters(symbol)
@@ -1336,11 +1342,15 @@ class HourlyInferenceScheduler:
         self.logger.info("🚀 Starting data fetch + inference + trading cycle")
         
         try:
-            # FIXED: Use asyncio.run() to create new event loop for async operation
+            # Simply run the async method with asyncio.run() from the thread
+            # This creates a new event loop specific to this thread, avoiding conflicts
             asyncio.run(self._run_data_and_trading_cycle_async())
             
         except Exception as e:
             self.logger.error(f"Error starting data and trading cycle: {e}")
+            # Import traceback for better error logging
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
     
     async def _run_data_and_trading_cycle_async(self):
         """Async combined data fetch + inference + trading cycle"""

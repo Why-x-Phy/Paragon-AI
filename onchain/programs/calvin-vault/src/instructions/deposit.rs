@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, MintTo, Transfer, FreezeAccount};
+use anchor_spl::token::{self, Mint, Token, TokenAccount, MintTo, Transfer, FreezeAccount, ThawAccount};
 use anchor_spl::associated_token::AssociatedToken;
 
 use crate::{constants::*, state::*, utils, errors::ErrorCode};
@@ -16,7 +16,7 @@ pub struct Deposit<'info> {
         constraint = !vault.paused @ ErrorCode::VaultPaused,
         constraint = !vault.deposits_paused @ ErrorCode::DepositsPaused,
     )]
-    pub vault: Account<'info, Vault>,
+    pub vault: Box<Account<'info, Vault>>,
     
     /// User's vault position account (tracks deposits for tier caps)
     #[account(
@@ -26,7 +26,7 @@ pub struct Deposit<'info> {
         seeds = [USER_POSITION_PDA_SEED, user.key().as_ref(), vault.key().as_ref()],
         bump
     )]
-    pub user_position: Account<'info, UserPosition>,
+    pub user_position: Box<Account<'info, UserPosition>>,
     
     /// The user's USDC token account
     #[account(
@@ -254,7 +254,12 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         &[vault.authority_bump],
     ];
     
-    if let Err(e) = token::mint_to(
+    // 🔒 CRITICAL: Check if account is frozen before minting (for repeat deposits)
+    // If frozen, unfreeze temporarily to allow minting, then re-freeze
+    let mut was_already_frozen = false;
+    
+    // Try to mint - if it fails due to frozen account, unfreeze first
+    let mint_result = token::mint_to(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             MintTo {
@@ -265,12 +270,55 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
             &[vault_authority_seeds],
         ),
         shares_to_mint,
-    ) {
-        vault.reentrancy_guard = false;
-        return Err(e.into());
+    );
+    
+    if let Err(e) = mint_result {
+        // Check if the error is because account is frozen
+        let error_code = e.to_string();
+        if error_code.contains("0x11") || error_code.contains("frozen") {
+            was_already_frozen = true;
+            
+            // Unfreeze the account temporarily
+            if let Err(unfreeze_err) = token::thaw_account(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    ThawAccount {
+                        account: ctx.accounts.user_shares_token.to_account_info(),
+                        mint: ctx.accounts.shares_mint.to_account_info(),
+                        authority: ctx.accounts.vault_authority.to_account_info(),
+                    },
+                    &[vault_authority_seeds],
+                ),
+            ) {
+                vault.reentrancy_guard = false;
+                return Err(unfreeze_err.into());
+            }
+            
+            // Now try minting again
+            if let Err(mint_err) = token::mint_to(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    MintTo {
+                        mint: ctx.accounts.shares_mint.to_account_info(),
+                        to: ctx.accounts.user_shares_token.to_account_info(),
+                        authority: ctx.accounts.vault_authority.to_account_info(),
+                    },
+                    &[vault_authority_seeds],
+                ),
+                shares_to_mint,
+            ) {
+                vault.reentrancy_guard = false;
+                return Err(mint_err.into());
+            }
+        } else {
+            // Different error, propagate it
+            vault.reentrancy_guard = false;
+            return Err(e.into());
+        }
     }
     
     // 🔒 CRITICAL: Freeze user's share token account to make shares non-transferable
+    // Always freeze after minting (whether it was already frozen or not)
     if let Err(e) = token::freeze_account(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
@@ -282,8 +330,12 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
             &[vault_authority_seeds],
         ),
     ) {
-        vault.reentrancy_guard = false;
-        return Err(e.into());
+        // If freeze fails and account wasn't already frozen, it's an error
+        if !was_already_frozen {
+            vault.reentrancy_guard = false;
+            return Err(e.into());
+        }
+        // If it was already frozen and freeze fails, that's fine (already frozen)
     }
     
     // 🎯 UPDATE HWM IF DEPOSIT PUSHES NAV ABOVE HWM

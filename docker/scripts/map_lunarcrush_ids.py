@@ -22,6 +22,7 @@ from psycopg2.extras import RealDictCursor
 import json
 from datetime import datetime
 import argparse
+from dotenv import load_dotenv
 
 # Setup logging
 logging.basicConfig(
@@ -37,38 +38,44 @@ logger = logging.getLogger(__name__)
 
 def load_environment():
     """Load environment variables from .env files"""
-    env_files = ['../../.env', '../../.env.dev']  # Prioritize .env over .env.dev
-    env_vars = {}
+    # Try different possible locations for .env file
+    env_files = [
+        '../../../.env',  # Original path
+        '../../.env',     # From docker/scripts
+        '.env',           # From root
+        '/home/ubuntu/CalvinAI-2/.env'  # Absolute path
+    ]
     
+    loaded = False
     for env_file in env_files:
         if os.path.exists(env_file):
             logger.info(f"Loading environment from {env_file}")
-            with open(env_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        key, value = line.split('=', 1)
-                        env_vars[key] = value
+            load_dotenv(env_file)
+            loaded = True
+            break
     
-    return env_vars
+    if not loaded:
+        logger.warning("No .env file found, using system environment variables only")
+    
+    return os.environ
 
 
 def get_database_connection(env_vars):
     """Get database connection with multiple fallback configurations"""
     connection_configs = [
         {
-            'host': env_vars.get('DB_HOST', 'localhost'),
-            'port': int(env_vars.get('DB_PORT', 6432)),
-            'database': env_vars.get('DB_NAME', 'calvin_trading_dev'),
-            'user': env_vars.get('DB_USER', 'calvin_dev'),
-            'password': env_vars.get('DB_PASSWORD', env_vars.get('DB_PASSWORD_DEV', 'calvin_dev_password'))
+            'host': env_vars.get('DB_HOST', '172.31.31.43'),
+            'port': int(env_vars.get('DB_PORT', 5433)),
+            'database': env_vars.get('DB_NAME', 'calvin_trading'),
+            'user': env_vars.get('DB_USER', 'calvin_prod'),
+            'password': env_vars.get('DB_PASSWORD')
         },
         {
-            'host': 'localhost',
-            'port': 5432,
-            'database': 'calvin_trading_dev',
-            'user': 'calvin_dev',
-            'password': 'calvin_dev_password'
+            'host': '172.31.31.43',
+            'port': 5433,
+            'database': 'calvin_trading',
+            'user': 'calvin_prod',
+            'password': env_vars.get('DB_PASSWORD')
         }
     ]
     
@@ -517,10 +524,11 @@ def main():
         # Load environment
         env_vars = load_environment()
         
-        # Get LunarCrush API key
-        api_key = env_vars.get('LUNARCRUSH_API_KEY')
+        # Get LunarCrush API key (now automatically available in os.environ)
+        api_key = os.environ.get('LUNARCRUSH_API_KEY')
         if not api_key:
             logger.error("LUNARCRUSH_API_KEY not found in environment variables")
+            logger.error("Make sure LUNARCRUSH_API_KEY is set in .env file or environment")
             sys.exit(1)
         
         # Connect to database

@@ -22,10 +22,18 @@ export default function WithdrawModal({ isOpen, onClose }) {
   const availableUsdc = userVaultPosition ? parseFloat(userVaultPosition.usdcValueFormatted) : 0;
   const walletUsdc = userTokenBalances ? parseFloat(userTokenBalances.usdcFormatted) : 0;
   
+  // Helper function to format very small numbers with appropriate precision
+  const formatSmallNumber = (num) => {
+    if (num === 0) return '0.000';
+    if (num < 0.000001) return '< 0.000001';
+    if (num < 0.001) return num.toFixed(6);
+    return num.toFixed(3);
+  };
+  
   const balances = {
     title: 'Your Balance',
     balances: [
-      { label: 'vCALVIN Shares', amount: availableShares.toFixed(3) },
+      { label: 'vCALVIN Shares', amount: formatSmallNumber(availableShares) },
       { label: 'USDC Value', amount: `$${availableUsdc.toFixed(2)}` },
       { label: 'USDC in Wallet', amount: `$${walletUsdc.toFixed(2)}` }
     ]
@@ -42,8 +50,11 @@ export default function WithdrawModal({ isOpen, onClose }) {
       }
 
       const withdrawAmount = Number(amount);
-      if (withdrawAmount > availableShares) {
-        toast.error(`Cannot withdraw more than ${availableShares.toFixed(3)} shares`);
+      
+      // Use a small epsilon for floating point comparison
+      const epsilon = 0.000001;
+      if (withdrawAmount > (availableShares + epsilon)) {
+        toast.error(`Cannot withdraw more than ${formatSmallNumber(availableShares)} shares`);
         return;
       }
 
@@ -70,6 +81,16 @@ export default function WithdrawModal({ isOpen, onClose }) {
     }
   };
 
+  // Function to set maximum available shares
+  const setMaxShares = () => {
+    // Use the raw shares value with full precision to avoid rounding issues
+    const rawShares = userVaultPosition?.shares ? (parseFloat(userVaultPosition.shares) / 1000000).toString() : '0';
+    setAmount(rawShares);
+  };
+
+  // Check if user has any shares (even very small amounts)
+  const hasShares = userVaultPosition && parseFloat(userVaultPosition.shares || '0') > 0;
+
   return (
     <Modal
       isOpen={isOpen}
@@ -81,13 +102,29 @@ export default function WithdrawModal({ isOpen, onClose }) {
             <BalanceCard {...balances} className="bg-black" />
             
             <div className="space-y-4">
+                <div>
+                    <div className="flex justify-between items-center mb-2">
+                        <label className="block text-sm font-medium text-white">
+                            Shares to Withdraw
+                        </label>
+                        <button
+                            type="button"
+                            onClick={setMaxShares}
+                            className="text-[#B73E15] text-sm hover:underline"
+                            disabled={!hasShares}
+                        >
+                            Max: {formatSmallNumber(availableShares)} shares
+                        </button>
+                    </div>
                 <input
                     type="number"
+                        step="0.000001"
                     value={amount}
                     onChange={(e) => setAmount(e.target.value)}
                     placeholder="Please enter amount here"
                     className="w-full bg-black/75 rounded-[4px] p-3 text-white no-spinner"
                 />
+                </div>
                 
                 <Button 
                     variant="secondary" 
@@ -96,7 +133,7 @@ export default function WithdrawModal({ isOpen, onClose }) {
                     textSize="text-lg"
                     onClick={handleWithdraw}
                     loading={txStates.withdraw === 'pending'}
-                    disabled={txStates.withdraw === 'pending' || availableShares === 0}
+                    disabled={txStates.withdraw === 'pending' || !hasShares}
                 >
                     {txStates.withdraw === 'pending' ? 'Withdrawing...' : 'Withdraw USDC'}
                 </Button>

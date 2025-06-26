@@ -7,6 +7,8 @@
   "dependencies": {
     "@auth/nextjs": "^0.0.0-380f8d56",
     "@coral-xyz/anchor": "^0.31.1",
+    "@pythnetwork/hermes-client": "^2.0.0",
+    "@pythnetwork/pyth-solana-receiver": "^0.10.1",
     "@solana/spl-token": "^0.4.13",
     "next-auth": "^5.0.0-beta.28"
   },

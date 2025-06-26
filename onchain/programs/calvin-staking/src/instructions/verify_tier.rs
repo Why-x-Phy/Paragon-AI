@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 
-use crate::{constants::*, state::*, errors::*};
+use crate::{constants::*, state::*};
 
 #[derive(Accounts)]
 pub struct VerifyTier<'info> {

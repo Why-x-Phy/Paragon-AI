@@ -17,7 +17,7 @@ export function useTransactionToast({
   // Display toast when transaction signature is available
   useEffect(() => {
     if (transactionSignature) {
-      const explorerUrl = `https://explorer.solana.com/tx/${transactionSignature}?cluster=devnet`;
+      const explorerUrl = `https://explorer.solana.com/tx/${transactionSignature}?cluster=mainnet`;
 
       // Dismiss previous toast if exists
       if (toastIdRef.current) {

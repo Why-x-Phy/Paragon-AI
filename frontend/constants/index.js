@@ -1,17 +1,17 @@
 // Smart Contract Configuration - Using environment variables for deployed programs
 export const CONTRACTS = {
-  // Calvin Staking Program (deployed) - FRESH DEVNET DEPLOYMENT
-  CALVIN_STAKING_PROGRAM: process.env.NEXT_PUBLIC_CALVIN_STAKING_PROGRAM || 'FH8te8ebpGLRUc32pZHj4q6DUwzt3KykQYZyA4NQPsod',
+  // Calvin Staking Program (deployed) - MAINNET DEPLOYMENT
+  CALVIN_STAKING_PROGRAM: process.env.NEXT_PUBLIC_CALVIN_STAKING_PROGRAM || '8kMj6gYFVUC3Ya6qwu3tyaZweyXUUuR8t8aCtA47aX7W',
   
-  // Calvin Vault Program (deployed) - FRESH DEVNET DEPLOYMENT
-  CALVIN_VAULT_PROGRAM: process.env.NEXT_PUBLIC_CALVIN_VAULT_PROGRAM || 'Evdjoh1AHQb6Ls1n7Td7buAiDA5ty7Ec8NCYt8eWEXFp',
+  // Calvin Vault Program (deployed) - MAINNET DEPLOYMENT
+  CALVIN_VAULT_PROGRAM: process.env.NEXT_PUBLIC_CALVIN_VAULT_PROGRAM || 'tXMJu1KaBQU5DSk94QXMtigQpzxbK62WJVUs2Xmxz7z',
   
   // Token Addresses
-  CALVIN_TOKEN: process.env.NEXT_PUBLIC_CALVIN_TOKEN || 'CrWbUJ4kMgduYDVRK8bDXhNBHr8cScixi79nGdGejnb1',
-  USDC: process.env.NEXT_PUBLIC_USDC_TOKEN || '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU',
+  CALVIN_TOKEN: process.env.NEXT_PUBLIC_CALVIN_TOKEN || '229vWzBTiUNdraYpVtSH9usTwwVxcyPDbBWf1zEPpump',
+  USDC: process.env.NEXT_PUBLIC_USDC_TOKEN || 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
   
-  // Devnet Configuration
-  RPC_ENDPOINT: process.env.NEXT_PUBLIC_RPC_ENDPOINT || 'https://api.devnet.solana.com',
+  // Mainnet Configuration
+  RPC_ENDPOINT: process.env.NEXT_PUBLIC_RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com',
   COMMITMENT: 'confirmed',
 };
 
@@ -62,7 +62,7 @@ export const ACTIONS = {
 export const UI = {
   MIN_STAKE_AMOUNT: 100,
   MIN_DEPOSIT_AMOUNT: 10,
-  REFRESH_INTERVAL: 15000, // 15 seconds
+  REFRESH_INTERVAL: 30000, // 30 seconds to reduce Helius rate limits
   
   // Transaction States
   TX_PENDING: 'pending',

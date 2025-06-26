@@ -17,7 +17,7 @@ pub struct StakeCalvin<'info> {
         bump = stake_config.bump,
         constraint = !stake_config.paused @ StakingError::StakingPaused,
     )]
-    pub stake_config: Account<'info, StakeConfig>,
+    pub stake_config: Box<Account<'info, StakeConfig>>,
 
     /// Stake vault account
     #[account(
@@ -25,7 +25,7 @@ pub struct StakeCalvin<'info> {
         seeds = [STAKE_VAULT_SEED],
         bump = stake_vault.bump,
     )]
-    pub stake_vault: Account<'info, StakeVault>,
+    pub stake_vault: Box<Account<'info, StakeVault>>,
 
     /// User's stake account (created if it doesn't exist)
     #[account(
@@ -35,7 +35,7 @@ pub struct StakeCalvin<'info> {
         seeds = [USER_STAKE_SEED, user.key().as_ref()],
         bump
     )]
-    pub user_stake: Account<'info, UserStake>,
+    pub user_stake: Box<Account<'info, UserStake>>,
 
     /// User's CALVIN token account
     #[account(

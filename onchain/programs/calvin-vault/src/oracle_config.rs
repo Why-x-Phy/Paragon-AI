@@ -5,6 +5,7 @@ use anchor_lang::prelude::*;
 // Pyth Price Feed IDs (hex strings) - includes USDC for NAV calculation
 pub const PYTH_PRICE_FEEDS: &[(&str, &str)] = &[
     ("USDC", "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a"), // Base currency for NAV
+    ("SOL", "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d"), // Added SOL Pyth feed
     ("TRUMP", "0x879551021853eec7a7dc827578e8e69da7e4fa8148339aa0d3d5296405be4b1a"),
     ("RENDER", "0x3d4a2bd9535be6ce8059d75eadeba507b043257321aa544717c56fa19b49e35d"),
     ("JUP", "0x0a0408d619e9380abad35060f9192039ed5042fa6f82301d0e48bb52be830996"),
@@ -12,7 +13,7 @@ pub const PYTH_PRICE_FEEDS: &[(&str, &str)] = &[
     ("FARTCOIN", "0x58cd29ef0e714c5affc44f269b2c1899a52da4169d7acc147b9da692e6953608"),
     ("RAY", "0x91568baa8beb53db23eb3fb7f22c6e8bd303d103919e19733f2bb642d3e7987a"),
     ("JTO", "0xb43660a5f790c69354b0729a5ef9d50d68f1df92107540210b9cccba1f947cc2"),
-    ("PYTH", "0x0bbf28e9a841a1cc788f6a361b17ca072d0ea3098a1e5df1c3922d0d719579ff"),
+    ("PYTH", "0x0bbf28e9a841a1cc788f6a361b17ca072d0ea3098a1e5df1c3922d06719579ff"),
     ("WIF", "0x4ca4beeca86f0d164160323817a4e42b10010a724c2217c6ee41b54cd4cc61fc"),
     ("VIRTUAL", "0x8132e3eb1dac3e56939a16ff83848d194345f6688bff97eb1c8bd462d558802b"),
     ("PENGU", "0xbed3097008b9b5e3c93bec20be79cb43986b85a996475589351a21e67bae9b61"),
@@ -86,6 +87,7 @@ pub fn get_all_pyth_price_feeds() -> Vec<(&'static str, Pubkey)> {
 // Token mint to symbol mapping (from TRACKED_TOKENS)
 pub const TOKEN_MINT_TO_SYMBOL: &[(&str, &str)] = &[
     ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "USDC"), // Base currency
+    ("So11111111111111111111111111111111111111112", "SOL"), // Native SOL
     ("6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN", "TRUMP"),
     ("rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof", "RENDER"),
     ("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", "JUP"),
@@ -93,16 +95,16 @@ pub const TOKEN_MINT_TO_SYMBOL: &[(&str, &str)] = &[
     ("9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump", "FARTCOIN"),
     ("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R", "RAY"),
     ("jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL", "JTO"),
-    ("HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3npgxbkkTs8LG", "PYTH"),
+    ("HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3", "PYTH"),
     ("EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", "WIF"),
-    ("BUjZjAS2vbbb65g7Z1Ca9ZRVYoJscURG5L3AkVXHP2ac", "VIRTUAL"),
-    ("3Bmj7x4udgJhKa43EYRcmNq2JLkgz7eAayFn8qYhyXKV", "PENGU"),
+    ("3iQL8BFS2vE7mww4ehAqQHAsbmRNCrPxizWAT2Zfyr9y", "VIRTUAL"),
+    ("2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv", "PENGU"),
     ("85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ", "W"), // WORMHOLE
     ("7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr", "POPCAT"),
-    ("ATHdb8YvGvBVhgJB3PaMU5sCdAUHkhkN42jdYWK4h2xQ", "ATH"),
+    ("Dm5BxyMetG3Aq5PaG1BrG7rBYqEMtnkjvPNMExfacVk7", "ATH"),
     ("MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5", "MEW"),
     ("MNDEFzGvMt87ueuHvVU9VcTqsAP5b3fTGPsHuuPA5ey", "MNDE"),
-    ("AUKyeqDfN8p6B93X9gYCnCpdJUfvxU6ZWEmAy2VKqm3w", "SPX"), // SPX6900
+    ("J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr", "SPX"), // SPX6900
     ("orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE", "ORCA"),
 ];
 

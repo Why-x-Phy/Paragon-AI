@@ -196,7 +196,7 @@ class AdaptiveStrategyEngine:
                 self.db_manager = await get_db_manager()
             
             # Initialize Redis client
-            redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+            redis_url = os.getenv('REDIS_URL', 'redis://:AppCherry1926@172.31.31.43:6379/0')
             self.redis_client = redis.from_url(redis_url, decode_responses=True)
             
             # Initialize portfolio coordinator if not provided

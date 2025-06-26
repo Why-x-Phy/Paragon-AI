@@ -16,7 +16,7 @@ pub struct UnstakeCalvin<'info> {
         bump = stake_config.bump,
         constraint = !stake_config.paused @ StakingError::StakingPaused,
     )]
-    pub stake_config: Account<'info, StakeConfig>,
+    pub stake_config: Box<Account<'info, StakeConfig>>,
 
     /// Stake vault account
     #[account(
@@ -24,7 +24,7 @@ pub struct UnstakeCalvin<'info> {
         seeds = [STAKE_VAULT_SEED],
         bump = stake_vault.bump,
     )]
-    pub stake_vault: Account<'info, StakeVault>,
+    pub stake_vault: Box<Account<'info, StakeVault>>,
 
     /// User's stake account
     #[account(
@@ -34,7 +34,7 @@ pub struct UnstakeCalvin<'info> {
         constraint = user_stake.user_authority == user.key(),
         constraint = user_stake.total_staked >= amount @ StakingError::InsufficientStakedAmount,
     )]
-    pub user_stake: Account<'info, UserStake>,
+    pub user_stake: Box<Account<'info, UserStake>>,
 
     /// User's CALVIN token account (receives unstaked tokens)
     #[account(
@@ -200,9 +200,9 @@ fn get_user_vault_shares_cpi(
     // [2] user_shares_token - the user's share token account
     
     if remaining_accounts.len() < 3 {
-        msg!("Insufficient remaining accounts for vault CPI call");
-        // Fail-safe: assume user has shares to prevent unstaking
-        return Ok(1);
+        msg!("Insufficient remaining accounts for vault CPI call - allowing unstaking (vault may not exist yet)");
+        // Fail-safe: allow unstaking when vault doesn't exist yet
+        return Ok(0);
     }
     
     let vault_account = &remaining_accounts[0];
@@ -211,8 +211,14 @@ fn get_user_vault_shares_cpi(
     
     // Verify the accounts are owned by the correct programs
     if *vault_account.owner != vault_program.key() {
-        msg!("Invalid vault account owner");
-        return Ok(1); // Fail-safe
+        msg!("Invalid vault account owner - allowing unstaking (vault may not exist yet)");
+        return Ok(0); // Fail-safe: allow unstaking when vault doesn't exist
+    }
+    
+    // Check if the shares token account exists first
+    if user_shares_token.data_is_empty() {
+        msg!("User {} shares account does not exist - no shares", user);
+        return Ok(0); // Account doesn't exist = no shares
     }
     
     // Parse the user's share token account to get the balance directly
@@ -227,17 +233,20 @@ fn get_user_vault_shares_cpi(
                 
                 msg!("User {} has {} vault shares", user, share_balance);
                 return Ok(share_balance);
+            } else {
+                msg!("Invalid shares token account format for user {}", user);
+                return Ok(0); // If account format is wrong, assume no shares (safer than blocking)
+            }
         }
-    }
         Err(_) => {
-            msg!("Failed to read user shares token account");
-            return Ok(1); // Fail-safe: assume user has shares
+            msg!("Failed to read user shares token account - allowing unstaking");
+            return Ok(0); // Fail-safe: allow unstaking when we can't read shares
         }
     }
     
-    // If we can't determine the balance, fail-safe to prevent unstaking
-    msg!("Could not determine vault share balance - assuming user has shares");
-    Ok(1)
+    // If we can't determine the balance, fail-safe to allow unstaking
+    msg!("Could not determine vault share balance - allowing unstaking (vault may not exist yet)");
+    Ok(0)
 }
 
 /// Calculate tier based on staked amount

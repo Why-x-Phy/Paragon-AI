@@ -13,7 +13,7 @@ use instructions::*;
 use errors::ErrorCode;
 
 // Program ID will be set during deployment
-declare_id!("7soxQcqTSQeQeT7dcSKBskvh46DoLEWAEhzPcW8Nv3em");
+declare_id!("tXMJu1KaBQU5DSk94QXMtigQpzxbK62WJVUs2Xmxz7z");
 
 /// The main vault program
 #[program]

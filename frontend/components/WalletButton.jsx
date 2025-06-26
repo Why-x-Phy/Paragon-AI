@@ -37,7 +37,7 @@ export default function WalletButton() {
     <div className="relative" ref={dropdownRef}>
       <Button 
         variant={connected ? "secondary" : "primary"}
-        icon="/wallet.svg"
+        icon="/Wallet.svg"
         onClick={handleButtonClick}
       >
         {connected ? shortenAddress(publicKey) : 'Select Wallet'}

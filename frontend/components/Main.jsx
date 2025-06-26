@@ -31,7 +31,7 @@ const Main = () => {
       {/* Calvin Character - Hidden on mobile, visible on larger screens */}
       <div className="hidden lg:block fixed bottom-0 right-8 z-10">
         <Image 
-          src="/calvin.png" 
+          src="/Calvin.png" 
           alt="Calvin Character" 
           width={300} 
           height={300}

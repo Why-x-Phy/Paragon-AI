@@ -1,0 +1,31 @@
+{
+  "name": "calvin-jupiter-bridge",
+  "version": "1.0.0",
+  "description": "Jupiter TypeScript SDK bridge for Calvin AI vault system",
+  "main": "jupiter_instruction_generator.js",
+  "scripts": {
+    "test": "node jupiter_instruction_generator.js EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump 10000000 6tMyF1Q5GScmXCJGSgpsKQtMPSPgkREwWuWWNspcmV8U 300",
+    "install-deps": "npm install"
+  },
+  "dependencies": {
+    "@jup-ag/api": "^6.0.42",
+    "@pythnetwork/client": "^2.22.1",
+    "@solana/web3.js": "^1.87.6",
+    "cross-fetch": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": [
+    "solana",
+    "jupiter",
+    "defi",
+    "trading",
+    "calvin-ai"
+  ],
+  "author": "Calvin AI Team",
+  "license": "MIT"
+}

@@ -1,11 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // Only use static export for production builds
-  ...(process.env.NODE_ENV === 'production' && {
-    output: 'export',
-    trailingSlash: true,
-    assetPrefix: 'https://vault.cabalcalvin.com',
-  }),
+  // Don't use static export since we have API routes that need server-side functionality
+  // Static export is only for purely client-side apps
   
   images: {
     unoptimized: true,
@@ -15,12 +11,9 @@ const nextConfig = {
     NEXTAUTH_URL: process.env.NEXTAUTH_URL,
   },
   
-  // Only add rewrites for development (when not using static export)
-  ...(process.env.NODE_ENV !== 'production' && {
-    async rewrites() {
-      return [];
-    },
-  }),
+  async rewrites() {
+    return [];
+  },
 };
 
 export default nextConfig;

@@ -1,5 +1,4 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, MintTo, Burn, Transfer};
 
 // Import modules
 pub mod constants;
@@ -8,11 +7,9 @@ pub mod instructions;
 pub mod errors;
 
 use instructions::*;
-use state::*;
-use errors::*;
 
 // Program ID will be set during deployment
-declare_id!("CNfW3eVGXVFb4cUo48xEsbxrqcJsrsHcKkLAD6ycJC81");
+declare_id!("8kMj6gYFVUC3Ya6qwu3tyaZweyXUUuR8t8aCtA47aX7W");
 
 /// Calvin Staking Program
 /// Manages CALVIN token staking and non-transferable Vault Pass token distribution

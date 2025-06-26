@@ -37,12 +37,14 @@ pub fn verify_tier_and_check_cap(
             // Parse the user_stake account to get the tier
             match user_stake_account.try_borrow_data() {
                 Ok(data) => {
-                    // UserStake structure: [user_authority(32), total_staked(8), tier(1), ...]
-                    if data.len() >= 41 {
-                        // Read the tier field (byte 40)
-                        data[40]
+                    // UserStake structure: [discriminator(8), user_authority(32), total_staked(8), vault_pass_mint(32), tier(1), ...]
+                    if data.len() >= 81 {
+                        // Read the tier field (byte 80 - CORRECT POSITION!)
+                        let tier = data[80];
+                        msg!("Read tier {} from correct position 80", tier);
+                        tier
                     } else {
-                        msg!("Invalid user stake account size");
+                        msg!("Invalid user stake account size: {}", data.len());
                         DEFAULT_TIER
                     }
                 }
@@ -91,9 +93,9 @@ pub fn verify_tier_and_check_cap(
 
 /// Calculate the current NAV in USDC using oracle price feeds
 /// 
-/// remaining_accounts structure:
-/// [0..1] - Staking program accounts (stake_config, user_stake) 
-/// [2..] - Oracle data in groups of 3: [token_account, price_account, mint_account]
+/// remaining_accounts structure (when called from deposit):
+/// These are already the oracle-only accounts: [token_account, price_account, mint_account, ...]
+/// The deposit instruction passes &ctx.remaining_accounts[2..] which skips staking accounts
 pub fn current_nav_usdc(
     _vault: &Vault,
     usdc_token_account: &Account<TokenAccount>,
@@ -105,13 +107,14 @@ pub fn current_nav_usdc(
     let mut total_nav_usdc = usdc_token_account.amount;
     msg!("USDC balance: {}", total_nav_usdc);
     
-    // Skip first 2 accounts (staking program accounts)
-    if remaining_accounts.len() < 2 {
+    // When called from deposit instruction, remaining_accounts are already oracle-only
+    // No need for further slicing
+    if remaining_accounts.len() == 0 {
         msg!("No oracle accounts provided, returning USDC balance only");
         return Ok(total_nav_usdc);
     }
     
-    let oracle_accounts = &remaining_accounts[2..];
+    let oracle_accounts = remaining_accounts;
     msg!("Processing {} oracle accounts", oracle_accounts.len());
     
     // Process oracle accounts in chunks of 3
@@ -259,15 +262,24 @@ pub fn calculate_shares_to_mint(
     
     if total_shares == 0 || vault_nav == 0 {
         // First deposit - one share per USDC (after fee)
-        return Ok(amount_after_fee);
+        // Convert micro-USDC to USDC units (divide by 1,000,000)
+        return Ok(amount_after_fee / 1_000_000);
     }
     
-    // Calculate shares based on proportion of NAV
-    let shares = amount_after_fee
-        .checked_mul(total_shares)
+    // Calculate shares based on proportion of NAV using 128-bit arithmetic to prevent overflow
+    let amount_after_fee_u128 = amount_after_fee as u128;
+    let total_shares_u128 = total_shares as u128;
+    let vault_nav_u128 = vault_nav as u128;
+    
+    let shares_u128 = amount_after_fee_u128
+        .checked_mul(total_shares_u128)
         .ok_or(error!(ErrorCode::ArithmeticError))?
-        .checked_div(vault_nav)
+        .checked_div(vault_nav_u128)
         .ok_or(error!(ErrorCode::ArithmeticError))?;
+    
+    // Convert back to u64, checking for overflow
+    let shares = u64::try_from(shares_u128)
+        .map_err(|_| error!(ErrorCode::ArithmeticError))?;
     
     Ok(shares)
 }
@@ -282,11 +294,20 @@ pub fn calculate_usdc_to_withdraw(
         return Err(error!(ErrorCode::InsufficientShares));
     }
     
-    let amount = shares
-        .checked_mul(vault_nav)
+    // Use 128-bit arithmetic to prevent overflow
+    let shares_u128 = shares as u128;
+    let vault_nav_u128 = vault_nav as u128;
+    let total_shares_u128 = total_shares as u128;
+    
+    let amount_u128 = shares_u128
+        .checked_mul(vault_nav_u128)
         .ok_or(error!(ErrorCode::ArithmeticError))?
-        .checked_div(total_shares)
+        .checked_div(total_shares_u128)
         .ok_or(error!(ErrorCode::ArithmeticError))?;
+    
+    // Convert back to u64, checking for overflow
+    let amount = u64::try_from(amount_u128)
+        .map_err(|_| error!(ErrorCode::ArithmeticError))?;
     
     Ok(amount)
 }
@@ -362,20 +383,33 @@ pub fn forward_jupiter<'a, 'b>(
     signer_seeds: &[&[&[u8]]],
     vault_authority_key: &Pubkey,
 ) -> Result<()> {
-    // Validate minimum required accounts
+    // **ENHANCED VALIDATION**: More detailed account validation
     if accounts.len() < 3 {
+        msg!("❌ Insufficient accounts for Jupiter: {} (minimum: 3)", accounts.len());
         return Err(error!(ErrorCode::InsufficientAccounts));
     }
     
+    // **CRITICAL DEBUG**: Log Jupiter CPI setup details
+    msg!("🚀 Setting up Jupiter CPI:");
+    msg!("  - Jupiter program: {}", jupiter_program.key());
+    msg!("  - Accounts provided: {}", accounts.len());
+    msg!("  - Instruction data: {} bytes", data.len());
+    msg!("  - Vault authority: {}", vault_authority_key);
+    
+    // **FIX**: Capture data length before moving data
+    let data_len = data.len();
+    
     // Build AccountMeta array with proper authority handling
     let mut account_metas = Vec::new();
+    let mut vault_authority_found = false;
     
-    for account in accounts.iter() {
+    for (i, account) in accounts.iter().enumerate() {
         let account_meta = if account.key == vault_authority_key {
+            vault_authority_found = true;
             // Vault authority will be the signer via PDA seeds
             anchor_lang::solana_program::instruction::AccountMeta {
                 pubkey: *account.key,
-                is_signer: true,   // ✅ FIXED: Vault authority signs via CPI
+                is_signer: true,   // ✅ CRITICAL: Vault authority signs via CPI
                 is_writable: account.is_writable,
             }
         } else {
@@ -386,7 +420,37 @@ pub fn forward_jupiter<'a, 'b>(
                 is_writable: account.is_writable,
             }
         };
+        
+        // **ENHANCED DEBUG**: Log each account being passed to Jupiter
+        msg!("  Account[{}]: {} (signer: {}, writable: {})", 
+             i, account.key, account_meta.is_signer, account_meta.is_writable);
+        
         account_metas.push(account_meta);
+    }
+    
+    // **CRITICAL FIX**: If vault authority not found in Jupiter accounts, we have a problem
+    if !vault_authority_found {
+        msg!("🚨 CRITICAL: Vault authority not found in Jupiter accounts!");
+        msg!("   This means Jupiter transaction was not created with vault authority as signer");
+        msg!("   Jupiter needs vault authority to be the payer/signer for the swap");
+        return Err(error!(ErrorCode::InvalidAccountConfiguration));
+    }
+    
+    // **CRITICAL VALIDATION**: Verify we have required account types
+    let signers = account_metas.iter().filter(|acc| acc.is_signer).count();
+    let writables = account_metas.iter().filter(|acc| acc.is_writable).count();
+    
+    msg!("📊 Jupiter account summary:");
+    msg!("  - Total accounts: {}", account_metas.len());
+    msg!("  - Signers: {}", signers);
+    msg!("  - Writable: {}", writables);
+    msg!("  - Vault authority present: {}", vault_authority_found);
+    
+    // **ADDITIONAL VALIDATION**: Ensure we have at least one signer
+    if signers == 0 {
+        msg!("🚨 ERROR: No signers found in Jupiter accounts!");
+        msg!("   Jupiter requires vault authority as signer for swap execution");
+        return Err(error!(ErrorCode::NoSignersFound));
     }
     
     // Create Jupiter instruction
@@ -396,16 +460,31 @@ pub fn forward_jupiter<'a, 'b>(
         data,
     };
     
+    // **ENHANCED LOGGING**: Log instruction details
+    msg!("🔧 Jupiter instruction created:");
+    msg!("  - Program ID: {}", jupiter_ix.program_id);
+    msg!("  - Account count: {}", jupiter_ix.accounts.len());
+    msg!("  - Data length: {}", data_len);
+    
     // Execute CPI with proper error handling
+    msg!("🚀 Executing Jupiter CPI...");
     anchor_lang::solana_program::program::invoke_signed(
         &jupiter_ix,
         accounts,
         signer_seeds,
     ).map_err(|e| {
-        // ✅ FIXED: Preserve actual error information
-        msg!("Jupiter CPI failed: {:?}", e);
+        // ✅ FIXED: Preserve actual error information with enhanced context
+        msg!("❌ Jupiter CPI failed with error: {:?}", e);
+        msg!("🔍 Error context:");
+        msg!("  - Accounts provided: {}", accounts.len());
+        msg!("  - Data length: {} bytes", data_len);
+        msg!("  - Signer seeds: {} groups", signer_seeds.len());
+        msg!("  - Vault authority found: {}", vault_authority_found);
         error!(ErrorCode::JupiterSwapFailed)
-    })
+    })?;
+    
+    msg!("✅ Jupiter CPI completed successfully");
+    Ok(())
 }
 
 /// Check Pyth price feed staleness

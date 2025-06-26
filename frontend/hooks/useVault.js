@@ -110,7 +110,7 @@ export const useVault = () => {
         description: `Staked ${amount} CALVIN tokens`,
         action: signature ? {
           label: 'View Transaction',
-          onClick: () => window.open(`https://explorer.solana.com/tx/${signature}?cluster=devnet`, '_blank')
+          onClick: () => window.open(`https://explorer.solana.com/tx/${signature}?cluster=mainnet`, '_blank')
         } : undefined
       });
 
@@ -147,7 +147,7 @@ export const useVault = () => {
         description: `Unstaked ${amount} CALVIN tokens`,
         action: signature ? {
           label: 'View Transaction',
-          onClick: () => window.open(`https://explorer.solana.com/tx/${signature}?cluster=devnet`, '_blank')
+          onClick: () => window.open(`https://explorer.solana.com/tx/${signature}?cluster=mainnet`, '_blank')
         } : undefined
       });
 
@@ -184,7 +184,7 @@ export const useVault = () => {
         description: `Deposited ${amount} USDC to vault`,
         action: signature ? {
           label: 'View Transaction',
-          onClick: () => window.open(`https://explorer.solana.com/tx/${signature}?cluster=devnet`, '_blank')
+          onClick: () => window.open(`https://explorer.solana.com/tx/${signature}?cluster=mainnet`, '_blank')
         } : undefined
       });
 
@@ -221,7 +221,7 @@ export const useVault = () => {
         description: `Withdrew ${shares} shares from vault`,
         action: signature ? {
           label: 'View Transaction',
-          onClick: () => window.open(`https://explorer.solana.com/tx/${signature}?cluster=devnet`, '_blank')
+          onClick: () => window.open(`https://explorer.solana.com/tx/${signature}?cluster=mainnet`, '_blank')
         } : undefined
       });
 
@@ -256,7 +256,8 @@ export const useVault = () => {
   // Check if user can unstake (must have zero vault shares)
   const canUnstake = useMemo(() => {
     if (!userVaultPosition) return false;
-    return parseFloat(userVaultPosition.sharesFormatted) === 0;
+    // Use raw shares value to avoid precision issues with very small amounts
+    return parseFloat(userVaultPosition.shares || '0') === 0;
   }, [userVaultPosition]);
 
   // Calculate user's tier info

@@ -42,11 +42,11 @@ def fetch_token_metadata(api_key, token_addresses):
 def connect_to_database():
     """Connect to the Calvin AI database"""
     db_config = {
-        'host': get_env_var('DB_HOST', False) or 'localhost',
-        'port': get_env_var('DB_PORT', False) or '6432',
-        'database': get_env_var('DB_NAME', False) or 'calvin_trading_dev',
-        'user': get_env_var('DB_USER', False) or 'calvin_dev',
-        'password': get_env_var('DB_PASSWORD_DEV', False) or get_env_var('DB_PASSWORD', False)
+        'host': get_env_var('DB_HOST', False) or '172.31.31.43',
+        'port': get_env_var('DB_PORT', False) or '5433',
+        'database': get_env_var('DB_NAME', False) or 'calvin_trading',
+        'user': get_env_var('DB_USER', False) or 'calvin_prod',
+        'password': get_env_var('DB_PASSWORD', False)
     }
     
     try:

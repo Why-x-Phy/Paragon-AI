@@ -639,45 +639,77 @@ class ProductionDBManager:
     # =========================================================================
     
     async def insert_ohlcv_data(self, ohlcv_data: List[OHLCVData]) -> int:
-        """Insert OHLCV data in batch"""
+        """Insert OHLCV data in batch with proper connection management"""
         if not ohlcv_data:
             return 0
             
         try:
-            query = """
-                INSERT INTO ohlcv (time, token_id, resolution, open, high, low, close, 
-                                 volume, volume_usd, trades_count, data_source)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                ON CONFLICT (time, token_id, resolution) DO UPDATE SET
-                    open = EXCLUDED.open,
-                    high = EXCLUDED.high,
-                    low = EXCLUDED.low,
-                    close = EXCLUDED.close,
-                    volume = EXCLUDED.volume,
-                    volume_usd = EXCLUDED.volume_usd,
-                    trades_count = EXCLUDED.trades_count,
-                    data_source = EXCLUDED.data_source
-            """
-            
-            async with self.pg_pool.acquire() as conn:
-                await conn.executemany(query, [
-                    (
-                        data.time, data.token_id, data.resolution,
-                        data.open, data.high, data.low, data.close,
-                        data.volume, data.volume_usd, data.trades_count, data.data_source
-                    )
-                    for data in ohlcv_data
-                ])
-            
-            # Cache latest prices in Redis
-            await self._cache_latest_prices(ohlcv_data)
-            
-            self.logger.debug(f"Inserted {len(ohlcv_data)} OHLCV records")
-            return len(ohlcv_data)
-            
+            # Use a timeout to prevent hanging operations
+            async with asyncio.timeout(30.0):  # 30 second timeout for batch operations
+                query = """
+                    INSERT INTO ohlcv (time, token_id, resolution, open, high, low, close, 
+                                     volume, volume_usd, trades_count, data_source)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    ON CONFLICT (time, token_id, resolution) DO UPDATE SET
+                        open = EXCLUDED.open,
+                        high = EXCLUDED.high,
+                        low = EXCLUDED.low,
+                        close = EXCLUDED.close,
+                        volume = EXCLUDED.volume,
+                        volume_usd = EXCLUDED.volume_usd,
+                        trades_count = EXCLUDED.trades_count,
+                        data_source = EXCLUDED.data_source
+                """
+                
+                # Use a dedicated connection for this batch operation
+                async with self.pg_pool.acquire() as conn:
+                    try:
+                        # Process in smaller chunks to avoid long-running transactions
+                        chunk_size = 50
+                        total_inserted = 0
+                        
+                        for i in range(0, len(ohlcv_data), chunk_size):
+                            chunk = ohlcv_data[i:i + chunk_size]
+                            
+                            # Prepare batch data
+                            batch_data = [
+                                (
+                                    data.time, data.token_id, data.resolution,
+                                    data.open, data.high, data.low, data.close,
+                                    data.volume, data.volume_usd or 0.0,
+                                    data.trades_count or 0, data.data_source
+                                )
+                                for data in chunk
+                            ]
+                            
+                            # Execute batch with proper error handling
+                            try:
+                                await conn.executemany(query, batch_data)
+                                total_inserted += len(batch_data)
+                            except Exception as chunk_error:
+                                self.logger.error(f"Failed to insert OHLCV chunk: {chunk_error}")
+                                # Continue with next chunk instead of failing completely
+                                continue
+                        
+                        # Update cache for latest prices (non-blocking)
+                        try:
+                            await self._cache_latest_prices(ohlcv_data)
+                        except Exception as cache_error:
+                            self.logger.warning(f"Failed to update price cache: {cache_error}")
+                            # Don't fail the whole operation for cache issues
+                        
+                        return total_inserted
+                        
+                    except Exception as conn_error:
+                        self.logger.error(f"Connection error during OHLCV insertion: {conn_error}")
+                        return 0
+                        
+        except asyncio.TimeoutError:
+            self.logger.error(f"OHLCV insertion timed out for {len(ohlcv_data)} records")
+            return 0
         except Exception as e:
             self.logger.error(f"Failed to insert OHLCV data: {e}")
-            raise DatabaseOperationError(f"Failed to insert OHLCV data: {e}")
+            return 0
     
     async def get_ohlcv_data(
         self, 
@@ -1643,40 +1675,44 @@ class ProductionDBManager:
             return []
 
     async def record_health_check(self, component: str, status: str, details: Dict = None):
-        """Record health check with improved concurrency handling"""
+        """Record a health check event with proper async connection handling"""
         try:
-            # Acquire connection with timeout, then use it in async context manager
-            conn = await asyncio.wait_for(self.pg_pool.acquire(), timeout=5.0)
-            try:
-                await conn.execute("""
-                    INSERT INTO system_health (component, status, details, check_time)
-                    VALUES ($1, $2, $3, NOW())
-                """, component, status, json.dumps(details or {}))
+            # Use a timeout to prevent hanging connections
+            async with asyncio.timeout(5.0):  # 5 second timeout
+                query = """
+                    INSERT INTO system_health 
+                    (check_time, component, status, details)
+                    VALUES (NOW(), $1, $2, $3)
+                """
                 
-                self.logger.debug(f"Recorded health check: {component} - {status}")
-            finally:
-                # Always release connection back to pool
-                await self.pg_pool.release(conn)
-                
+                # Use a dedicated connection from the pool with proper cleanup
+                async with self.pg_pool.acquire() as conn:
+                    try:
+                        await conn.execute(query, component, status, json.dumps(details) if details else None)
+                        self.logger.debug(f"✅ Health check recorded: {component} -> {status}")
+                    except Exception as exec_error:
+                        # Don't let execution errors propagate and cause connection issues
+                        self.logger.error(f"Failed to execute health check query: {exec_error}")
+                        
         except asyncio.TimeoutError:
-            self.logger.warning(f"Health check recording timed out for {component}")
+            self.logger.warning(f"Health check recording timed out for component: {component}")
         except Exception as e:
-            # Don't raise exceptions from health checks to prevent cascading failures
-            self.logger.warning(f"Failed to record health check for {component}: {e}")
+            # Catch all exceptions to prevent unhandled async task errors
+            self.logger.error(f"Failed to record health check for {component}: {e}")
+            # Don't re-raise the exception as this would create "Future exception was never retrieved"
 
     async def health_check(self) -> bool:
         """Enhanced health check with connection pool monitoring"""
         try:
             # Quick PostgreSQL check with timeout
-            conn = await asyncio.wait_for(self.pg_pool.acquire(), timeout=3.0)
-            try:
-                await conn.fetchval("SELECT 1")
-            finally:
-                await self.pg_pool.release(conn)
+            async with asyncio.timeout(3.0):
+                async with self.pg_pool.acquire() as conn:
+                    await conn.fetchval("SELECT 1")
             
             # Quick Redis check with timeout
             if self.redis_client:
-                await asyncio.wait_for(self.redis_client.ping(), timeout=3.0)
+                async with asyncio.timeout(3.0):
+                    await self.redis_client.ping()
             
             return True
             

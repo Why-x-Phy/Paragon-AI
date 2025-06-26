@@ -15,7 +15,7 @@ pub struct Trade<'info> {
         constraint = !vault.paused @ ErrorCode::VaultPaused,
         constraint = !vault.trading_paused @ ErrorCode::TradingPaused,
     )]
-    pub vault: Account<'info, Vault>,
+    pub vault: Box<Account<'info, Vault>>,
     
     /// The vault's USDC token account
     #[account(
@@ -63,7 +63,7 @@ pub struct Trade<'info> {
         constraint = source_token_whitelist.mint == source_mint.key() @ ErrorCode::TokenNotWhitelisted,
         constraint = source_token_whitelist.is_active @ ErrorCode::TokenNotWhitelisted,
     )]
-    pub source_token_whitelist: Account<'info, TokenWhitelist>,
+    pub source_token_whitelist: Box<Account<'info, TokenWhitelist>>,
     
     /// Destination token whitelist entry (validates destination token is whitelisted)
     #[account(
@@ -73,7 +73,7 @@ pub struct Trade<'info> {
         constraint = destination_token_whitelist.mint == destination_mint.key() @ ErrorCode::TokenNotWhitelisted,
         constraint = destination_token_whitelist.is_active @ ErrorCode::TokenNotWhitelisted,
     )]
-    pub destination_token_whitelist: Account<'info, TokenWhitelist>,
+    pub destination_token_whitelist: Box<Account<'info, TokenWhitelist>>,
     
     /// Price oracle account for source token (Pyth price feed)
     /// CHECK: Validated by utils::current_nav_usdc function
@@ -164,11 +164,11 @@ pub fn trade(ctx: Context<Trade>, data: Vec<u8>) -> Result<()> {
         return Err(error!(ErrorCode::InvalidOracleAccount));
     }
     
-    // Get amount to trade (from the source token account)
-    let amount_in = ctx.accounts.source_token_account.amount;
+    // Record source balance before swap to calculate actual swap amount
+    let source_balance_before = ctx.accounts.source_token_account.amount;
     
     // 🔒 VALIDATE TRADE AMOUNT
-    if amount_in == 0 {
+    if source_balance_before == 0 {
         vault.reentrancy_guard = false;
         return Err(error!(ErrorCode::InvalidAmount));
     }
@@ -185,17 +185,64 @@ pub fn trade(ctx: Context<Trade>, data: Vec<u8>) -> Result<()> {
         &[vault.authority_bump],
     ];
     
-    // Calculate pre-trade NAV for comparison
+    // Split remaining_accounts into oracle accounts and Jupiter accounts
+    // The vault expects oracle accounts in groups of 3: [token_account, price_oracle, token_mint]
+    // followed by Jupiter accounts for the swap
+    // We need to determine how many oracle groups are provided
+    
+    // **IMPROVED LOGIC**: Dynamically determine oracle count based on actual remaining accounts
+    // The vault client sends oracle accounts in groups of 3, followed by Jupiter accounts
+    // Look for a pattern where we have oracle account groups followed by Jupiter accounts
+    
+    let oracle_count = {
+        let total_remaining = ctx.remaining_accounts.len();
+        
+        // **CRITICAL FIX**: Be more flexible with oracle account detection
+        // The client might send different numbers of oracle accounts based on available tokens
+        if total_remaining >= 21 {
+            // Standard case: 6 oracle accounts (2 tokens × 3) + 15 Jupiter accounts = 21 total
+            6
+        } else if total_remaining >= 18 {
+            // Alternative case: 6 oracle accounts + fewer Jupiter accounts
+            6  
+        } else if total_remaining >= 15 {
+            // Minimal case: No oracle accounts, just Jupiter accounts
+            0
+        } else if total_remaining >= 12 {
+            // Legacy case: 12 oracle accounts (4 tokens × 3) but fewer Jupiter accounts
+            // This might be from older client logic
+            12.min(total_remaining - 3) // Ensure at least 3 Jupiter accounts remain
+    } else {
+            // Very few accounts - assume all are Jupiter accounts
+            0
+        }
+    };
+    
+    // **SAFETY CHECK**: Ensure we don't split beyond array bounds
+    let safe_oracle_count = oracle_count.min(ctx.remaining_accounts.len());
+    
+    let (oracle_accounts, jupiter_accounts) = ctx.remaining_accounts.split_at(safe_oracle_count);
+    
+    // **ENHANCED LOGGING**: Log account distribution for debugging
+    msg!("Calculating NAV with {} remaining accounts", ctx.remaining_accounts.len());
+    msg!("Oracle accounts: {}, Jupiter accounts: {}", oracle_accounts.len(), jupiter_accounts.len());
+    
+    // **CRITICAL CHECK**: Ensure Jupiter has enough accounts to execute
+    if jupiter_accounts.len() < 10 {
+        msg!("⚠️ Warning: Jupiter received only {} accounts, may cause execution failure", jupiter_accounts.len());
+    }
+    
+    // Calculate pre-trade NAV
     let pre_trade_nav = utils::current_nav_usdc(
         vault,
         &ctx.accounts.vault_usdc_token,
-        ctx.remaining_accounts,
+        oracle_accounts,
     )?;
     
-    // Execute Jupiter swap
+    // Execute Jupiter swap using only the Jupiter accounts
     utils::forward_jupiter(
         ctx.accounts.jupiter_program.to_account_info(),
-        ctx.remaining_accounts,
+        jupiter_accounts,  // Only Jupiter accounts, not oracle accounts
         data.clone(),
         &[vault_authority_seeds],
         &vault.vault_authority,
@@ -205,7 +252,7 @@ pub fn trade(ctx: Context<Trade>, data: Vec<u8>) -> Result<()> {
     let post_trade_nav = utils::current_nav_usdc(
         vault,
         &ctx.accounts.vault_usdc_token,
-        ctx.remaining_accounts,
+        oracle_accounts,
     )?;
     
     let destination_balance_after = ctx.accounts.destination_token_account.amount;
@@ -213,13 +260,16 @@ pub fn trade(ctx: Context<Trade>, data: Vec<u8>) -> Result<()> {
         .checked_sub(destination_balance_before)
         .ok_or(error!(ErrorCode::ArithmeticError))?;
     
+    // Calculate actual amount swapped from source token
+    let source_balance_after = ctx.accounts.source_token_account.amount;
+    let amount_in = source_balance_before
+        .checked_sub(source_balance_after)
+        .ok_or(error!(ErrorCode::ArithmeticError))?;
+    
     // Get current NAV including the new token positions with actual price feeds
-    // Prepare remaining accounts for NAV calculation
+    // Prepare remaining accounts for NAV calculation - ONLY oracle accounts in groups of 3
     let nav_remaining_accounts = vec![
-        // First 2 accounts are placeholders for staking program accounts
-        ctx.accounts.vault_authority.to_account_info(), // placeholder
-        ctx.accounts.vault_authority.to_account_info(), // placeholder
-        // Then oracle data in groups of 3: [token_account, price_account, mint_account]
+        // Oracle data in groups of 3: [token_account, price_account, mint_account]
         ctx.accounts.source_token_account.to_account_info(),
         ctx.accounts.source_price_account.to_account_info(),
         ctx.accounts.source_mint.to_account_info(),
@@ -259,8 +309,13 @@ pub fn trade(ctx: Context<Trade>, data: Vec<u8>) -> Result<()> {
         return Err(e);
     }
     
-    // 🎯 COLLECT PERFORMANCE FEES IMMEDIATELY ON PROFITS
-    if post_trade_nav > vault.high_water_mark_nav {
+    // 🎯 COLLECT PERFORMANCE FEES ONLY ON PROFITABLE USDC EXITS
+    // Performance fees should only be collected when:
+    // 1. Selling tokens FOR USDC (destination mint is USDC)
+    // 2. NAV increases above high water mark (profitable trade)
+    let is_selling_for_usdc = ctx.accounts.destination_mint.key() == vault.usdc_mint;
+    
+    if is_selling_for_usdc && post_trade_nav > vault.high_water_mark_nav {
         let performance_fee = utils::calculate_performance_fee(
             post_trade_nav, 
             vault.high_water_mark_nav
@@ -281,6 +336,8 @@ pub fn trade(ctx: Context<Trade>, data: Vec<u8>) -> Result<()> {
             )?;
             
             vault.high_water_mark_nav = post_trade_nav.saturating_sub(performance_fee);
+            
+            msg!("💰 Performance fee collected: {} USDC (profitable sale)", performance_fee);
         }
     }
     

@@ -11,7 +11,7 @@ pub struct Withdraw<'info> {
     
     /// The vault account
     #[account(mut)]
-    pub vault: Account<'info, Vault>,
+    pub vault: Box<Account<'info, Vault>>,
     
     /// User's vault position account
     #[account(
@@ -21,7 +21,7 @@ pub struct Withdraw<'info> {
         constraint = user_position.user_authority == user.key(),
         constraint = user_position.vault == vault.key(),
     )]
-    pub user_position: Account<'info, UserPosition>,
+    pub user_position: Box<Account<'info, UserPosition>>,
     
     /// The user's USDC token account
     #[account(

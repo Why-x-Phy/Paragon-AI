@@ -62,8 +62,8 @@ export const useTrades = () => {
   useEffect(() => {
     fetchTrades();
     
-    // Auto-refresh every 30 seconds for live updates
-    const interval = setInterval(fetchTrades, 30000);
+    // Auto-refresh every 60 seconds to reduce rate limits
+    const interval = setInterval(fetchTrades, 60000);
     return () => clearInterval(interval);
   }, [fetchTrades]);
 

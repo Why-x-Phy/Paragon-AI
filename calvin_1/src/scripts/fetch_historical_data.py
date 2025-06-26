@@ -4,7 +4,7 @@ Script to fetch and store historical OHLCV data from BirdEye API
 with support for multiple API keys, configurable resolution, and time periods.
 
 Usage:
-    python src/scripts/fetch_historical_data.py --token-address MNDEFzGvMt87ueuHvVU9VcTqsAP5b3fTGPsHuuPA5ey --resolution 1H --days 100 --max-workers 4
+    python src/scripts/fetch_historical_data.py --all-tokens --resolution 1H --days 10 --max-workers 4
 """
 
 import os
@@ -534,7 +534,7 @@ async def main_async():
     parser.add_argument(
         "--delay-between-tokens", 
         type=float, 
-        default=10.0,
+        default=1.0,
         help="Delay between processing different tokens in seconds (for --all-tokens)"
     )
     

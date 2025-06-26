@@ -1,1 +1,1 @@
-"calvin_dev" "calvin_dev_password"
+"calvin_prod" "md5842e7d11821e663f3d245b226eff6db7"

@@ -1,6 +1,8 @@
 import NextAuth from 'next-auth'
 import DiscordProvider from 'next-auth/providers/discord'
 
+export const dynamic = 'force-dynamic'
+
 const handler = NextAuth({
   providers: [
     DiscordProvider({
@@ -18,6 +20,8 @@ const handler = NextAuth({
     async signIn({ user, account }) {
       if (account.provider === 'discord') {
         try {
+          console.log('🔍 Checking Discord guild membership for user:', user.name);
+          
           const response = await fetch(`https://discord.com/api/v10/users/@me/guilds/${process.env.DISCORD_SERVER_ID}/member`, {
             headers: {
               Authorization: `Bearer ${account.access_token}`
@@ -25,21 +29,28 @@ const handler = NextAuth({
           })
 
           if (!response.ok) {
-            console.log('Failed to fetch Discord guild member info:', response.status)
+            console.log('❌ Failed to fetch Discord guild member info:', {
+              status: response.status,
+              statusText: response.statusText,
+              serverId: process.env.DISCORD_SERVER_ID
+            });
             return false
           }
 
           const data = await response.json()
+          console.log('📋 User roles:', data.roles);
+          console.log('🎯 Required role:', process.env.REQUIRED_ROLE_ID);
+          
           const hasRequiredRole = data.roles.includes(process.env.REQUIRED_ROLE_ID)
           
           if (!hasRequiredRole) {
-            console.log('User does not have required role:', process.env.REQUIRED_ROLE_ID)
+            console.log('❌ User does not have required role:', process.env.REQUIRED_ROLE_ID)
             return false
           }
 
-          console.log('User authenticated successfully with required role')
+          console.log('✅ User authenticated successfully with required role')
         } catch (error) {
-          console.error('Discord role check error:', error)
+          console.error('❌ Discord role check error:', error)
           return false
         }
       }

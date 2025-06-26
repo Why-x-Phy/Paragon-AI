@@ -227,10 +227,10 @@ class VaultTradeExecutor:
             # 3. Execute through vault smart contract (or simulate)
             if self.vault_client:
                 tx_sig = await self.vault_client.execute_trade(
-                    jupiter_data,
-                    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC mint
-                    token_mint,  # destination mint
-                    allocation.position_value_usdc
+                    jupiter_data=jupiter_data,
+                    source_mint="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                    destination_mint=token_mint,  # target token
+                    amount_usdc=allocation.position_value_usdc
                 )
             else:
                 # Simulate vault execution
@@ -288,10 +288,24 @@ class VaultTradeExecutor:
                 logger.error(f"❌ Jupiter quote validation failed")
                 return None
             
-            # Get swap transaction data
-            swap_data = await self.jupiter_client.get_swap_transaction(quote)
+            # Get swap instruction data using Node.js bridge
+            # ✅ CRITICAL FIX: Use vault authority PDA for Jupiter instruction generation
+            # The vault program will handle the signing via CPI with PDA seeds
+            vault_authority_pda = str(self.vault_client._get_vault_authority_pda()) if self.vault_client else "6tMyF1Q5GScmXCJGSgpsKQtMPSPgkREwWuWWNspcmV8U"
+            swap_data = await self.jupiter_client.get_swap_transaction(
+                quote, 
+                vault_authority_pda,  # Vault authority PDA (will sign via CPI)
+                slippage_bps
+            )
             
-            logger.debug(f"✅ Created Jupiter trade: {amount_usdc} USDC → {output_mint}")
+            if not swap_data or not swap_data.get('sdk_generated'):
+                logger.error(f"❌ Failed to generate Jupiter instruction via Node.js bridge")
+                return None
+            
+            logger.debug(f"✅ Created Jupiter trade via Node.js bridge: {amount_usdc} USDC → {output_mint}")
+            logger.debug(f"  - Generated {len(swap_data.get('accounts', []))} accounts")
+            logger.debug(f"  - Instruction data: {len(swap_data.get('instruction_data', ''))} chars")
+            
             return swap_data
             
         except Exception as e:

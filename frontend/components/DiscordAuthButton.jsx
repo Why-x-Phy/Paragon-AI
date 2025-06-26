@@ -46,9 +46,34 @@ export default function DiscordAuthButton() {
     )
   }
 
+  const handleSignIn = async () => {
+    try {
+      console.log('🔍 Attempting Discord sign-in...');
+      
+      // Check if NextAuth is available
+      if (!signIn) {
+        console.error('❌ NextAuth signIn function not available');
+        alert('Authentication system not loaded. Please refresh the page.');
+        return;
+      }
+
+      // Call signIn with debugging
+      const result = await signIn('discord', { 
+        callbackUrl: window.location.origin,
+        redirect: true 
+      });
+      
+      console.log('📋 SignIn result:', result);
+      
+    } catch (error) {
+      console.error('❌ Discord sign-in error:', error);
+      alert(`Authentication failed: ${error.message}`);
+    }
+  }
+
   return (
     <button 
-      onClick={() => signIn('discord')}
+      onClick={handleSignIn}
       className="px-6 py-3 bg-[#5865F2] hover:bg-[#4752C4] text-white rounded-lg transition-colors flex items-center gap-2"
     >
       <svg className="w-5 h-5" viewBox="0 0 24 24" fill="currentColor">

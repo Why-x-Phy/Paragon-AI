@@ -28,7 +28,7 @@ pub const VAULT_PASS_MINT_SEED: &[u8] = b"vault_pass_mint";
 
 // CALVIN token details
 pub const CALVIN_TOKEN_DECIMALS: u8 = 6;
-pub const CALVIN_TOKEN_ADDRESS: &str = "CrWbUJ4kMgduYDVRK8bDXhNBHr8cScixi79nGdGejnb1";
+pub const CALVIN_TOKEN_ADDRESS: &str = "229vWzBTiUNdraYpVtSH9usTwwVxcyPDbBWf1zEPpump";
 
 // Vault Pass token details
 pub const VAULT_PASS_DECIMALS: u8 = 0; // Non-divisible tokens 

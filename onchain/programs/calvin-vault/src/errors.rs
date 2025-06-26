@@ -224,6 +224,12 @@ pub enum VaultError {
 
     #[msg("Security feature not enabled")]
     SecurityFeatureNotEnabled,
+
+    #[msg("Invalid account configuration")]
+    InvalidAccountConfiguration,
+
+    #[msg("No signers found in transaction")]
+    NoSignersFound,
 }
 
 // Re-export for easier use in other modules

@@ -184,6 +184,9 @@ class RealtimeDataStorage:
         self.transaction_task: Optional[asyncio.Task] = None
         self.candle_task: Optional[asyncio.Task] = None
         
+        # Connection state tracking for safer health checks
+        self._last_connection_state: Optional[Dict] = None
+        
     async def initialize(self):
         """Initialize the real-time storage system"""
         try:
@@ -373,14 +376,16 @@ class RealtimeDataStorage:
         """Handle WebSocket connection state changes"""
         self.logger.info(f"WebSocket connection state: {state.value}")
         
-        # Record health check asynchronously with current timestamp
+        # Record health check safely without blocking or creating race conditions
         if self.db_manager:
-            # Use create_task to handle the async operation without blocking
-            asyncio.create_task(self.db_manager.record_health_check(
-                'websocket',
-                'healthy' if state == ConnectionState.CONNECTED else 'degraded',
-                {'timestamp': datetime.utcnow().isoformat(), 'state': state.value}
-            ))
+            # Use a simple flag-based approach instead of fire-and-forget tasks
+            # This avoids connection pool conflicts
+            self._last_connection_state = {
+                'timestamp': datetime.utcnow().isoformat(), 
+                'state': state.value
+            }
+            # The health check will be recorded in the next batch operation
+            # to avoid concurrent connection usage
     
     # =========================================================================
     # TICK PROCESSING

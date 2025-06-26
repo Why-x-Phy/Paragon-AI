@@ -6,22 +6,19 @@ resolution = true
 skip-lint = false
 
 [programs.mainnet]
-calvin_staking = "CNfW3eVGXVFb4cUo48xEsbxrqcJsrsHcKkLAD6ycJC81"
-calvin_vault = "7soxQcqTSQeQeT7dcSKBskvh46DoLEWAEhzPcW8Nv3em"
+calvin_staking = "8kMj6gYFVUC3Ya6qwu3tyaZweyXUUuR8t8aCtA47aX7W"
+calvin_vault = "tXMJu1KaBQU5DSk94QXMtigQpzxbK62WJVUs2Xmxz7z"
 
 [programs.devnet]
 calvin_staking = "FH8te8ebpGLRUc32pZHj4q6DUwzt3KykQYZyA4NQPsod"
 calvin_vault = "Evdjoh1AHQb6Ls1n7Td7buAiDA5ty7Ec8NCYt8eWEXFp"
 
 [programs.localnet]
-calvin_staking = "BMeQT4VD9X4RFYT8MAmofKJk14dFyFrBWqJJzTeNgGtW"
-calvin_vault = "7rky4NGhHtUREVJLKnAKwapDBmzCMbEno6VDcFZXyWxA"
+calvin_staking = "5RBEFruhEtwXaXR6nMLxM94t9yEUcSZbtoR33rP22oqZ"
+calvin_vault = "HsRMhLLDiwAcAiLcYFmsSoE4Pz1Din4aW75TwP7usPCm"
 
 [registry]
 url = "https://api.apr.dev"
-
-[build]
-features = ["custom-heap", "custom-panic", "anchor-debug"]
 
 [provider]
 cluster = "https://mainnet.helius-rpc.com/?api-key=acfda155-4d7f-4930-8ac4-ddd9eebfb70d"

@@ -136,7 +136,7 @@ services:
       - '--web.console.templates=/etc/prometheus/consoles'
       - '--storage.tsdb.retention.time=30d'
       - '--web.enable-lifecycle'
-      - '--web.external-url=http://YOUR_SERVER_IP:9090'
+      - '--web.external-url=http://172.31.31.43:9090'
     networks:
       - calvin-prod-network
     restart: unless-stopped
@@ -164,7 +164,7 @@ services:
       GF_USERS_ALLOW_SIGN_UP: false
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
       GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
-      GF_SERVER_ROOT_URL: http://YOUR_SERVER_IP:3000
+      GF_SERVER_ROOT_URL: http://172.31.31.43:3000
       GF_SERVER_SERVE_FROM_SUB_PATH: false
     volumes:
       - grafana_data:/var/lib/grafana

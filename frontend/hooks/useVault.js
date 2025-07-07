@@ -32,7 +32,13 @@ export const useVault = () => {
   // Create vault client instance
   const vaultClient = useMemo(() => {
     if (!wallet) return null;
-    return new VaultClient(wallet, new Connection(CONTRACTS.RPC_ENDPOINT, CONTRACTS.COMMITMENT));
+    // Create connection with versioned transaction support
+    // This is critical for Pyth price feeds to work correctly
+    const connection = new Connection(CONTRACTS.RPC_ENDPOINT, {
+      commitment: CONTRACTS.COMMITMENT,
+      maxSupportedTransactionVersion: 0,
+    });
+    return new VaultClient(wallet, connection);
   }, [wallet]);
 
   // Helper to update transaction state

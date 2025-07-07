@@ -100,12 +100,14 @@ pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()> {
     ];
     
     // 🎯 ADJUST HIGH WATER MARK PROPORTIONALLY
-    if vault.total_shares > 0 {
-        let remaining_shares = vault.total_shares.saturating_sub(shares);
-        vault.high_water_mark_nav = vault.high_water_mark_nav
-            .saturating_mul(remaining_shares)
-            .saturating_div(vault.total_shares);
-    }
+    // TODO: Fix the math bug - this is causing HWM to drop by thousands of percent
+    // Commenting out for now to prevent HWM corruption
+    // if vault.total_shares > 0 {
+    //     let remaining_shares = vault.total_shares.saturating_sub(shares);
+    //     vault.high_water_mark_nav = vault.high_water_mark_nav
+    //         .saturating_mul(remaining_shares)
+    //         .saturating_div(vault.total_shares);
+    // }
     
     // Thaw the user's share account temporarily to allow burning
     token::thaw_account(

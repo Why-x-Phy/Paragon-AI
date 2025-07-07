@@ -17,25 +17,30 @@ export default function WithdrawModal({ isOpen, onClose }) {
     refreshData 
   } = useVault();
   
-  // Calculate available shares to withdraw
+  // Use formatted values with consistent precision
   const availableShares = userVaultPosition ? parseFloat(userVaultPosition.sharesFormatted) : 0;
   const availableUsdc = userVaultPosition ? parseFloat(userVaultPosition.usdcValueFormatted) : 0;
   const walletUsdc = userTokenBalances ? parseFloat(userTokenBalances.usdcFormatted) : 0;
   
-  // Helper function to format very small numbers with appropriate precision
-  const formatSmallNumber = (num) => {
-    if (num === 0) return '0.000';
+  // Consistent formatting function for all share amounts (6 decimal places)
+  const formatShares = (num) => {
+    if (num === 0) return '0.000000';
     if (num < 0.000001) return '< 0.000001';
-    if (num < 0.001) return num.toFixed(6);
-    return num.toFixed(3);
+    return num.toFixed(6);
+  };
+
+  // Consistent formatting function for USDC amounts (2 decimal places)
+  const formatUsdc = (num) => {
+    if (num === 0) return '0.00';
+    return num.toFixed(2);
   };
   
   const balances = {
     title: 'Your Balance',
     balances: [
-      { label: 'vCALVIN Shares', amount: formatSmallNumber(availableShares) },
-      { label: 'USDC Value', amount: `$${availableUsdc.toFixed(2)}` },
-      { label: 'USDC in Wallet', amount: `$${walletUsdc.toFixed(2)}` }
+      { label: 'vCALVIN Shares', amount: formatShares(availableShares) },
+      { label: 'USDC Value', amount: `$${formatUsdc(availableUsdc)}` },
+      { label: 'USDC in Wallet', amount: `$${formatUsdc(walletUsdc)}` }
     ]
   };
 
@@ -51,10 +56,10 @@ export default function WithdrawModal({ isOpen, onClose }) {
 
       const withdrawAmount = Number(amount);
       
-      // Use a small epsilon for floating point comparison
+      // Use appropriate epsilon for 6 decimal place precision
       const epsilon = 0.000001;
       if (withdrawAmount > (availableShares + epsilon)) {
-        toast.error(`Cannot withdraw more than ${formatSmallNumber(availableShares)} shares`);
+        toast.error(`Cannot withdraw more than ${formatShares(availableShares)} shares`);
         return;
       }
 
@@ -81,14 +86,15 @@ export default function WithdrawModal({ isOpen, onClose }) {
     }
   };
 
-  // Function to set maximum available shares
+  // Function to set maximum available shares using the raw precision value
   const setMaxShares = () => {
-    // Use the raw shares value with full precision to avoid rounding issues
-    const rawShares = userVaultPosition?.shares ? (parseFloat(userVaultPosition.shares) / 1000000).toString() : '0';
-    setAmount(rawShares);
+    // Use the raw shares value and format it to 6 decimal places for maximum precision
+    const rawShares = userVaultPosition?.shares || '0';
+    const maxShares = (parseFloat(rawShares) / 1000000).toFixed(6); // Convert from raw to decimal with 6 places
+    setAmount(maxShares);
   };
 
-  // Check if user has any shares (even very small amounts)
+  // Check if user has any shares (use raw shares to detect even tiny amounts)
   const hasShares = userVaultPosition && parseFloat(userVaultPosition.shares || '0') > 0;
 
   return (
@@ -113,15 +119,15 @@ export default function WithdrawModal({ isOpen, onClose }) {
                             className="text-[#B73E15] text-sm hover:underline"
                             disabled={!hasShares}
                         >
-                            Max: {formatSmallNumber(availableShares)} shares
+                            Max: {formatShares(availableShares)} shares
                         </button>
                     </div>
                 <input
                     type="number"
-                        step="0.000001"
+                    step="0.000001"
                     value={amount}
                     onChange={(e) => setAmount(e.target.value)}
-                    placeholder="Please enter amount here"
+                    placeholder="0.000000"
                     className="w-full bg-black/75 rounded-[4px] p-3 text-white no-spinner"
                 />
                 </div>

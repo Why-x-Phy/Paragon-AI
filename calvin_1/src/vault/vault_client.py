@@ -40,6 +40,9 @@ from .jupiter_client import JupiterV6Client
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 JUPITER_PROGRAM_ID = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+# Modern Pyth integration
+HERMES_ENDPOINT = "https://hermes.pyth.network"
+PYTH_RECEIVER_PROGRAM_ID = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ"
 
 logger = log
 
@@ -163,11 +166,6 @@ class VaultClient:
 
     async def close(self):
         """Close async connections"""
-        # Close ALT manager first
-        if self.alt_manager:
-            await self.alt_manager.cleanup()
-            logger.debug("✅ ALT Manager closed")
-            
         if self.client:
             await self.client.close()
             self.client = None
@@ -282,7 +280,6 @@ class VaultClient:
             
             # The vault expects remaining_accounts to contain oracle data for ALL whitelisted tokens,
             # not just the two being traded. Since we don't know which tokens are whitelisted,
-            # let's try with empty remaining_accounts to bypass NAV calculation.
             # The vault has oracle accounts in main instruction (sourcePriceAccount, destinationPriceAccount)
             # which should be sufficient for the trade itself.
             
@@ -328,20 +325,25 @@ class VaultClient:
                         unique_oracle_tokens.append(token)
                         break
             
-            # Build oracle account groups (3 accounts per token)
+            # Build oracle account groups using modern pull oracle approach (3 accounts per token)
+            oracle_accounts_dict = await self.get_oracle_accounts_for_tokens(unique_oracle_tokens[:4])
+            
             for token_mint in unique_oracle_tokens[:4]:  # Limit to 4 tokens
                 try:
                     # Get token account, oracle, and mint for this token
                     token_account = self._get_vault_token_account(token_mint, vault_authority_pda)
-                    oracle_account = await self._get_oracle_for_token(token_mint)
+                    oracle_account = oracle_accounts_dict.get(token_mint)
                     mint_account = Pubkey.from_string(token_mint)
                     
-                    # Add the 3-account group
-                    remaining_accounts.extend([
-                        {"pubkey": token_account, "is_signer": False, "is_writable": False},
-                        {"pubkey": oracle_account, "is_signer": False, "is_writable": False},
-                        {"pubkey": mint_account, "is_signer": False, "is_writable": False},
-                    ])
+                    if oracle_account:
+                        # Add the 3-account group
+                        remaining_accounts.extend([
+                            {"pubkey": token_account, "is_signer": False, "is_writable": False},
+                            {"pubkey": oracle_account, "is_signer": False, "is_writable": False},
+                            {"pubkey": mint_account, "is_signer": False, "is_writable": False},
+                        ])
+                    else:
+                        logger.warning(f"⚠️ No oracle account created for {token_mint}")
                     
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to add oracle group for {token_mint}: {e}")
@@ -408,9 +410,13 @@ class VaultClient:
             input_whitelist_pda = self._get_token_whitelist_pda(vault_pda, input_mint)
             output_whitelist_pda = self._get_token_whitelist_pda(vault_pda, output_mint)
             
-            # Get oracle accounts
-            input_oracle = await self._get_oracle_for_token(input_mint)
-            output_oracle = await self._get_oracle_for_token(output_mint)
+            # Get oracle accounts using modern pull oracle approach
+            oracle_accounts = await self.get_oracle_accounts_for_tokens([input_mint, output_mint])
+            input_oracle = oracle_accounts.get(input_mint)
+            output_oracle = oracle_accounts.get(output_mint)
+            
+            if not input_oracle or not output_oracle:
+                raise Exception(f"Failed to create oracle accounts for tokens: {input_mint}, {output_mint}")
             
             # Build accounts dict in exact Trade struct order
             accounts = {
@@ -468,6 +474,8 @@ class VaultClient:
             logger.error(f"❌ Failed to build versioned message: {e}")
             raise
 
+    # NOTE: Switchboard cranking removed - now using Pyth oracles which don't require cranking
+
     async def get_vault_state(self) -> Dict[str, Any]:
         """
         Get current vault state from smart contract with improved error handling
@@ -477,6 +485,8 @@ class VaultClient:
         """
         if not self.client:
             await self.initialize()
+        
+        # Oracle data is now provided via Pyth price feeds - no cranking needed
             
         try:
             # Check if vault program ID is properly configured
@@ -1383,9 +1393,14 @@ class VaultClient:
                          logger.debug(f"⚠️ Failed to verify token account for {token_mint[:8]}...: {e}")
                          continue
                     
-                    # Get oracle and mint
-                    oracle_account = await self._get_oracle_for_token(token_mint)
+                    # Get oracle using modern pull oracle approach
+                    oracle_accounts_dict = await self.get_oracle_accounts_for_tokens([token_mint])
+                    oracle_account = oracle_accounts_dict.get(token_mint)
                     mint_account = Pubkey.from_string(token_mint)
+                    
+                    if not oracle_account:
+                        logger.warning(f"⚠️ Failed to create oracle account for {token_mint}")
+                        continue
                     
                     # Add the 3-account group
                     remaining_accounts.extend([
@@ -1598,55 +1613,30 @@ class VaultClient:
 
     async def _get_oracle_for_token(self, token_mint: str) -> Optional[Pubkey]:
         """
-        Get the Pyth oracle account for a specific token mint
+        Get the Pyth oracle account for a specific token mint using modern pull oracle approach
         
-        This maps to the oracle_config.rs constants in the smart contract
+        This method now creates dynamic PriceUpdateV2 accounts instead of using static hex-to-pubkey conversion
         
         Args:
             token_mint: Token mint address
             
         Returns:
-            Pyth oracle pubkey if found
+            PriceUpdateV2 account pubkey if successfully created
         """
         try:
-            # Real Pyth oracle mappings from oracle_config.rs - using the actual hex codes from Pyth
-            TOKEN_ORACLE_HEX_MAPPING = {
-                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",  # USDC
-                "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN": "0x879551021853eec7a7dc827578e8e69da7e4fa8148339aa0d3d5296405be4b1a",  # TRUMP
-                "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof": "0x3d4a2bd9535be6ce8059d75eadeba507b043257321aa544717c56fa19b49e35d",  # RENDER
-                "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN": "0x0a0408d619e9380abad35060f9192039ed5042fa6f82301d0e48bb52be830996",   # JUP
-                "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": "0x72b021217ca3fe68922a19aaf990109cb9d84e9ad004b4d2025ad6f529314419",  # BONK
-                "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump": "0x58cd29ef0e714c5affc44f269b2c1899a52da4169d7acc147b9da692e6953608",  # FARTCOIN
-                "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R": "0x91568baa8beb53db23eb3fb7f22c6e8bd303d103919e19733f2bb642d3e7987a",   # RAY
-                "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL": "0xb43660a5f790c69354b0729a5ef9d50d68f1df92107540210b9cccba1f947cc2",   # JTO
-                "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3npgxbkkTs8LG": "0x0bbf28e9a841a1cc788f6a361b17ca072d0ea3098a1e5df1c3922d0d719579ff",    # PYTH
-                "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm": "0x4ca4beeca86f0d164160323817a4e42b10010a724c2217c6ee41b54cd4cc61fc",  # WIF
-                "3iQL8BFS2vE7mww4ehAqQHAsbmRNCrPxizWAT2Zfyr9y": "0x8132e3eb1dac3e56939a16ff83848d194345f6688bff97eb1c8bd462d558802b", # VIRTUAL
-                "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv": "0xbed3097008b9b5e3c93bec20be79cb43986b85a996475589351a21e67bae9b61", # PENGU
-                "85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ": "0xeff7446475e218517566ea99e72a4abec2e1bd8498b43b7d8331e29dcb059389", # W (WORMHOLE)
-                "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr": "0xb9312a7ee50e189ef045aa3c7842e099b061bd9bdc99ac645956c3b660dc8cce", # POPCAT
-                "Dm5BxyMetG3Aq5PaG1BrG7rBYqEMtnkjvPNMExfacVk7": "0xf6b551a947e7990089e2d5149b1e44b369fcc6ad3627cb822362a2b19d24ad4a", # ATH
-                "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5": "0x514aed52ca5294177f20187ae883cec4a018619772ddce41efcc36a6448f5d5d", # MEW
-                "MNDEFzGvMt87ueuHvVU9VcTqsAP5b3fTGPsHuuPA5ey": "0x3607bf4d7b78666bd3736c7aacaf2fd2bc56caa8667d3224971ebe3c0623292a", # MNDE
-                "J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr": "0x8414cfadf82f6bed644d2e399c11df21ec0131aa574c56030b132113dbbf3a0a", # SPX (SPX6900)
-                "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE": "0x37505261e557e251290b8c8899453064e8d760ed5c65a779726f2490980da74c", # ORCA
-            }
+            # Use the new pull oracle approach
+            oracle_accounts = await self.get_oracle_accounts_for_tokens([token_mint])
+            oracle_account = oracle_accounts.get(token_mint)
             
-            
-            oracle_hex = TOKEN_ORACLE_HEX_MAPPING.get(token_mint)
-            if oracle_hex:
-                # Convert hex to pubkey using our helper function
-                oracle_pubkey = self._hex_to_pubkey(oracle_hex)
-                if oracle_pubkey:
-                    return oracle_pubkey
-                else:
-                    logger.error(f"❌ Failed to convert hex to pubkey for {token_mint}: {oracle_hex}")
-                    return None
+            if oracle_account:
+                logger.debug(f"✅ Generated oracle account for {token_mint}: {oracle_account}")
+                return oracle_account
             else:
-                logger.warning(f"⚠️ No oracle mapping found for token {token_mint}")
-                # For unknown tokens, use USDC oracle as fallback
-                usdc_hex = "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a"
-                return self._hex_to_pubkey(usdc_hex)
+                logger.warning(f"⚠️ Failed to generate oracle account for {token_mint}")
+                # For unknown tokens, try to generate a USDC oracle as fallback
+                usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+                fallback_accounts = await self.get_oracle_accounts_for_tokens([usdc_mint])
+                return fallback_accounts.get(usdc_mint)
             
         except Exception as e:
             logger.error(f"❌ Failed to get oracle for token {token_mint}: {e}")
@@ -1654,7 +1644,11 @@ class VaultClient:
 
     def _hex_to_pubkey(self, hex_str: str) -> Optional[Pubkey]:
         """
-        Convert hex string from oracle_config.rs to Pubkey
+        DEPRECATED: Convert hex string from oracle_config.rs to Pubkey
+        
+        ⚠️ WARNING: This method is deprecated and should not be used!
+        Hex price feed IDs are NOT Solana account addresses.
+        Use get_oracle_accounts_for_tokens() for modern pull oracle approach.
         
         Args:
             hex_str: Hex string like "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a"
@@ -1792,63 +1786,7 @@ class VaultClient:
             logger.warning(f"⚠️ Failed to parse Pyth price data: {e}")
             return None
 
-    def _parse_switchboard_price_data(self, account_data: bytes) -> Optional[float]:
-        """
-        Parse Switchboard oracle account data to extract current price
-        
-        Switchboard stores price data in a simpler format with a result field.
-        The account data typically contains JSON-like structure with price information.
-        
-        Args:
-            account_data: Raw bytes from Switchboard price account
-            
-        Returns:
-            Current price in USD as float, or None if parsing fails
-        """
-        try:
-            import struct
-            
-            if len(account_data) < 144:  # Minimum size for Switchboard result
-                logger.warning(f"⚠️ Switchboard account data too short: {len(account_data)} bytes")
-                return None
-            
-            # Switchboard on-demand feeds typically store the result as a f64 at a specific offset
-            # The result is usually stored at offset 136 as a double (8 bytes)
-            
-            # Try to extract the result value (f64 at offset 136)
-            try:
-                price_result = struct.unpack('<d', account_data[136:144])[0]
-                
-                # Sanity check: price should be positive and reasonable
-                if price_result <= 0:
-                    logger.debug(f"⚠️ Non-positive Switchboard price: ${price_result}")
-                    return None
-                
-                if price_result > 1000000:  # Max $1M per token
-                    logger.debug(f"⚠️ Unreasonably high Switchboard price: ${price_result}")
-                    return None
-                
-                logger.debug(f"📊 Switchboard price: ${price_result:.8f}")
-                return price_result
-                
-            except struct.error:
-                # If that doesn't work, try other common offsets
-                for offset in [128, 144, 152, 160, 168]:
-                    if len(account_data) >= offset + 8:
-                        try:
-                            price_test = struct.unpack('<d', account_data[offset:offset+8])[0]
-                            if 0 < price_test < 1000000:
-                                logger.debug(f"📊 Switchboard price found at offset {offset}: ${price_test:.8f}")
-                                return price_test
-                        except:
-                            continue
-                
-                logger.debug("⚠️ Could not find valid price in Switchboard data")
-                return None
-            
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to parse Switchboard price data: {e}")
-            return None
+    # NOTE: Switchboard price parsing removed - now using Pyth oracles
 
 
 
@@ -2059,40 +1997,27 @@ class VaultClient:
                     mint_pubkey = Pubkey(mint_bytes)
                     mint_str = str(mint_pubkey)
                     
-                    # Get token balance
+                    # Get token balance (ui_amount is already decimal-adjusted)
                     token_amount = float(balance_response.value.ui_amount or 0)
                     
                     if token_amount == 0:
                         continue
                     
-                    # Get USDC value
+                    # Calculate USDC value with explicit price handling
                     if mint_str == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v":  # USDC
-                        usdc_value = token_amount
+                        # USDC is always $1.00 (by definition of stablecoin)
+                        usdc_value = token_amount * 1.0
+                        logger.debug(f"💵 USDC: {token_amount:.6f} @ $1.000000 = ${usdc_value:.2f}")
                     else:
-                        # Use real Pyth oracle to get current price
-                        oracle_pubkey = await self._get_oracle_for_token(mint_str)
-                        if oracle_pubkey:
-                            try:
-                                # Get oracle account data
-                                oracle_account = await self.client.get_account_info(oracle_pubkey)
-                                if oracle_account and oracle_account.value:
-                                    # Parse Pyth price data structure
-                                    price_usd = self._parse_pyth_price_data(oracle_account.value.data)
-                                    if price_usd:
-                                        usdc_value = token_amount * price_usd
-                                        logger.debug(f"💎 {mint_str[:8]}...: {token_amount:.6f} @ ${price_usd:.6f} = ${usdc_value:.2f}")
-                                    else:
-                                        usdc_value = 0.0
-                                        logger.warning(f"⚠️ Failed to parse price for {mint_str}")
-                                else:
-                                    usdc_value = 0.0
-                                    logger.warning(f"⚠️ No oracle account data for {mint_str}")
-                            except Exception as e:
-                                logger.warning(f"Failed to get oracle price for {mint_str}: {e}")
-                                usdc_value = 0.0
+                        # Use real-time WebSocket price data for other tokens
+                        price_usd = await self._get_realtime_price_for_token(mint_str)
+                        if price_usd and price_usd > 0:
+                            # Both token_amount (from ui_amount) and price_usd are in human-readable units
+                            usdc_value = token_amount * price_usd
+                            logger.debug(f"💎 {mint_str[:8]}...: {token_amount:.6f} @ ${price_usd:.6f} = ${usdc_value:.2f}")
                         else:
                             usdc_value = 0.0
-                            logger.warning(f"⚠️ No oracle mapping for token {mint_str}")
+                            logger.warning(f"⚠️ No valid price data for {mint_str} (price: {price_usd})")
                     
                     total_nav_usdc += usdc_value
                     logger.debug(f"💎 Token {mint_str[:8]}...: {token_amount:.6f} tokens = ${usdc_value:.2f} USDC")
@@ -2107,46 +2032,83 @@ class VaultClient:
         except Exception as e:
             logger.error(f"❌ Failed to calculate vault NAV: {e}")
             return 0.0
+
+    async def _get_realtime_price_for_token(self, token_mint: str) -> Optional[float]:
+        """
+        Get token price from real-time WebSocket feeds (Redis cache)
+        
+        Uses live BirdEye WebSocket price data for maximum accuracy:
+        1. Real-time WebSocket price updates
+        2. Redis cache with sub-second latency  
+        3. In-memory fallback from DualWebSocketFeedManager
+        4. Database fallback for non-tracked tokens
+        """
+        try:
+            # Import the existing database manager
+            from ..database.production_db import get_db_manager
+            
+            # Get database manager instance
+            db_manager = await get_db_manager()
+            
+            # Convert mint address to token_id using existing token cache
+            token_info = await db_manager.get_token_by_address(token_mint)
+            if not token_info:
+                logger.warning(f"⚠️ Token not found in database: {token_mint}")
+                return None
+            
+            # PRIORITY 1: Try real-time WebSocket cached price (most accurate)
+            # This uses Redis cache updated by WebSocket feeds every few seconds
+            cache_key = f"prices:{token_info.token_id}:current"
+            
+            try:
+                cached_price = await db_manager.redis_client.get(cache_key)
+                if cached_price:
+                    price_usd = float(cached_price)
+                    logger.debug(f"📡 Real-time WebSocket price for {token_mint[:8]}...: ${price_usd:.6f}")
+                    return price_usd
+            except Exception as e:
+                logger.debug(f"Redis lookup failed: {e}")
+            
+            # PRIORITY 2: Fallback to latest database price (hourly data)
+            price_usd = await db_manager.get_latest_price(token_info.token_id)
+            
+            if price_usd is not None:
+                logger.debug(f"📈 Fallback price for {token_mint[:8]}...: ${price_usd:.6f}")
+                return price_usd
+            else:
+                logger.warning(f"⚠️ No price data available for {token_mint}")
+                return None
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Real-time price lookup failed for {token_mint}: {e}")
+            return None
     
     async def _get_vault_token_balance(self, vault_authority_pda: Pubkey, token_mint: Pubkey) -> float:
         """Get token balance for a specific mint in the vault"""
         try:
-            from spl.token.instructions import get_associated_token_address
+            # Use the existing _get_vault_token_account method to get the correct ATA
+            token_account = self._get_vault_token_account(str(token_mint), vault_authority_pda)
             
-            # Get the vault's associated token account for this mint
-            token_account = get_associated_token_address(
-                owner=vault_authority_pda,
-                mint=token_mint
-            )
+            logger.debug(f"🔍 Checking token account: {token_account} for mint {str(token_mint)[:8]}...")
             
-            # Get account info
-            account_info = await self.client.get_account_info(token_account)
-            if not account_info or not account_info.value:
-                logger.debug(f"No token account found for mint {token_mint}")
+            # Get the token account balance
+            balance_response = await self.client.get_token_account_balance(token_account)
+            
+            if not balance_response or not balance_response.value:
+                logger.debug(f"No token account or balance found for mint {str(token_mint)[:8]}...")
                 return 0.0
-                    
-            # Decode token account data
-            from spl.token.core import _TokenCore
-            token_data = _TokenCore.decode_token_account(account_info.value.data)
+                
+            # Get the ui_amount which is already decimal-adjusted
+            token_amount = float(balance_response.value.ui_amount or 0)
             
-            # Get mint info to determine decimals
-            mint_info = await self.client.get_account_info(token_mint)
-            if not mint_info or not mint_info.value:
-                logger.warning(f"Could not get mint info for {token_mint}")
-            return 0.0
-    
-            mint_data = _TokenCore.decode_mint(mint_info.value.data)
-            decimals = mint_data.decimals
-            
-            # Convert to human-readable amount
-            token_amount = token_data.amount / (10 ** decimals)
-            
-            logger.debug(f"Token balance for {str(token_mint)[:8]}...: {token_amount}")
+            logger.debug(f"✅ Token balance for {str(token_mint)[:8]}...: {token_amount}")
             return token_amount
             
         except Exception as e:
-            logger.warning(f"Failed to get token balance for {token_mint}: {e}")
-            return 0.0 
+            logger.warning(f"❌ Failed to get token balance for {str(token_mint)[:8]}...: {str(e)}")
+            import traceback
+            logger.debug(f"Full error trace: {traceback.format_exc()}")
+            return 0.0
 
  
 
@@ -2409,28 +2371,17 @@ class VaultClient:
                 mint=usdc_mint
             )
             
-            # Oracle accounts - use real Pyth price feeds
-            # USDC Pyth feed: 0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a
-            # FARTCOIN Pyth feed: 0x58cd29ef0e714c5affc44f269b2c1899a52da4169d7acc147b9da692e6953608
+            # Oracle accounts - use modern pull oracle approach to create PriceUpdateV2 accounts
+            oracle_accounts_dict = await self.get_oracle_accounts_for_tokens([source_mint, destination_mint])
+            source_price_account = oracle_accounts_dict.get(source_mint)
+            destination_price_account = oracle_accounts_dict.get(destination_mint)
             
-            # Map token mints to their Pyth price feeds
-            PYTH_PRICE_FEEDS = {
-                'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': '0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a',  # USDC
-                '9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump': '0x58cd29ef0e714c5affc44f269b2c1899a52da4169d7acc147b9da692e6953608',  # FARTCOIN
-            }
+            if not source_price_account:
+                raise ValueError(f"Failed to create oracle account for source token: {source_mint}")
+            if not destination_price_account:
+                raise ValueError(f"Failed to create oracle account for destination token: {destination_mint}")
             
-            # Get the correct oracle accounts
-            source_feed_id = PYTH_PRICE_FEEDS.get(source_mint)
-            destination_feed_id = PYTH_PRICE_FEEDS.get(destination_mint)
-            
-            if not source_feed_id:
-                raise ValueError(f"No Pyth price feed found for source token: {source_mint}")
-            if not destination_feed_id:
-                raise ValueError(f"No Pyth price feed found for destination token: {destination_mint}")
-            
-            # Convert hex feed IDs to PublicKeys
-            source_price_account = PublicKey(bytes.fromhex(source_feed_id[2:]))  # Remove 0x prefix
-            destination_price_account = PublicKey(bytes.fromhex(destination_feed_id[2:]))  # Remove 0x prefix
+            logger.info(f"✅ Created oracle accounts: {source_price_account}, {destination_price_account}")
             
             # Create instruction accounts in EXACT order from Trade struct
             accounts = [
@@ -2467,3 +2418,74 @@ class VaultClient:
         except Exception as e:
             logger.error(f"❌ Failed to build vault trade instruction: {e}")
             raise
+
+
+    async def get_oracle_accounts_for_tokens(self, token_mints: List[str]) -> Dict[str, Optional[Pubkey]]:
+        """
+        Get Pyth oracle accounts for a list of tokens using on-demand PriceUpdateV2 account creation
+        
+        For hourly trading, we create fresh oracle accounts with latest price data from Hermes.
+        This ensures we always have the most recent prices without background processes.
+        
+        Args:
+            token_mints: List of token mint addresses
+            
+        Returns:
+            Dictionary mapping token_mint -> Pyth PriceUpdateV2 account pubkey (or None if not found)
+        """
+        try:
+            # Import the existing Pyth oracle handler
+            from ..pyth.oracle_handler import PythOracleHandler, TOKEN_ORACLE_HEX_MAPPING
+            
+            logger.info(f"🔋 Creating fresh Pyth oracle accounts for {len(token_mints)} tokens...")
+            
+            # Filter tokens to only those with Pyth price feeds
+            price_feed_ids = []
+            token_to_feed_mapping = {}
+            
+            for token_mint in token_mints:
+                if token_mint in TOKEN_ORACLE_HEX_MAPPING:
+                    feed_id = TOKEN_ORACLE_HEX_MAPPING[token_mint]
+                    price_feed_ids.append(feed_id)
+                    token_to_feed_mapping[feed_id] = token_mint
+                    logger.debug(f"📊 Mapped {token_mint[:8]}... to feed {feed_id[:10]}...")
+                else:
+                    logger.warning(f"⚠️ No price feed mapping found for token: {token_mint}")
+            
+            if not price_feed_ids:
+                logger.error("❌ No valid price feeds found for any tokens")
+                return {token_mint: None for token_mint in token_mints}
+            
+            # Create Pyth oracle handler and use Node.js script for oracle account creation
+            pyth_handler = PythOracleHandler(self.client, self.authority_keypair)
+            
+            # Use the Node.js script to create oracle accounts (much more reliable)
+            logger.debug(f"🚀 Using Node.js Pyth SDK to create oracle accounts for {len(token_mints)} tokens...")
+            oracle_accounts_dict = await pyth_handler.get_oracle_accounts_for_tokens(token_mints)
+            
+            # Convert the result to the expected format
+            result = {}
+            for token_mint in token_mints:
+                if token_mint in oracle_accounts_dict:
+                    result[token_mint] = oracle_accounts_dict[token_mint]
+                    logger.debug(f"✅ Oracle account for {token_mint[:8]}...: {oracle_accounts_dict[token_mint]}")
+                else:
+                    result[token_mint] = None
+                    logger.warning(f"⚠️ No oracle account created for {token_mint[:8]}...")
+            
+            successful_oracles = len([a for a in result.values() if a])
+            logger.info(f"🎉 Successfully created {successful_oracles}/{len(token_mints)} Pyth oracle accounts")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to get Pyth oracle accounts for tokens: {e}")
+            import traceback
+            logger.debug(f"Full error trace: {traceback.format_exc()}")
+            return {token_mint: None for token_mint in token_mints}
+
+    # NOTE: _fetch_and_post_price_updates_via_python method removed
+    # Switchboard oracles are permanent on-chain accounts that don't need to be created
+
+    # NOTE: _get_price_feed_id_for_token method removed
+    # Switchboard oracles use permanent on-chain accounts instead of Pyth feed IDs

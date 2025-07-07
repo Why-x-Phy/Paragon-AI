@@ -75,8 +75,28 @@ class VaultTradeExecutor:
             try:
                 from .vault_client import VaultClient
                 from .jupiter_client import JupiterV6Client
+                from solana.rpc.async_api import AsyncClient
+                from solders.keypair import Keypair
+                import os
+                import json
                 
-                self.vault_client = VaultClient()
+                # Create vault client with proper parameters
+                rpc_url = os.getenv('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
+                vault_program_id = os.getenv('VAULT_PROGRAM_ID', 'tXMJu1KaBQU5DSk94QXMtigQpzxbK62WJVUs2Xmxz7z')
+                
+                # Load authority keypair
+                authority_key_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'onchain', 'calvin-ai-authority.json')
+                with open(authority_key_path, 'r') as f:
+                    authority_key_data = json.load(f)
+                authority_keypair = Keypair.from_bytes(authority_key_data)
+                
+                # Create connection and vault client
+                connection = AsyncClient(rpc_url)
+                self.vault_client = VaultClient(
+                    vault_program=vault_program_id,
+                    connection=connection,
+                    authority_keypair=authority_keypair
+                )
                 await self.vault_client.initialize()
                 logger.info("✅ Vault client initialized and ready")
                 
@@ -268,11 +288,15 @@ class VaultTradeExecutor:
             amount_micro_usdc = int(amount_usdc * 1e6)
             
             # Get Jupiter quote (this will record the operation in database)
+            # Get vault authority PDA as payer for the quote
+            vault_authority_pda = str(self.vault_client._get_vault_authority_pda()) if self.vault_client else None
+            
             quote = await self.jupiter_client.get_quote(
                 input_mint=input_mint,
                 output_mint=output_mint,
                 amount=amount_micro_usdc,
-                slippage_bps=slippage_bps
+                slippage_bps=slippage_bps,
+                payer_pubkey=vault_authority_pda
             )
             
             # Store Jupiter operation ID for trade linking

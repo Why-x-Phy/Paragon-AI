@@ -3,7 +3,7 @@ import { NextResponse } from 'next/server';
 export async function GET() {
   try {
     // Call the Calvin AI backend trades API
-    const backendUrl = process.env.CALVIN_BACKEND_URL || 'http://18.216.72.134:8000';
+    const backendUrl = process.env.CALVIN_BACKEND_URL || 'http://localhost:8000';
     const response = await fetch(`${backendUrl}/api/trades`, {
       method: 'GET',
       headers: {

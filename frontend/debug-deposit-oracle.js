@@ -4,7 +4,10 @@ const { getAssociatedTokenAddress, TOKEN_PROGRAM_ID } = require('@solana/spl-tok
 async function debugDepositOracle() {
   console.log('🧪 Debugging deposit oracle accounts...');
   
-  const connection = new Connection('https://mainnet.helius-rpc.com/?api-key=4b71b7b4-b7e8-4d4b-8c8b-6b7b5b7b5b7b');
+  const connection = new Connection('https://mainnet.helius-rpc.com/?api-key=4b71b7b4-b7e8-4d4b-8c8b-6b7b5b7b5b7b', {
+    commitment: 'confirmed',
+    maxSupportedTransactionVersion: 0,
+  });
   
   // Calvin Vault Program ID (mainnet)
   const vaultProgramId = new PublicKey('tXMJu1KaBQU5DSk94QXMtigQpzxbK62WJVUs2Xmxz7z');

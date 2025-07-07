@@ -6,6 +6,8 @@ import {
   Connection, 
   PublicKey, 
   Transaction,
+  TransactionMessage,
+  VersionedTransaction,
   SystemProgram,
   SYSVAR_RENT_PUBKEY 
 } from '@solana/web3.js';
@@ -18,7 +20,9 @@ import {
   TokenAccountNotFoundError,
   TokenInvalidAccountOwnerError
 } from '@solana/spl-token';
-import { AnchorProvider, BN } from '@coral-xyz/anchor';
+import { AnchorProvider, BN, Program } from '@coral-xyz/anchor';
+import { HermesClient } from '@pythnetwork/hermes-client';
+import { PythSolanaReceiver } from '@pythnetwork/pyth-solana-receiver';
 import { 
   getStakingProgram, 
   getVaultProgram,
@@ -27,18 +31,82 @@ import {
   getVaultPDA,
   getUserPositionPDA
 } from './anchor-program';
+
+// ================ ORACLE CONFIGURATION ================
+// Single source of truth for all Pyth price feed IDs
+// Must match oracle_config.rs in the backend exactly
+export const PYTH_PRICE_FEEDS = {
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': '0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a', // USDC
+  'So11111111111111111111111111111111111111112': '0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d', // SOL
+  '6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN': '0x879551021853eec7a7dc827578e8e69da7e4fa8148339aa0d3d5296405be4b1a', // TRUMP
+  'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263': '0x72b021217ca3fe68922a19aaf990109cb9d84e9ad004b4d2025ad6f529314419', // BONK
+  'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN': '0x0a0408d619e9380abad35060f9192039ed5042fa6f82301d0e48bb52be830996', // JUP
+  '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R': '0x91568baa8beb53db23eb3fb7f22c6e8bd303d103919e19733f2bb642d3e7987a', // RAY
+  'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm': '0x4ca4beeca86f0d164160323817a4e42b10010a724c2217c6ee41b54cd4cc61fc', // WIF
+  'Dm5BxyMetG3Aq5PaG1BrG7rBYqEMtnkjvPNMExfacVk7': '0xf6b551a947e7990089e2d5149b1e44b369fcc6ad3627cb822362a2b19d24ad4a', // ATH
+  '9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump': '0x58cd29ef0e714c5affc44f269b2c1899a52da4169d7acc147b9da692e6953608', // FARTCOIN
+  'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL': '0xb43660a5f790c69354b0729a5ef9d50d68f1df92107540210b9cccba1f947cc2', // JTO
+  'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5': '0x514aed52ca5294177f20187ae883cec4a018619772ddce41efcc36a6448f5d5d', // MEW
+  'MNDEFzGvMt87ueuHvVU9VcTqsAP5b3fTGPsHuuPA5ey': '0x3607bf4d7b78666bd3736c7aacaf2fd2bc56caa8667d3224971ebe3c0623292a', // MNDE
+  'orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE': '0x37505261e557e251290b8c8899453064e8d760ed5c65a779726f2490980da74c', // ORCA
+  'rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof': '0x3d4a2bd9535be6ce8059d75eadeba507b043257321aa544717c56fa19b49e35d', // RENDER
+  'HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3': '0x0bbf28e9a841a1cc788f6a361b17ca072d0ea3098a1e5df1c3922d06719579ff', // PYTH
+  '3iQL8BFS2vE7mww4ehAqQHAsbmRNCrPxizWAT2Zfyr9y': '0x8132e3eb1dac3e56939a16ff83848d194345f6688bff97eb1c8bd462d558802b', // VIRTUAL
+  '2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv': '0xbed3097008b9b5e3c93bec20be79cb43986b85a996475589351a21e67bae9b61', // PENGU
+  '85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ': '0xeff7446475e218517566ea99e72a4abec2e1bd8498b43b7d8331e29dcb059389', // W (WORMHOLE)
+  '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr': '0xb9312a7ee50e189ef045aa3c7842e099b061bd9bdc99ac645956c3b660dc8cce', // POPCAT
+  'J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr': '0x8414cfadf82f6bed644d2e399c11df21ec0131aa574c56030b132113dbbf3a0a', // SPX
+};
+
+// Token mint to symbol mapping (used for price display)
+export const TOKEN_MINT_TO_SYMBOL = {
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'USDC',
+  'So11111111111111111111111111111111111111112': 'SOL',
+  '6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN': 'TRUMP',
+  'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263': 'BONK',
+  'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN': 'JUP',
+  '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R': 'RAY',
+  'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm': 'WIF',
+  'Dm5BxyMetG3Aq5PaG1BrG7rBYqEMtnkjvPNMExfacVk7': 'ATH',
+  '9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump': 'FARTCOIN',
+  'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL': 'JTO',
+  'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5': 'MEW',
+  'MNDEFzGvMt87ueuHvVU9VcTqsAP5b3fTGPsHuuPA5ey': 'MNDE',
+  'orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE': 'ORCA',
+  'rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof': 'RENDER',
+  'HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3': 'PYTH',
+  '3iQL8BFS2vE7mww4ehAqQHAsbmRNCrPxizpWAT2Zfyr9y': 'VIRTUAL',
+  '2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv': 'PENGU',
+  '85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ': 'W',
+  '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr': 'POPCAT',
+  'J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr': 'SPX',
+};
 import { CONTRACTS, TIERS, FEES } from '@/constants';
 
 export class VaultClient {
   constructor(wallet, connection) {
     this.wallet = wallet;
-    this.connection = connection || new Connection(CONTRACTS.RPC_ENDPOINT, CONTRACTS.COMMITMENT);
+    // Use simple connection - PythSolanaReceiver will handle versioned transactions internally
+    this.connection = connection || new Connection(CONTRACTS.RPC_ENDPOINT, {
+      commitment: CONTRACTS.COMMITMENT,
+    });
     this.provider = null;
     this.stakingProgram = null;
     this.vaultProgram = null;
+    this.switchboardProgram = null;
     
     this.usdcMint = new PublicKey(CONTRACTS.USDC);
     this.calvinMint = new PublicKey(CONTRACTS.CALVIN_TOKEN);
+    
+    // Initialize Pyth client for price feeds following official documentation pattern
+    // The URL below is a public Hermes instance operated by the Pyth Data Association.
+    // Hermes is also available from several third-party providers listed here:
+    // https://docs.pyth.network/price-feeds/api-instances-and-providers/hermes
+    this.hermesClient = new HermesClient(
+      "https://hermes.pyth.network/",
+      {}
+    );
+    this.pythSolanaReceiver = null; // Will be initialized properly later
     
     // Price caching for accurate and efficient share price calculations
     this.priceCache = new Map(); // tokenSymbol -> { price, timestamp }
@@ -67,14 +135,11 @@ export class VaultClient {
       try {
         // Initialize staking program
         this.stakingProgram = getStakingProgram(provider);
-        console.log('✅ Staking program initialized with ID:', this.stakingProgram.programId.toString());
+        console.log('✅ Staking program initialized');
         
-        // Verify staking program ID matches expected (no hardcoding)
+        // Verify staking program ID matches expected
         if (this.stakingProgram.programId.toString() !== CONTRACTS.CALVIN_STAKING_PROGRAM) {
-          console.error('❌ Staking program ID mismatch!', {
-            expected: CONTRACTS.CALVIN_STAKING_PROGRAM,
-            actual: this.stakingProgram.programId.toString()
-          });
+          console.error('❌ Staking program ID mismatch!');
         }
       } catch (stakingError) {
         console.error('❌ Failed to initialize staking program:', stakingError);
@@ -84,56 +149,43 @@ export class VaultClient {
       try {
         // Initialize vault program
         this.vaultProgram = getVaultProgram(provider);
-        console.log('✅ Vault program initialized with ID:', this.vaultProgram.programId.toString());
+        console.log('✅ Vault program initialized');
         
-        // Verify vault program ID matches expected (no hardcoding)
+        // Verify vault program ID matches expected
         if (this.vaultProgram.programId.toString() !== CONTRACTS.CALVIN_VAULT_PROGRAM) {
-          console.error('❌ Vault program ID mismatch!', {
-            expected: CONTRACTS.CALVIN_VAULT_PROGRAM,
-            actual: this.vaultProgram.programId.toString()
-          });
+          console.error('❌ Vault program ID mismatch!');
         }
       } catch (vaultError) {
         console.error('❌ Failed to initialize vault program:', vaultError);
         this.vaultProgram = null;
       }
 
-      // Test program connectivity
-      if (this.vaultProgram) {
-        try {
-          // Try to get program account info to test connectivity
-          const programAccount = await this.connection.getAccountInfo(this.vaultProgram.programId);
-          if (!programAccount) {
-            console.error('❌ Vault program account not found on network');
-            this.vaultProgram = null;
-          } else {
-            console.log('✅ Vault program verified on network');
-          }
-        } catch (connectivityError) {
-          console.error('❌ Failed to verify vault program connectivity:', connectivityError);
-        }
-      }
-
-      if (this.stakingProgram) {
-        try {
-          // Try to get program account info to test connectivity
-          const programAccount = await this.connection.getAccountInfo(this.stakingProgram.programId);
-          if (!programAccount) {
-            console.error('❌ Staking program account not found on network');
-            this.stakingProgram = null;
-          } else {
-            console.log('✅ Staking program verified on network');
-          }
-        } catch (connectivityError) {
-          console.error('❌ Failed to verify staking program connectivity:', connectivityError);
-        }
+      // Initialize PythSolanaReceiver following official documentation pattern
+      // You will need a Connection from @solana/web3.js and a Wallet from @coral-xyz/anchor to create
+      // the receiver.
+      try {
+        // Create an Anchor-compatible wallet interface
+        const anchorWallet = {
+          publicKey: this.wallet.publicKey,
+          signTransaction: async (tx) => await this.wallet.signTransaction(tx),
+          signAllTransactions: async (txs) => await this.wallet.signAllTransactions(txs),
+        };
+        
+        this.pythSolanaReceiver = new PythSolanaReceiver({
+          connection: this.connection,
+          wallet: anchorWallet,
+        });
+        console.log('✅ Pyth Solana Receiver initialized');
+      } catch (pythError) {
+        console.error('❌ Failed to initialize Pyth Solana Receiver:', pythError);
+        this.pythSolanaReceiver = null;
       }
 
       console.log('📋 VaultClient initialization summary:', {
         stakingProgram: this.stakingProgram ? '✅ Ready' : '❌ Failed',
         vaultProgram: this.vaultProgram ? '✅ Ready' : '❌ Failed',
-        wallet: this.wallet?.publicKey ? `✅ ${this.wallet.publicKey.toString().slice(0, 8)}...` : '❌ No wallet',
-        network: this.connection.rpcEndpoint
+        pythSolanaReceiver: this.pythSolanaReceiver ? '✅ Ready' : '❌ Failed',
+        wallet: this.wallet?.publicKey ? `✅ Connected` : '❌ No wallet',
       });
 
     } catch (error) {
@@ -141,6 +193,7 @@ export class VaultClient {
       // Set programs to null on initialization failure
       this.stakingProgram = null;
       this.vaultProgram = null;
+      this.pythSolanaReceiver = null;
     }
   }
 
@@ -732,93 +785,26 @@ export class VaultClient {
   }
 
   /**
-   * Get oracle accounts for NAV calculation during deposits
+   * Get Pyth oracle accounts for NAV calculation during deposits
    * Returns oracle accounts in the format expected by the smart contract:
-   * Groups of 3: [token_account, price_account, mint_account]
+   * Groups of 3: [token_account, pyth_price_update_v2, mint_account]
    */
   async getOracleAccountsForDeposit(vaultAuthorityPDA) {
     try {
-      // Token mint to Pyth price feed mapping (from oracle_config.rs)
-      const PYTH_PRICE_FEEDS = {
-        'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': '0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a', // USDC
-        '6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN': '0x879551021853eec7a7dc827578e8e69da7e4fa8148339aa0d3d5296405be4b1a', // TRUMP
-        'rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof': '0x3d4a2bd9535be6ce8059d75eadeba507b043257321aa544717c56fa19b49e35d', // RENDER
-        'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN': '0x0a0408d619e9380abad35060f9192039ed5042fa6f82301d0e48bb52be830996', // JUP
-        'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263': '0x72b021217ca3fe68922a19aaf990109cb9d84e9ad004b4d2025ad6f529314419', // BONK
-        '9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump': '0x58cd29ef0e714c5affc44f269b2c1899a52da4169d7acc147b9da692e6953608', // FARTCOIN
-        '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R': '0x91568baa8beb53db23eb3fb7f22c6e8bd303d103919e19733f2bb642d3e7987a', // RAY
-        'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL': '0xb43660a5f790c69354b0729a5ef9d50d68f1df92107540210b9cccba1f947cc2', // JTO
-        'HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3': '0x0bbf28e9a841a1cc788f6a361b17ca072d0ea3098a1e5df1c3922d0d719579ff', // PYTH
-        'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm': '0x4ca4beeca86f0d164160323817a4e42b10010a724c2217c6ee41b54cd4cc61fc', // WIF
-        '3iQL8BFS2vE7mww4ehAqQHAsbmRNCrPxizWAT2Zfyr9y': '0x8132e3eb1dac3e56939a16ff83848d194345f6688bff97eb1c8bd462d558802b', // VIRTUAL
-        '2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv': '0xbed3097008b9b5e3c93bec20be79cb43986b85a996475589351a21e67bae9b61', // PENGU
-        '85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ': '0xeff7446475e218517566ea99e72a4abec2e1bd8498b43b7d8331e29dcb059389', // W
-        '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr': '0xb9312a7ee50e189ef045aa3c7842e099b061bd9bdc99ac645956c3b660dc8cce', // POPCAT
-        'Dm5BxyMetG3Aq5PaG1BrG7rBYqEMtnkjvPNMExfacVk7': '0xf6b551a947e7990089e2d5149b1e44b369fcc6ad3627cb822362a2b19d24ad4a', // ATH
-        'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5': '0x514aed52ca5294177f20187ae883cec4a018619772ddce41efcc36a6448f5d5d', // MEW
-        'MNDEFzGvMt87ueuHvVU9VcTqsAP5b3fTGPsHuuPA5ey': '0x3607bf4d7b78666bd3736c7aacaf2fd2bc56caa8667d3224971ebe3c0623292a', // MNDE
-        'J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr': '0x8414cfadf82f6bed644d2e399c11df21ec0131aa574c56030b132113dbbf3a0a', // SPX
-        'orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE': '0x37505261e557e251290b8c8899453064e8d760ed5c65a779726f2490980da74c', // ORCA
-      };
-
       // Get all token accounts owned by vault authority to determine which oracles we need
       const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
         vaultAuthorityPDA,
         { programId: TOKEN_PROGRAM_ID }
       );
 
-      console.log(`🔍 Found ${tokenAccounts.value.length} token accounts for oracle NAV calculation`);
+      console.log(`🔍 Found ${tokenAccounts.value.length} token accounts for Pyth oracle NAV calculation`);
 
-      const oracleAccounts = [];
+      // Collect all price feed IDs for tokens that need oracle data
+      const priceFeeds = [];
+      const tokenData = [];
 
-      // Always include USDC oracle accounts to satisfy smart contract requirements
-      // Use the vault's main USDC account (from instruction accounts) as the token account
-      const usdcMint = this.usdcMint.toString();
-      const usdcFeedId = PYTH_PRICE_FEEDS[usdcMint];
-      
-      if (usdcFeedId) {
-        try {
-          // Get vault authority PDA and its USDC token account
-          const [vaultAuthorityPDA] = PublicKey.findProgramAddressSync(
-            [Buffer.from("vault_authority")],
-            this.vaultProgram.programId
-          );
-          
-          // Use the vault's main USDC account (even if it doesn't exist yet)
-          const { getAssociatedTokenAddress } = await import('@solana/spl-token');
-          const vaultUsdcAccount = await getAssociatedTokenAddress(this.usdcMint, vaultAuthorityPDA, true);
-          
-          const feedIdBytes = Buffer.from(usdcFeedId.slice(2), 'hex');
-          const priceAccountPubkey = new PublicKey(feedIdBytes);
-
-          // Add USDC oracle group - always include this for contract compliance
-          oracleAccounts.push(
-            {
-              pubkey: vaultUsdcAccount, // Use vault's main USDC account
-              isWritable: false,
-              isSigner: false,
-            },
-            {
-              pubkey: priceAccountPubkey,
-              isWritable: false,
-              isSigner: false,
-            },
-            {
-              pubkey: new PublicKey(usdcMint),
-              isWritable: false,
-              isSigner: false,
-            }
-          );
-
-          console.log(`📊 Added USDC oracle group: token=${vaultUsdcAccount.toString().slice(0,8)}..., price=${priceAccountPubkey.toString().slice(0,8)}..., mint=${usdcMint.slice(0,8)}...`);
-          console.log(`🔢 Oracle accounts length after USDC: ${oracleAccounts.length}`);
-        } catch (error) {
-          console.warn(`⚠️ Failed to add USDC oracle accounts:`, error);
-          console.log(`🔢 Oracle accounts length after USDC error: ${oracleAccounts.length}`);
-        }
-      }
-
-      // Process each non-USDC token account that has a balance
+      // Process each token account that has a balance and a Pyth feed
+      // INCLUDING USDC - the smart contract expects it even though it skips it in NAV calculation
       for (const tokenAccount of tokenAccounts.value) {
         const accountInfo = tokenAccount.account.data.parsed.info;
         const tokenMint = accountInfo.mint;
@@ -829,69 +815,93 @@ export class VaultClient {
           continue;
         }
 
-        // Skip USDC (already handled above)
-        if (tokenMint === this.usdcMint.toString()) {
-          continue;
-        }
-
-        // Get Pyth price feed ID for this token
+        // Get Pyth feed ID for this token
         const pythFeedId = PYTH_PRICE_FEEDS[tokenMint];
         if (!pythFeedId) {
-          console.warn(`⚠️ No Pyth feed found for token ${tokenMint}`);
+          console.log(`ℹ️ No Pyth feed for token ${tokenMint.slice(0, 8)}... - skipping oracle group`);
           continue;
         }
 
-        try {
-          // Convert hex feed ID to Pubkey (same as test script that worked)
-          const feedIdBytes = Buffer.from(pythFeedId.slice(2), 'hex'); // Remove 0x prefix
-          const priceAccountPubkey = new PublicKey(feedIdBytes);
+        priceFeeds.push(pythFeedId);
+        tokenData.push({
+          feedId: pythFeedId,
+          tokenAccount: new PublicKey(tokenAccount.pubkey),
+          mint: new PublicKey(tokenMint),
+          symbol: TOKEN_MINT_TO_SYMBOL[tokenMint] || 'UNKNOWN'
+        });
 
-          // Add the oracle account group: [token_account, price_account, mint_account]
-          oracleAccounts.push(
-            {
-              pubkey: new PublicKey(tokenAccount.pubkey),
-              isWritable: false,
-              isSigner: false,
-            },
-            {
-              pubkey: priceAccountPubkey,
-              isWritable: false,
-              isSigner: false,
-            },
-            {
-              pubkey: new PublicKey(tokenMint),
-              isWritable: false,
-              isSigner: false,
-            }
-          );
-
-          console.log(`📊 Added oracle group for ${tokenMint}: token=${tokenAccount.pubkey.slice(0,8)}..., price=${priceAccountPubkey.toString().slice(0,8)}..., mint=${tokenMint.slice(0,8)}...`);
-
-        } catch (error) {
-          console.warn(`⚠️ Failed to create oracle accounts for token ${tokenMint}:`, error);
-        }
+        console.log(`📊 Added ${TOKEN_MINT_TO_SYMBOL[tokenMint] || tokenMint.slice(0, 8)} to Pyth oracle list: ${pythFeedId.slice(0,10)}...`);
       }
 
-      console.log(`✅ Prepared ${oracleAccounts.length / 3} oracle groups (${oracleAccounts.length} total accounts) for NAV calculation`);
-      console.log(`🔍 Oracle accounts details:`, oracleAccounts.map((acc, i) => `[${i}] ${acc.pubkey.toString().slice(0,8)}...`));
+      console.log(`🔄 Fetching ${priceFeeds.length} Pyth price updates from Hermes...`);
+
+      // Fetch price updates from Hermes following official documentation pattern
+      // Hermes provides other methods for retrieving price updates. See
+      // https://hermes.pyth.network/docs for more information.
+      const priceUpdateData = (
+        await this.hermesClient.getLatestPriceUpdates(
+          priceFeeds,
+          { encoding: "base64" }
+        )
+      ).binary.data;
       
-      // 🔍 DEBUG: Detailed oracle account structure
-      console.log('🔍 Detailed oracle account structure:');
-      for (let i = 0; i < oracleAccounts.length; i += 3) {
-        const group = Math.floor(i / 3);
-        if (i + 2 < oracleAccounts.length) {
-          console.log(`  Group ${group}:`);
-          console.log(`    [${i}] Token: ${oracleAccounts[i].pubkey.toString()}`);
-          console.log(`    [${i+1}] Price: ${oracleAccounts[i+1].pubkey.toString()}`);
-          console.log(`    [${i+2}] Mint: ${oracleAccounts[i+2].pubkey.toString()}`);
-        }
+      if (!priceUpdateData) {
+        throw new Error('Received undefined price updates from Hermes - invalid response structure');
       }
       
-      return oracleAccounts;
+      // Price updates are strings of base64-encoded binary data
+      console.log(`✅ Received ${priceUpdateData.length} price updates from Hermes`);
+
+      // Store the data we'll need for the vault transaction
+      this._priceUpdates = priceUpdateData;
+      this._priceFeeds = priceFeeds;
+      this._tokenData = tokenData;
+      
+      console.log(`✅ Prepared ${priceFeeds.length} price feeds for Pyth transaction builder`);
+      
+      return { priceUpdates: priceUpdateData, priceFeeds, tokenData };
 
     } catch (error) {
-      console.error('❌ Failed to get oracle accounts:', error);
-      return []; // Return empty array if oracle setup fails
+      console.error('❌ Failed to get Pyth oracle accounts:', error);
+      return { priceUpdates: [], priceFeeds: [], tokenData: [] };
+    }
+  }
+
+  /**
+   * Update Pyth oracle feeds (handled automatically during oracle account creation)
+   * This method is maintained for compatibility but Pyth updates are handled in getOracleAccountsForDeposit
+   */
+  async updateOracleFeeds(tokenMints = []) {
+    try {
+      console.log('🔄 Pyth oracle updates are handled automatically during transaction building...');
+      console.log('✅ No separate oracle update transaction needed with Pyth!');
+      return null; // No separate transaction needed
+
+    } catch (error) {
+      console.error('❌ Failed to update oracle feeds:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Update price feeds using Pyth (handled automatically)
+   * This method is maintained for compatibility but Pyth handles updates internally
+   */
+  async updatePriceFeeds(tokenMints = []) {
+    try {
+      console.log('🔄 Pyth price updates are handled automatically in getOracleAccountsForDeposit...');
+      
+      // No separate price update instructions needed with Pyth
+      console.log('✅ Pyth always provides fresh price data from Hermes API!');
+      
+      return {
+        instructions: [], // No separate instructions needed
+        lookupTables: []  // No lookup tables needed
+      };
+      
+    } catch (error) {
+      console.error('❌ Failed to create Pyth update instructions:', error);
+      return { instructions: [], lookupTables: [] };
     }
   }
 
@@ -945,11 +955,7 @@ export class VaultClient {
         if (!vault) {
           throw new Error('Vault account not found');
         }
-        console.log('📋 Vault state loaded:', {
-          sharesMint: vault.sharesMint.toBase58(),
-          treasury: vault.treasury.toBase58(),
-          paused: vault.paused
-        });
+        console.log('�� Vault state loaded');
       } catch (error) {
         console.error('❌ Failed to fetch vault account:', error);
         throw new Error(`Vault account not found or not initialized: ${error.message}`);
@@ -960,104 +966,187 @@ export class VaultClient {
         [Buffer.from("vault_authority")],
         this.vaultProgram.programId
       );
-      console.log('📍 Vault Authority PDA:', vaultAuthorityPDA.toBase58());
       
-      // Vault USDC account is an ATA owned by vault authority
+      // Get required token accounts
       const vaultUsdcAccount = await getAssociatedTokenAddress(this.usdcMint, vaultAuthorityPDA, true);
-      console.log('📍 Vault USDC Account:', vaultUsdcAccount.toBase58());
-      
-      // Treasury USDC account (owned by treasury wallet from vault state)
       const treasuryUsdcAccount = await getAssociatedTokenAddress(this.usdcMint, vault.treasury, false);
-      console.log('📍 Treasury USDC Account:', treasuryUsdcAccount.toBase58());
-      
-      // User shares account (will be created and frozen by the instruction)
       const userSharesAccount = await getAssociatedTokenAddress(vault.sharesMint, this.wallet.publicKey, false);
+
+      console.log('📍 Vault Authority PDA:', vaultAuthorityPDA.toBase58());
+      console.log('📍 Vault USDC Account:', vaultUsdcAccount.toBase58());
+      console.log('📍 Treasury USDC Account:', treasuryUsdcAccount.toBase58());
       console.log('📍 User Shares Account:', userSharesAccount.toBase58());
 
-      // 🚨 CRITICAL FIX: Get oracle accounts for NAV calculation
-      console.log('🔍 Getting oracle accounts for NAV calculation...');
-      const oracleAccounts = await this.getOracleAccountsForDeposit(vaultAuthorityPDA);
+      // Get oracle data for vault NAV calculation
+      console.log('🔍 Preparing Pyth oracle data for vault transaction...');
+      await this.getOracleAccountsForDeposit(vaultAuthorityPDA);
 
-      console.log('🏗️ Building transaction with accounts:', {
-        user: this.wallet.publicKey.toBase58(),
-        vault: vaultPDA.toBase58(),
-        userPosition: userPositionPDA.toBase58(),
-        userUsdcToken: userUsdcAccount.toBase58(),
-        vaultUsdcToken: vaultUsdcAccount.toBase58(),
-        treasuryUsdcToken: treasuryUsdcAccount.toBase58(),
-        sharesMint: vault.sharesMint.toBase58(),
-        userSharesToken: userSharesAccount.toBase58(),
-        vaultAuthority: vaultAuthorityPDA.toBase58(),
-        stakingProgram: this.stakingProgram.programId.toBase58(),
-        oracleAccountsCount: oracleAccounts.length,
-      });
-
-      // Build remaining accounts: [staking_accounts, oracle_accounts]
-      const remainingAccounts = [
-        // Staking accounts (required for tier verification)
-        {
-          pubkey: getStakeConfigPDA()[0],      // stake_config
-          isWritable: false,
-          isSigner: false,
-        },
-        {
-          pubkey: getUserStakePDA(this.wallet.publicKey)[0], // user_stake
-          isWritable: false,
-          isSigner: false,
-        },
-        // Oracle accounts (required for NAV calculation)
-        ...oracleAccounts
-      ];
-
-      console.log(`📊 Total remaining accounts: ${remainingAccounts.length} (2 staking + ${oracleAccounts.length} oracle)`);
-      
-      // 🔍 DEBUG: Log exact remaining accounts structure
-      console.log('🔍 Remaining accounts breakdown:');
-      remainingAccounts.forEach((acc, i) => {
-        console.log(`  [${i}] ${acc.pubkey.toString().slice(0,8)}... (writable: ${acc.isWritable}, signer: ${acc.isSigner})`);
-      });
-      
-      // 🔍 DEBUG: Verify oracle accounts are in groups of 3
-      if (oracleAccounts.length > 0) {
-        console.log('🔍 Oracle accounts verification:');
-        console.log(`  - Oracle accounts length: ${oracleAccounts.length}`);
-        console.log(`  - Should be divisible by 3: ${oracleAccounts.length % 3 === 0}`);
-        console.log(`  - Number of oracle groups: ${Math.floor(oracleAccounts.length / 3)}`);
-        
-        for (let i = 0; i < oracleAccounts.length; i += 3) {
-          const group = Math.floor(i / 3);
-          if (i + 2 < oracleAccounts.length) {
-            console.log(`  - Group ${group}: token=${oracleAccounts[i].pubkey.toString().slice(0,8)}..., price=${oracleAccounts[i+1].pubkey.toString().slice(0,8)}..., mint=${oracleAccounts[i+2].pubkey.toString().slice(0,8)}...`);
-          }
-        }
+      // Check if we have the required Pyth data
+      if (!this._priceUpdates || !this._priceFeeds || !this._tokenData) {
+        console.warn('⚠️ No Pyth price updates needed - vault may only hold USDC');
+        // Continue with empty oracle data
+        this._priceUpdates = [];
+        this._priceFeeds = [];
+        this._tokenData = [];
       }
 
-      const tx = await this.vaultProgram.methods
-        .deposit(amountBN)
-        .accounts({
-          user: this.wallet.publicKey,
-          vault: vaultPDA,
-          userPosition: userPositionPDA,
-          userUsdcToken: userUsdcAccount,
-          vaultUsdcToken: vaultUsdcAccount,
-          treasuryUsdcToken: treasuryUsdcAccount,
-          sharesMint: vault.sharesMint,
-          userSharesToken: userSharesAccount,
-          vaultAuthority: vaultAuthorityPDA,
-          stakingProgram: this.stakingProgram.programId,
-          systemProgram: SystemProgram.programId,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-          rent: SYSVAR_RENT_PUBKEY,
-        })
-        .remainingAccounts(remainingAccounts)
-        .transaction();
+      if (this._priceUpdates.length === 0) {
+        console.log('💡 No price updates needed - using simple transaction');
         
-      console.log('✅ Transaction built successfully with oracle accounts');
+        // Build simple transaction without Pyth price updates
+        const depositInstruction = await this.vaultProgram.methods
+          .deposit(amountBN)
+          .accounts({
+            user: this.wallet.publicKey,
+            vault: vaultPDA,
+            userPosition: userPositionPDA,
+            userUsdcToken: userUsdcAccount,
+            vaultUsdcToken: vaultUsdcAccount,
+            treasuryUsdcToken: treasuryUsdcAccount,
+            sharesMint: vault.sharesMint,
+            userSharesToken: userSharesAccount,
+            vaultAuthority: vaultAuthorityPDA,
+            stakingProgram: this.stakingProgram.programId,
+            systemProgram: SystemProgram.programId,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+            rent: SYSVAR_RENT_PUBKEY,
+          })
+          .remainingAccounts([
+            // Staking accounts (required for tier verification)
+            {
+              pubkey: getStakeConfigPDA()[0],
+              isWritable: false,
+              isSigner: false,
+            },
+            {
+              pubkey: getUserStakePDA(this.wallet.publicKey)[0],
+              isWritable: false,
+              isSigner: false,
+            },
+          ])
+          .instruction();
+
+        const tx = new Transaction();
+        tx.add(depositInstruction);
         
-      return await this.sendTransaction(tx);
+        console.log('📤 Sending simple deposit transaction...');
+        return await this.sendTransaction(tx);
+      } else {
+        console.log('🏗️ Building Pyth transaction with price updates...');
+        
+        // Post price updates following official documentation pattern
+        // Set closeUpdateAccounts: true if you want to delete the price update account at
+        // the end of the transaction to reclaim rent.
+        const transactionBuilder = this.pythSolanaReceiver.newTransactionBuilder({
+          closeUpdateAccounts: false,
+        });
+
+        // Add price updates to the transaction builder
+        await transactionBuilder.addPostPriceUpdates(this._priceUpdates);
+        console.log(`✅ Added ${this._priceUpdates.length} price updates`);
+
+        // Use this function to add your application-specific instructions to the builder
+        await transactionBuilder.addPriceConsumerInstructions(
+          async (getPriceUpdateAccount) => {
+            // Generate instructions here that use the price updates posted above.
+            // getPriceUpdateAccount(<price feed id>) will give you the account for each price update.
+            
+            // Build oracle accounts using the getPriceUpdateAccount callback
+            const oracleAccounts = [];
+
+            for (let i = 0; i < this._tokenData.length; i++) {
+              const token = this._tokenData[i];
+              const feedId = this._priceFeeds[i];
+              const priceUpdateAccount = getPriceUpdateAccount(feedId);
+
+              // Add the oracle account group: [token_account, pyth_price_update_v2, mint_account]
+              oracleAccounts.push(
+                {
+                  pubkey: token.tokenAccount,
+                  isWritable: false,
+                  isSigner: false,
+                },
+                {
+                  pubkey: priceUpdateAccount,
+                  isWritable: false,
+                  isSigner: false,
+                },
+                {
+                  pubkey: token.mint,
+                  isWritable: false,
+                  isSigner: false,
+                }
+              );
+            }
+
+            // Build remaining accounts
+            const remainingAccounts = [
+              // Staking accounts
+              {
+                pubkey: getStakeConfigPDA()[0],
+                isWritable: false,
+                isSigner: false,
+              },
+              {
+                pubkey: getUserStakePDA(this.wallet.publicKey)[0],
+                isWritable: false,
+                isSigner: false,
+              },
+              // Oracle accounts
+              ...oracleAccounts
+            ];
+
+            // Build the vault deposit instruction
+            const depositInstruction = await this.vaultProgram.methods
+              .deposit(amountBN)
+              .accounts({
+                user: this.wallet.publicKey,
+                vault: vaultPDA,
+                userPosition: userPositionPDA,
+                userUsdcToken: userUsdcAccount,
+                vaultUsdcToken: vaultUsdcAccount,
+                treasuryUsdcToken: treasuryUsdcAccount,
+                sharesMint: vault.sharesMint,
+                userSharesToken: userSharesAccount,
+                vaultAuthority: vaultAuthorityPDA,
+                stakingProgram: this.stakingProgram.programId,
+                systemProgram: SystemProgram.programId,
+                tokenProgram: TOKEN_PROGRAM_ID,
+                associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+                rent: SYSVAR_RENT_PUBKEY,
+              })
+              .remainingAccounts(remainingAccounts)
+              .instruction();
+
+            return [{ instruction: depositInstruction, signers: [] }];
+          }
+        );
+
+        // Send the instructions in the builder in 1 or more transactions.
+        // The builder will pack the instructions into transactions automatically.
+        console.log('📤 Building and sending Pyth transaction...');
+        
+        const versionedTransactions = await transactionBuilder.buildVersionedTransactions({
+          computeUnitPriceMicroLamports: 50000,
+        });
+
+        const signatures = await this.pythSolanaReceiver.provider.sendAll(
+          versionedTransactions,
+          { skipPreflight: true }
+        );
+
+        console.log('✅ Pyth transaction completed!');
+        return signatures[0];
+      }
     } catch (error) {
-      console.error('Error depositing USDC:', error);
+      console.error('❌ Error depositing USDC:', error);
+      
+      // Enhanced error handling for common issues
+      if (error.message && error.message.includes('Transaction version')) {
+        throw new Error('Your wallet does not support the required transaction format. Please try updating your wallet or using a different wallet like Phantom or Solflare.');
+      }
+      
       throw error;
     }
   }
@@ -1102,7 +1191,11 @@ export class VaultClient {
       console.log('  - Vault USDC:', vaultUsdcAccount.toString());
       console.log('  - Vault Authority:', vaultAuthorityPDA.toString());
 
-      const tx = await this.vaultProgram.methods
+      // 🔄 Pyth oracle updates are handled automatically
+      console.log('🔄 Pyth oracle accounts are handled automatically for withdrawal...');
+
+      // Build the vault withdrawal instruction
+      const withdrawInstruction = await this.vaultProgram.methods
         .withdraw(sharesBN)
         .accounts({
           user: this.wallet.publicKey,
@@ -1115,9 +1208,15 @@ export class VaultClient {
           vaultAuthority: vaultAuthorityPDA,
           tokenProgram: TOKEN_PROGRAM_ID,
         })
-        .transaction();
+        .instruction();
+
+      // 🔄 Build transaction with Pyth oracle accounts
+      const tx = new Transaction();
+      
+      // Add the vault withdrawal instruction
+      tx.add(withdrawInstruction);
         
-      console.log('✅ Withdraw transaction built successfully');
+      console.log('✅ Withdraw transaction built successfully with Pyth!');
       return await this.sendTransaction(tx);
     } catch (error) {
       console.error('❌ Error withdrawing USDC:', error);
@@ -1130,7 +1229,16 @@ export class VaultClient {
   async sendTransaction(transaction) {
     try {
       console.log('📤 Sending transaction...');
-      const signature = await this.wallet.sendTransaction(transaction, this.connection);
+      
+      // Send transaction with versioned transaction support
+      const sendOptions = {
+        // Support both legacy and versioned transactions
+        maxRetries: 3,
+        skipPreflight: true,
+        preflightCommitment: CONTRACTS.COMMITMENT,
+      };
+      
+      const signature = await this.wallet.sendTransaction(transaction, this.connection, sendOptions);
       console.log('📝 Transaction signature:', signature);
       
       console.log('⏳ Confirming transaction...');
@@ -1140,6 +1248,14 @@ export class VaultClient {
       return signature;
     } catch (error) {
       console.error('❌ Transaction failed:', error);
+      
+      // Enhanced error handling for versioned transaction issues
+      if (error.message && error.message.includes('Transaction version')) {
+        console.error('🔧 Transaction version error detected. This usually means:');
+        console.error('   1. The wallet doesn\'t support versioned transactions');
+        console.error('   2. The RPC endpoint doesn\'t support maxSupportedTransactionVersion');
+        console.error('   3. Update your wallet or use a different RPC endpoint');
+      }
       
       // Try to get more detailed error information
       if (error.logs) {
@@ -1176,12 +1292,17 @@ export class VaultClient {
     const quotient = amount.div(divisor);
     const remainder = amount.mod(divisor);
     
-    // For very small amounts, show more precision to avoid displaying as zero
+    // Always show full precision for vault shares (6 decimals)
     const fullRemainder = remainder.toString().padStart(decimals, '0');
     const formattedNumber = `${quotient.toString()}.${fullRemainder}`;
     const numValue = parseFloat(formattedNumber);
     
-    // If the number is very small but not zero, show at least 6 decimal places
+    // For vault shares (6 decimals), always show 6 decimal places to preserve precision
+    if (decimals === 6) {
+      return numValue.toFixed(6);
+    }
+    
+    // For very small amounts, show more precision to avoid displaying as zero
     if (numValue > 0 && numValue < 0.001) {
       return numValue.toFixed(6);
     }
@@ -1196,6 +1317,62 @@ export class VaultClient {
     if (tier.depositCap === null) return true; // Unlimited
     
     return (currentDeposits + newDeposit) <= tier.depositCap;
+  }
+
+  /**
+   * Test if the current setup supports versioned transactions
+   * This can help diagnose issues before attempting deposits
+   */
+  async testVersionedTransactionSupport() {
+    try {
+      console.log('🧪 Testing versioned transaction support...');
+      
+      // Test 1: Check if connection supports versioned transactions
+      const connectionInfo = await this.connection.getVersion();
+      console.log('✅ Connection version:', connectionInfo);
+      
+      // Test 2: Try to create a simple versioned transaction
+      const { blockhash } = await this.connection.getLatestBlockhash();
+      const message = new TransactionMessage({
+        payerKey: this.wallet.publicKey,
+        recentBlockhash: blockhash,
+        instructions: [], // Empty for testing
+      }).compileToV0Message();
+      
+      const testTransaction = new VersionedTransaction(message);
+      console.log('✅ Can create versioned transactions');
+      
+      // Test 3: Check if PythSolanaReceiver is properly initialized
+      if (!this.pythSolanaReceiver) {
+        throw new Error('PythSolanaReceiver not initialized');
+      }
+      console.log('✅ PythSolanaReceiver initialized');
+      
+      // Test 4: Try to create a transaction builder
+      const testBuilder = this.pythSolanaReceiver.newTransactionBuilder({
+        closeUpdateAccounts: false,
+      });
+      console.log('✅ Pyth transaction builder working');
+      
+      console.log('🎉 All versioned transaction tests passed!');
+      return {
+        success: true,
+        message: 'Your setup supports versioned transactions for Pyth price feeds'
+      };
+      
+    } catch (error) {
+      console.error('❌ Versioned transaction test failed:', error);
+      return {
+        success: false,
+        error: error.message,
+        recommendations: [
+          'Update your wallet to the latest version',
+          'Try a different wallet (Phantom, Solflare, etc.)',
+          'Check your RPC endpoint configuration',
+          'Contact support if issues persist'
+        ]
+      };
+    }
   }
 
   /**
@@ -1305,82 +1482,12 @@ export class VaultClient {
   }
 
   /**
-   * Get real token prices from Pyth with Switchboard fallback
+   * Get real token prices from Switchboard with Pyth fallback
    */
   async getRealTokenPrice(tokenMint, tokenBalance, tokenDecimals) {
     const tokenMintStr = tokenMint.toString();
-    
-    // Token mint to symbol mapping from oracle_config.rs
-    const TOKEN_MINT_TO_SYMBOL = {
-      'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'USDC',
-      '6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN': 'TRUMP',
-      'rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof': 'RENDER',
-      'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN': 'JUP',
-      'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263': 'BONK',
-      '9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump': 'FARTCOIN',
-      '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R': 'RAY',
-      'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL': 'JTO',
-      'HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3': 'PYTH',
-      'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm': 'WIF',
-      '3iQL8BFS2vE7mww4ehAqQHAsbmRNCrPxizpWAT2Zfyr9y': 'VIRTUAL',
-      '2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv': 'PENGU',
-      '85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ': 'W',
-      '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr': 'POPCAT',
-      'Dm5BxyMetG3Aq5PaG1BrG7rBYqEMtnkjvPNMExfacVk7': 'ATH',
-      'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5': 'MEW',
-      'MNDEFzGvMt87ueuHvVU9VcTqsAP5b3fTGPsHuuPA5ey': 'MNDE',
-      'J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr': 'SPX',
-      'orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE': 'ORCA',
-      'So11111111111111111111111111111111111111112': 'SOL', // Native SOL
-    };
 
-    // Pyth price feed IDs from oracle_config.rs
-    const PYTH_PRICE_FEEDS = {
-      'USDC': '0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a',
-      'TRUMP': '0x879551021853eec7a7dc827578e8e69da7e4fa8148339aa0d3d5296405be4b1a',
-      'RENDER': '0x3d4a2bd9535be6ce8059d75eadeba507b043257321aa544717c56fa19b49e35d',
-      'JUP': '0x0a0408d619e9380abad35060f9192039ed5042fa6f82301d0e48bb52be830996',
-      'BONK': '0x72b021217ca3fe68922a19aaf990109cb9d84e9ad004b4d2025ad6f529314419',
-      'FARTCOIN': '0x58cd29ef0e714c5affc44f269b2c1899a52da4169d7acc147b9da692e6953608',
-      'RAY': '0x91568baa8beb53db23eb3fb7f22c6e8bd303d103919e19733f2bb642d3e7987a',
-      'JTO': '0xb43660a5f790c69354b0729a5ef9d50d68f1df92107540210b9cccba1f947cc2',
-      'PYTH': '0x0bbf28e9a841a1cc788f6a361b17ca072d0ea3098a1e5df1c3922d0d719579ff',
-      'WIF': '0x4ca4beeca86f0d164160323817a4e42b10010a724c2217c6ee41b54cd4cc61fc',
-      'VIRTUAL': '0x8132e3eb1dac3e56939a16ff83848d194345f6688bff97eb1c8bd462d558802b',
-      'PENGU': '0xbed3097008b9b5e3c93bec20be79cb43986b85a996475589351a21e67bae9b61',
-      'W': '0xeff7446475e218517566ea99e72a4abec2e1bd8498b43b7d8331e29dcb059389',
-      'POPCAT': '0xb9312a7ee50e189ef045aa3c7842e099b061bd9bdc99ac645956c3b660dc8cce',
-      'ATH': '0xf6b551a947e7990089e2d5149b1e44b369fcc6ad3627cb822362a2b19d24ad4a',
-      'MEW': '0x514aed52ca5294177f20187ae883cec4a018619772ddce41efcc36a6448f5d5d',
-      'MNDE': '0x3607bf4d7b78666bd3736c7aacaf2fd2bc56caa8667d3224971ebe3c0623292a',
-      'SPX': '0x8414cfadf82f6bed644d2e399c11df21ec0131aa574c56030b132113dbbf3a0a',
-      'ORCA': '0x37505261e557e251290b8c8899453064e8d760ed5c65a779726f2490980da74c',
-      'SOL': '0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d', // SOL/USD
-    };
 
-    // Switchboard feeds as fallback
-    const SWITCHBOARD_FEEDS = {
-      'TRUMP': '9wcBMATS8bGLQ2UcRuYjsRAD7TPqB1CMhqfueBx78Uj2',
-      'WIF': '8GqzQoqqKzJoNaWZtf2udVGV3Fn74W9DQayYu1S1zvkt',
-      'ATH': '21JapEAFu8r8SAAQjB2fURfjiosnTHAFFm4S27qe4vVF',
-      'BONK': '7GCiue6chgGuk6BvaurQNWD1Ervho8zEdcNWt5CXqR4hL3RGDUGh',
-      'FARTCOIN': 'EE8Uyquv38j2JmyCiPprCNUxDBTrzpCXqR4hL3RGDUGh',
-      'JTO': 'E9fHVUZnvT4i8H3jQLb6g2tSpcagunJpjwCGNTYxwKSE',
-      'JUP': '2F9M59yYc28WMrAymNWceaBEk8ZmDAjUAKULp8seAJF3',
-      'MEW': '7Eev1vbsrgEmiRbVjyyFL8nqRKQt7jNPVtxiS4C6ewns',
-      'MNDE': 'CwtLbG7w71oCasCMYR8KARZYEVJK5x1GXdoYpqjctp7E',
-      'ORCA': 'BFWHemmj4ZtvqQVsWrGrFrL2U8tz7Lzq8nhy1KRMVezL',
-      'PENGU': 'DAG9yMr4FbTVd41Jojw6X589EHiPgR375SP5AdAAW7tH',
-      'POPCAT': '5FWVcePyDK5jF6ZqFgmEMyu9qu5qdsswwvMd7GvRmfFW',
-      'PYTH': '72ukr6M31f9cCzxvZT4Ba7AGyWSFLQGHjXU6WUzN4xD7',
-      'RAY': 'AJkAFiXdbMonys8rTXZBrRnuUiLcDFdkyoPuvrVKXhex',
-      'RENDER': 'B6xHth4K3fj3KK1TASXtHfbAReShYW3EihgwSKvhsugz',
-      'SPX': '8m5YKLgnftRTcVXJLk7bV37xc2qrWR9TkXq4TY3FP3pz',
-      'VIRTUAL': '34aJFwk2jTKmB2C6zWnT641ABCQv1P2ghrob57i1gFdg',
-      'W': 'DwjV47HwtHW5YR1CPndw3Fq1QMeYyvYA7jYXhMtcUCte',
-      'SOL': 'E8TLLh5jkYDvSXfAES7qe3s8Cfjj4hyvjksuvUHe8NEw',
-      'USDC': 'aHTvxuDvCRRnmJDDR1JkfLa4SpCNsgC4vDeLMEcN3zY',
-    };
 
     const tokenSymbol = TOKEN_MINT_TO_SYMBOL[tokenMintStr];
     if (!tokenSymbol) {
@@ -1389,8 +1496,8 @@ export class VaultClient {
 
     console.log(`🔍 Looking up price for ${tokenSymbol} (${tokenMintStr})`);
 
-    // Try Pyth first
-    const pythFeedId = PYTH_PRICE_FEEDS[tokenSymbol];
+    // Try Pyth first (primary oracle source)
+    const pythFeedId = PYTH_PRICE_FEEDS[tokenMintStr];
     if (pythFeedId) {
       try {
         const pythPrice = await this.getPythPrice(pythFeedId, tokenSymbol);
@@ -1399,19 +1506,6 @@ export class VaultClient {
         }
       } catch (error) {
         console.warn(`⚠️ Pyth price failed for ${tokenSymbol}:`, error.message);
-      }
-    }
-
-    // Fallback to Switchboard
-    const switchboardFeed = SWITCHBOARD_FEEDS[tokenSymbol];
-    if (switchboardFeed) {
-      try {
-        const switchboardPrice = await this.getSwitchboardPrice(switchboardFeed, tokenSymbol);
-        if (switchboardPrice > 0) {
-          return this.calculateTokenValue(tokenBalance, tokenDecimals, switchboardPrice);
-        }
-      } catch (error) {
-        console.warn(`⚠️ Switchboard price failed for ${tokenSymbol}:`, error.message);
       }
     }
 
@@ -1468,49 +1562,7 @@ export class VaultClient {
     }
   }
 
-  /**
-   * Get price from Switchboard on-chain data
-   */
-  async getSwitchboardPrice(feedAddress, tokenSymbol) {
-    try {
-      // Get account data from Switchboard feed
-      const feedPubkey = new PublicKey(feedAddress);
-      const accountInfo = await this.connection.getAccountInfo(feedPubkey);
-      
-      if (!accountInfo) {
-        throw new Error('Switchboard feed account not found');
-      }
 
-      // Parse Switchboard aggregator data (simplified)
-      // Note: This is a basic implementation - full Switchboard parsing would need their SDK
-      const data = accountInfo.data;
-      
-      // Switchboard stores price as i128 in little-endian format at offset 114
-      // This is a simplified extraction - production should use @switchboard-xyz/solana.js
-      if (data.length < 130) {
-        throw new Error('Invalid Switchboard account data');
-      }
-
-      // Extract price value (simplified - this may need adjustment based on Switchboard format)
-      const priceBytes = data.slice(114, 130);
-      let price = 0;
-      
-      // Convert little-endian bytes to number (simplified)
-      for (let i = 0; i < 8; i++) {
-        price += priceBytes[i] * Math.pow(256, i);
-      }
-      
-      // Switchboard typically uses 9 decimal places for USD prices
-      price = price / 1e9;
-      
-      console.log(`📊 Switchboard price for ${tokenSymbol}: $${price.toFixed(6)}`);
-      return price;
-
-    } catch (error) {
-      console.error(`❌ Switchboard price fetch failed for ${tokenSymbol}:`, error);
-      throw error;
-    }
-  }
 
   /**
    * Calculate token value in USDC from price

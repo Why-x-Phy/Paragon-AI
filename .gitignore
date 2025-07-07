@@ -128,3 +128,45 @@ dist/
 # Temporary files
 *.tmp
 *.temp
+
+# Test and Debug Files
+test_*.py
+debug_*.py
+*_test.py
+*_debug.py
+test_*.log
+debug_*.log
+*_test_*.py
+*_debug_*.py
+test_event_loop_*.py
+test_inference_*.py
+test_portfolio_*.py
+test_websocket_*.py
+debug_*.json
+test_*.json
+*.test.py
+*.debug.py
+scratch_*.py
+temp_*.py
+experimental_*.py
+
+# Test output files
+test_output/
+debug_output/
+test_results/
+debug_results/
+*_test_output.*
+*_debug_output.*
+
+# Jupyter notebook test files
+*_test.ipynb
+*_debug.ipynb
+test_*.ipynb
+debug_*.ipynb
+scratch_*.ipynb
+
+# Performance profiling files
+*.prof
+*.profile
+profile_*.txt
+perf_*.txt

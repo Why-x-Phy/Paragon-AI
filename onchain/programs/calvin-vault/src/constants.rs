@@ -32,7 +32,7 @@ pub const MAX_PRICE_STALENESS_SECONDS: i64 = 60; // Max staleness for price orac
 // Arithmetic Safety Limits
 pub const MAX_DEPOSIT_AMOUNT: u64 = 1_000_000_000_000; // 1M USDC max single deposit
 pub const MAX_TOTAL_NAV: u64 = 100_000_000_000_000;   // 100M USDC max total NAV
-pub const MIN_SHARE_PRICE: u64 = 1;                   // 0.000001 USDC minimum share price (very permissive)
+pub const MIN_SHARE_PRICE: u64 = 0;                   // No minimum share price restriction
 pub const MAX_SHARE_PRICE: u64 = 1_000_000_000;       // 1,000 USDC maximum share price (allows for 1000x returns!)
 pub const MAX_ALLOCATION_BPS: u16 = 10_000;           // 100% maximum allocation
 

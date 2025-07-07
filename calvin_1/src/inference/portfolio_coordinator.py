@@ -25,8 +25,9 @@ SimpleStrategyEngine (per token) → PortfolioCoordinator → Position Allocatio
 
 import asyncio
 import os
-from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Tuple, Set, TYPE_CHECKING
+from collections import deque
+from datetime import datetime, timedelta, date
 from dataclasses import dataclass, asdict
 from enum import Enum
 import numpy as np
@@ -128,8 +129,8 @@ class PortfolioSignal:
     correlation_risk: float
     concentration_risk: float
     
-    # Execution priority (1 = highest, 10 = lowest)
-    execution_priority: int = 5
+    # Execution priority ('HIGH', 'MEDIUM', 'LOW')
+    execution_priority: str = 'MEDIUM'
 
 class PortfolioCoordinator:
     """
@@ -139,43 +140,35 @@ class PortfolioCoordinator:
     and position allocation logic.
     """
     
-    def __init__(self, config: Optional[PortfolioConfig] = None):
-        """
-        Initialize the portfolio coordinator
-        
-        Args:
-            config: Portfolio configuration (uses env defaults if None)
-        """
+    def __init__(self, config: Optional[PortfolioConfig] = None, db_manager: Optional['ProductionDBManager'] = None):
+        """Initialize portfolio coordinator"""
         self.config = config or self._load_config_from_env()
-        
-        # Initialize core components
-        self.strategy_engine = SimpleStrategyEngine()
-        self.model_registry = get_model_registry()
-        
-        # Database and position management
-        self.db_manager = None
-        self.position_manager = None
-        
-        # Portfolio state
-        self.tracked_symbols: List[str] = []
-        self.active_allocations: Dict[str, AssetAllocation] = {}
-        self.portfolio_history: List[PortfolioSignal] = []
-        
-        # Performance tracking
-        self.daily_pnl_by_asset: Dict[str, float] = {}
-        self.performance_attribution: Dict[str, Dict[str, float]] = {}
-        
-        # Signal management
-        self.last_signals: Dict[str, TradingSignal] = {}
-        self.signal_cache_timeout = timedelta(minutes=self.config.signal_timeout_minutes)
+        self.db_manager = db_manager  # Use provided db_manager if available
+        self.redis_client = None
+        self.strategy_engine: Optional[SimpleStrategyEngine] = None
+        self.position_manager: Optional['PositionManager'] = None
         
         # Risk management
         self.risk_limits = self._create_risk_limits()
         
-        logger.info("Portfolio Coordinator initialized")
-        logger.info(f"Config: max_exposure={self.config.max_portfolio_exposure_pct}%, "
-                   f"max_per_asset={self.config.max_single_asset_exposure_pct}%, "
-                   f"allocation_method={self.config.allocation_method.value}")
+        # Performance tracking
+        self.portfolio_history: deque[PortfolioSignal] = deque(maxlen=1000)
+        self.signal_cache_timeout = timedelta(minutes=self.config.signal_timeout_minutes)
+        self.last_signals: Dict[str, TradingSignal] = {}
+        
+        # Asset tracking
+        self.tracked_symbols: Set[str] = set()
+        
+        # Daily P&L tracking
+        self.daily_pnl_by_asset: Dict[str, float] = {}
+        self._last_pnl_reset_date: Optional[date] = None
+        
+        # Performance attribution by asset
+        self.performance_attribution: Dict[str, Dict[str, Any]] = {}
+        
+        logger.info(f"Portfolio Coordinator initialized with config: {self.config}")
+        if self.db_manager:
+            logger.info("Using provided database manager for thread safety")
 
     def _load_config_from_env(self) -> PortfolioConfig:
         """Load portfolio configuration from environment variables"""
@@ -225,27 +218,63 @@ class PortfolioCoordinator:
         )
 
     async def initialize(self):
-        """Initialize async components"""
+        """Initialize the portfolio coordinator"""
         try:
-            # Initialize database manager
-            self.db_manager = await get_db_manager()
+            # Initialize database manager if not provided in constructor
+            if not self.db_manager:
+                # Check if we're in a thread
+                try:
+                    import asyncio
+                    # Try to get the current running loop
+                    current_loop = asyncio.get_running_loop()
+                    
+                    # If we're in a thread with its own event loop, create a new DB manager
+                    # to avoid event loop conflicts
+                    from ..database.production_db import ProductionDBManager
+                    self.db_manager = ProductionDBManager()
+                    await self.db_manager.initialize()
+                    logger.info("Database manager initialized (thread-local)")
+                except RuntimeError:
+                    # No running loop, use the default get_db_manager
+                    self.db_manager = await get_db_manager()
+                    logger.info("Database manager initialized (main)")
+            else:
+                logger.info("Using provided database manager from scheduler")
+            
+            # Initialize strategy engine - it will handle its own thread-local DB
+            from ..inference.strategy_engine import SimpleStrategyEngine
+            self.strategy_engine = SimpleStrategyEngine()
+            
+            # Initialize model registry
+            self.model_registry = get_model_registry()
             
             # Load tracked symbols from database
             await self._load_tracked_symbols()
             
-            # Initialize position manager with our risk limits
-            from ..trading.position_manager import PositionManager
-            self.position_manager = PositionManager(risk_limits=self.risk_limits)
+            # Initialize position manager with our risk limits and thread-local db_manager
+            self.position_manager = PositionManager(
+                db_manager=self.db_manager,  # Pass the thread-local db_manager
+                risk_limits=self.risk_limits
+            )
             await self.position_manager.initialize()
             
-            # 🆕 RECOVER PORTFOLIO STATE FROM DATABASE
+            # Recover portfolio state from database
             await self._recover_portfolio_state()
             
-            logger.info(f"Portfolio Coordinator initialized with {len(self.tracked_symbols)} tracked symbols")
-            logger.info(f"Tracked symbols: {', '.join(self.tracked_symbols[:10])}{'...' if len(self.tracked_symbols) > 10 else ''}")
+            # Recover daily P&L tracking
+            await self._recover_daily_pnl_tracking()
+            
+            # Recover performance attribution
+            await self._recover_performance_attribution()
+            
+            # Recover portfolio history
+            await self._recover_portfolio_history()
+            
+            self.initialized = True
+            logger.info(f"Portfolio coordinator initialized with {len(self.tracked_symbols)} tracked symbols")
             
         except Exception as e:
-            logger.error(f"Failed to initialize Portfolio Coordinator: {e}")
+            logger.error(f"Portfolio coordinator initialization failed: {e}")
             raise
 
     async def _recover_portfolio_state(self):
@@ -312,19 +341,30 @@ class PortfolioCoordinator:
             # Rebuild performance attribution from recent data
             for row in rows:
                 if row['details']:
-                    perf_data = row['details']
-                    symbol = perf_data.get('symbol')
-                    if symbol:
-                        self.performance_attribution[symbol] = {
-                            'total_signals': perf_data.get('total_signals', 0),
-                            'successful_signals': perf_data.get('successful_signals', 0),
-                            'total_pnl': perf_data.get('total_pnl', 0.0),
-                            'win_rate': perf_data.get('signal_generation_rate', 0.0),
-                            'avg_return': perf_data.get('avg_return', 0.0),
-                            'sharpe_ratio': perf_data.get('sharpe_ratio', 0.0),
-                            'max_drawdown': 0.0,
-                            'last_updated': datetime.now()
-                        }
+                    details = row['details']
+                    
+                    # Handle both string and dict formats
+                    if isinstance(details, str):
+                        try:
+                            import json
+                            details = json.loads(details)
+                        except json.JSONDecodeError:
+                            continue
+                    
+                    # Now details should be a dict
+                    if isinstance(details, dict):
+                        symbol = details.get('symbol')
+                        if symbol:
+                            self.performance_attribution[symbol] = {
+                                'total_signals': details.get('total_signals', 0),
+                                'successful_signals': details.get('successful_signals', 0),
+                                'total_pnl': details.get('total_pnl', 0.0),
+                                'win_rate': details.get('signal_generation_rate', 0.0),
+                                'avg_return': details.get('avg_return', 0.0),
+                                'sharpe_ratio': details.get('sharpe_ratio', 0.0),
+                                'max_drawdown': 0.0,
+                                'last_updated': datetime.now()
+                            }
             
             logger.info(f"📈 Recovered performance attribution for {len(self.performance_attribution)} assets")
             
@@ -352,12 +392,15 @@ class PortfolioCoordinator:
                     portfolio_risk_score=cycle.get('portfolio_risk_score', 0.0),
                     correlation_risk=cycle.get('correlation_risk', 0.0),
                     concentration_risk=0.0,
-                    execution_priority=5
+                    execution_priority='MEDIUM'
                 )
                 self.portfolio_history.append(portfolio_signal)
             
-            # Sort by timestamp
-            self.portfolio_history.sort(key=lambda x: x.timestamp)
+            # Sort by timestamp (convert to list, sort, then recreate deque)
+            if self.portfolio_history:
+                sorted_history = sorted(self.portfolio_history, key=lambda x: x.timestamp)
+                self.portfolio_history.clear()
+                self.portfolio_history.extend(sorted_history)
             
             logger.info(f"📊 Recovered {len(self.portfolio_history)} recent portfolio cycles")
             
@@ -368,7 +411,7 @@ class PortfolioCoordinator:
     async def _load_tracked_symbols(self):
         """Load tracked symbols from database using token addresses"""
         try:
-            self.tracked_symbols = []
+            self.tracked_symbols = set()
             
             # Get all active tokens from database
             active_tokens = await self.db_manager.get_active_tokens()
@@ -376,20 +419,20 @@ class PortfolioCoordinator:
             # Filter to only tracked tokens
             for token in active_tokens:
                 if token['address'] in self.tracked_tokens_addresses:
-                    self.tracked_symbols.append(token['symbol'])
+                    self.tracked_symbols.add(token['symbol'])
             
             # Fallback: if no tracked symbols found, use available models
             if not self.tracked_symbols:
                 logger.warning("No tracked symbols found in database, using available models")
                 models = self.model_registry.list_models()
-                self.tracked_symbols = list(set([model.symbol for model in models]))
+                self.tracked_symbols = set([model.symbol for model in models])
             
             logger.info(f"Loaded {len(self.tracked_symbols)} tracked symbols")
             
         except Exception as e:
             logger.error(f"Failed to load tracked symbols: {e}")
             # Fallback to basic symbols
-            self.tracked_symbols = ['BONK', 'JUP', 'SOL', 'Fartcoin']
+            self.tracked_symbols = {'BONK', 'JUP', 'SOL', 'Fartcoin'}
 
     async def generate_portfolio_signals(self, simulation_time: Optional[datetime] = None, override_portfolio_state: Optional[Dict[str, Any]] = None) -> Optional[PortfolioSignal]:
         """
@@ -683,14 +726,17 @@ class PortfolioCoordinator:
                         continue
                     
                     # Calculate position size based on signal strength
+                    # Base position size is 5% of portfolio
+                    base_position_pct = self.config.base_position_size_pct
+                    
                     if signal.strength == SignalStrength.WEAK:
-                        position_pct = self.config.weak_signal_multiplier
+                        position_pct = base_position_pct * self.config.weak_signal_multiplier
                     elif signal.strength == SignalStrength.MODERATE:
-                        position_pct = self.config.moderate_signal_multiplier
+                        position_pct = base_position_pct * self.config.moderate_signal_multiplier
                     elif signal.strength == SignalStrength.STRONG:
-                        position_pct = self.config.strong_signal_multiplier
+                        position_pct = base_position_pct * self.config.strong_signal_multiplier
                     else:
-                        position_pct = 1.0  # Default to 100%
+                        position_pct = base_position_pct  # Default to base size
                     
                     # Calculate target position value
                     target_position_value = portfolio_value * (position_pct / 100.0)
@@ -753,8 +799,8 @@ class PortfolioCoordinator:
         return target_cash_pct
 
     def _calculate_execution_priority(self, signals: List[TradingSignal], 
-                                    risk_assessment: Dict[str, float]) -> int:
-        """Calculate execution priority (1=highest, 10=lowest)"""
+                                    risk_assessment: Dict[str, float]) -> str:
+        """Calculate execution priority ('HIGH', 'MEDIUM', 'LOW')"""
         # High priority for high-confidence signals with low portfolio risk
         avg_confidence = np.mean([s.confidence for s in signals]) if signals else 0.5
         portfolio_risk = risk_assessment.get('portfolio_risk', 0.5)
@@ -762,10 +808,13 @@ class PortfolioCoordinator:
         # Priority score: higher confidence and lower risk = higher priority (lower number)
         priority_score = (1.0 - avg_confidence) + portfolio_risk
         
-        # Convert to 1-10 scale
-        priority = int(np.clip(priority_score * 10, 1, 10))
-        
-        return priority
+        # Convert to categorical priority
+        if priority_score <= 0.6:
+            return 'HIGH'
+        elif priority_score <= 1.2:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
 
     def _update_performance_tracking(self, portfolio_signal: PortfolioSignal):
         """Update performance tracking metrics"""
@@ -795,8 +844,11 @@ class PortfolioCoordinator:
             # Calculate portfolio-level P&L
             if len(self.portfolio_history) >= 2:
                 previous_signal = self.portfolio_history[-2]
-                portfolio_pnl_change = portfolio_signal.portfolio_value - previous_signal.portfolio_value
-                portfolio_pnl_pct = (portfolio_pnl_change / previous_signal.portfolio_value) * 100 if previous_signal.portfolio_value > 0 else 0.0
+                # Convert to float to handle potential Decimal types from database
+                current_value = float(portfolio_signal.portfolio_value)
+                previous_value = float(previous_signal.portfolio_value)
+                portfolio_pnl_change = current_value - previous_value
+                portfolio_pnl_pct = (portfolio_pnl_change / previous_value) * 100 if previous_value > 0 else 0.0
                 
                 # Update daily P&L by asset
                 for symbol, allocation in portfolio_signal.asset_allocations.items():
@@ -804,7 +856,7 @@ class PortfolioCoordinator:
                         self.daily_pnl_by_asset[symbol] = 0.0
                     
                     # Calculate asset contribution to portfolio P&L
-                    asset_weight = allocation.position_value_usdc / portfolio_signal.portfolio_value if portfolio_signal.portfolio_value > 0 else 0.0
+                    asset_weight = float(allocation.position_value_usdc) / current_value if current_value > 0 else 0.0
                     asset_pnl_contribution = portfolio_pnl_change * asset_weight
                     
                     self.daily_pnl_by_asset[symbol] += asset_pnl_contribution

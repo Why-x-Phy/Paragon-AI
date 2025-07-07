@@ -118,7 +118,7 @@ class EmergencyStopLossMonitor:
         
         # Core components
         self.position_manager = PositionManager()
-        self.vault_client = VaultClient()
+        self.vault_client = None  # Will be initialized in initialize() method
         self.websocket_feed: Optional[BirdEyeWebSocketFeed] = None
         self.db_manager = None
         
@@ -159,6 +159,29 @@ class EmergencyStopLossMonitor:
                 self.db_manager = await get_db_manager()
             
             # Initialize vault client
+            from .vault_client import VaultClient
+            from solana.rpc.async_api import AsyncClient
+            from solders.keypair import Keypair
+            import os
+            import json
+            
+            # Create vault client with proper parameters
+            rpc_url = os.getenv('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
+            vault_program_id = os.getenv('VAULT_PROGRAM_ID', 'tXMJu1KaBQU5DSk94QXMtigQpzxbK62WJVUs2Xmxz7z')
+            
+            # Load authority keypair
+            authority_key_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'onchain', 'calvin-ai-authority.json')
+            with open(authority_key_path, 'r') as f:
+                authority_key_data = json.load(f)
+            authority_keypair = Keypair.from_bytes(authority_key_data)
+            
+            # Create connection and vault client
+            connection = AsyncClient(rpc_url)
+            self.vault_client = VaultClient(
+                vault_program=vault_program_id,
+                connection=connection,
+                authority_keypair=authority_keypair
+            )
             await self.vault_client.initialize()
             
             # Initialize position manager
@@ -670,47 +693,15 @@ class EmergencyStopLossMonitor:
 
     async def _subscribe_to_position_prices(self):
         """Subscribe to WebSocket price feeds for all positions"""
-        if not self.websocket_feed:
-            logger.error("❌ No WebSocket feed available")
-            return
+        # ⚠️ DISABLED: WebSocket subscriptions are now handled centrally by DualWebSocketFeedManager
+        # The emergency monitor receives price updates via the main system's price relay
+        logger.info("📡 Emergency monitor using centralized WebSocket feeds (no individual subscriptions needed)")
         
-        subscription_count = 0
+        # Just mark all position symbols as "subscribed" since they get data via relay
         for symbol in self.position_monitors.keys():
-            try:
-                # Get token address from database with error handling
-                token_info = None
-                try:
-                    if self.db_manager:
-                        token_info = await self.db_manager.get_token_by_symbol(symbol)
-                except Exception as db_error:
-                    logger.warning(f"Database error getting token info for {symbol}: {db_error}")
-                    continue
-                
-                if token_info:
-                    subscription = PriceSubscription(
-                        query_type="simple",
-                        chart_type="1m",
-                        address=token_info['address'],
-                        currency="usd"
-                    )
-                    
-                    try:
-                        success = await self.websocket_feed.subscribe_price(subscription)
-                        if success:
-                            self.subscribed_tokens.add(symbol)
-                            subscription_count += 1
-                            logger.debug(f"✅ Subscribed to {symbol} price updates")
-                        else:
-                            logger.warning(f"⚠️ Failed to subscribe to {symbol} prices")
-                    except Exception as sub_error:
-                        logger.warning(f"Subscription error for {symbol}: {sub_error}")
-                else:
-                    logger.warning(f"⚠️ Token address not found for {symbol}")
-                    
-            except Exception as e:
-                logger.error(f"❌ Failed to subscribe to {symbol} prices: {e}")
+            self.subscribed_tokens.add(symbol)
         
-        logger.info(f"📡 Subscribed to {subscription_count} token price feeds")
+        logger.info(f"📡 Emergency monitor ready to receive price updates for {len(self.subscribed_tokens)} tokens")
 
     async def _get_vault_positions(self) -> Dict[str, PositionData]:
         """Get current vault positions from position manager"""

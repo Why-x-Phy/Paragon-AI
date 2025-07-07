@@ -160,11 +160,15 @@ class RealtimeDataStorage:
         self.position_triggers: Dict[int, List[PositionTrigger]] = defaultdict(list)
         self.trigger_callbacks: List[Callable[[PositionTrigger, float], None]] = []
         
-        # Processing queue for batch operations
-        self.tick_queue: deque = deque(maxlen=10000)
-        self.transaction_queue: deque = deque(maxlen=10000)
+        # Processing queue for batch operations - MEMORY LEAK PROTECTION
+        self.tick_queue: deque = deque(maxlen=5000)  # Reduced from 10000
+        self.transaction_queue: deque = deque(maxlen=5000)  # Reduced from 10000
         self.batch_size = 100
         self.batch_timeout = 5.0  # seconds
+        
+        # 🚨 MEMORY LEAK PREVENTION
+        self.max_aggregators = 50  # Limit number of active candle aggregators
+        self.aggregator_cleanup_interval = 300  # Clean up stale aggregators every 5 minutes
         
         # Processing stats
         self.stats = {
@@ -175,7 +179,9 @@ class RealtimeDataStorage:
             'errors': 0,
             'last_tick_time': None,
             'last_transaction_time': None,
-            'start_time': datetime.utcnow()
+            'start_time': datetime.utcnow(),
+            'queue_overflows_prevented': 0,
+            'aggregators_cleaned': 0
         }
         
         # Running state
@@ -183,6 +189,7 @@ class RealtimeDataStorage:
         self.processing_task: Optional[asyncio.Task] = None
         self.transaction_task: Optional[asyncio.Task] = None
         self.candle_task: Optional[asyncio.Task] = None
+        self.cleanup_task: Optional[asyncio.Task] = None
         
         # Connection state tracking for safer health checks
         self._last_connection_state: Optional[Dict] = None
@@ -221,11 +228,12 @@ class RealtimeDataStorage:
             self.processing_task = asyncio.create_task(self._process_tick_queue())
             self.transaction_task = asyncio.create_task(self._process_transaction_queue())
             self.candle_task = asyncio.create_task(self._process_candle_aggregation())
+            self.cleanup_task = asyncio.create_task(self._cleanup_stale_aggregators())
             
             # Start WebSocket feed
             await self.websocket_feed.start()
             
-            self.logger.info("Real-time data storage started")
+            self.logger.info("Real-time data storage started with memory leak protection")
             
         except Exception as e:
             self.logger.error(f"Failed to start real-time storage: {e}")
@@ -244,20 +252,13 @@ class RealtimeDataStorage:
             await self.websocket_feed.stop()
             
             # Cancel processing tasks
-            if self.processing_task:
-                self.processing_task.cancel()
-            if self.transaction_task:
-                self.transaction_task.cancel()
-            if self.candle_task:
-                self.candle_task.cancel()
+            tasks = [self.processing_task, self.transaction_task, self.candle_task, self.cleanup_task]
+            for task in tasks:
+                if task:
+                    task.cancel()
             
             # Wait for tasks to complete
-            await asyncio.gather(
-                self.processing_task,
-                self.transaction_task,
-                self.candle_task,
-                return_exceptions=True
-            )
+            await asyncio.gather(*[task for task in tasks if task], return_exceptions=True)
             
             # Process remaining queue items
             await self._flush_tick_queue()
@@ -276,6 +277,12 @@ class RealtimeDataStorage:
     async def _handle_price_update(self, price_update: PriceUpdate):
         """Handle incoming price update from WebSocket"""
         try:
+            # 🚨 MEMORY LEAK FIX: Check queue capacity before adding
+            if len(self.tick_queue) >= self.tick_queue.maxlen * 0.9:
+                self.logger.warning(f"Tick queue near capacity ({len(self.tick_queue)}/{self.tick_queue.maxlen}) - forcing batch processing")
+                await self._process_tick_batch()
+                self.stats['queue_overflows_prevented'] += 1
+            
             # Get token info
             token = self.db_manager.get_token_by_address(price_update.address)
             if not token:
@@ -311,6 +318,12 @@ class RealtimeDataStorage:
     async def _handle_transaction_update(self, transaction_update: TransactionUpdate):
         """Handle incoming transaction update from WebSocket"""
         try:
+            # 🚨 MEMORY LEAK FIX: Check queue capacity before adding
+            if len(self.transaction_queue) >= self.transaction_queue.maxlen * 0.9:
+                self.logger.warning(f"Transaction queue near capacity ({len(self.transaction_queue)}/{self.transaction_queue.maxlen}) - forcing batch processing")
+                await self._process_transaction_batch()
+                self.stats['queue_overflows_prevented'] += 1
+            
             # Get token info
             token = self.db_manager.get_token_by_address(transaction_update.token_address or transaction_update.from_address)
             if not token:
@@ -376,16 +389,12 @@ class RealtimeDataStorage:
         """Handle WebSocket connection state changes"""
         self.logger.info(f"WebSocket connection state: {state.value}")
         
-        # Record health check safely without blocking or creating race conditions
-        if self.db_manager:
-            # Use a simple flag-based approach instead of fire-and-forget tasks
-            # This avoids connection pool conflicts
-            self._last_connection_state = {
-                'timestamp': datetime.utcnow().isoformat(), 
-                'state': state.value
-            }
-            # The health check will be recorded in the next batch operation
-            # to avoid concurrent connection usage
+        # 🚨 DISABLED: Health check recording to prevent database spam
+        # Just track the state in memory
+        self._last_connection_state = {
+            'timestamp': datetime.utcnow().isoformat(), 
+            'state': state.value
+        }
     
     # =========================================================================
     # TICK PROCESSING
@@ -495,6 +504,11 @@ class RealtimeDataStorage:
     async def _add_tick_to_aggregator(self, tick: TickData):
         """Add tick to the appropriate candle aggregator"""
         try:
+            # 🚨 MEMORY LEAK FIX: Limit number of active aggregators
+            if len(self.candle_aggregators) >= self.max_aggregators:
+                # Clean up oldest aggregators
+                await self._cleanup_oldest_aggregators()
+            
             # Get or create aggregator for this token
             if tick.token_id not in self.candle_aggregators:
                 self.candle_aggregators[tick.token_id] = CandleAggregator()
@@ -672,6 +686,56 @@ class RealtimeDataStorage:
     # MONITORING AND STATS
     # =========================================================================
     
+    async def _cleanup_stale_aggregators(self):
+        """Background task to clean up stale aggregators"""
+        while self.is_running:
+            try:
+                await asyncio.sleep(self.aggregator_cleanup_interval)
+                
+                current_time = datetime.utcnow()
+                stale_cutoff = current_time - timedelta(minutes=10)  # Remove aggregators older than 10 minutes
+                
+                stale_tokens = []
+                for token_id, aggregator in self.candle_aggregators.items():
+                    if aggregator.last_update and aggregator.last_update < stale_cutoff:
+                        stale_tokens.append(token_id)
+                
+                for token_id in stale_tokens:
+                    # Finalize stale aggregator before removing
+                    await self._finalize_candle(token_id, self.candle_aggregators[token_id])
+                    del self.candle_aggregators[token_id]
+                    self.stats['aggregators_cleaned'] += 1
+                
+                if stale_tokens:
+                    self.logger.info(f"🧹 Cleaned up {len(stale_tokens)} stale candle aggregators")
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error in aggregator cleanup: {e}")
+                await asyncio.sleep(60)
+
+    async def _cleanup_oldest_aggregators(self):
+        """Clean up oldest aggregators when limit is reached"""
+        if len(self.candle_aggregators) < self.max_aggregators:
+            return
+        
+        # Sort by last update time and remove oldest
+        sorted_aggregators = sorted(
+            self.candle_aggregators.items(),
+            key=lambda x: x[1].last_update or datetime.min
+        )
+        
+        # Remove oldest 25% of aggregators
+        to_remove = len(sorted_aggregators) // 4
+        
+        for i in range(to_remove):
+            token_id, aggregator = sorted_aggregators[i]
+            # Finalize before removing
+            await self._finalize_candle(token_id, aggregator)
+            del self.candle_aggregators[token_id]
+            self.stats['aggregators_cleaned'] += 1
+
     def get_statistics(self) -> Dict[str, Any]:
         """Get processing statistics"""
         uptime = datetime.utcnow() - self.stats['start_time']
@@ -679,8 +743,12 @@ class RealtimeDataStorage:
         return {
             **self.stats,
             'uptime_seconds': uptime.total_seconds(),
-            'queue_size': len(self.tick_queue),
+            'tick_queue_size': len(self.tick_queue),
+            'tick_queue_capacity': self.tick_queue.maxlen,
+            'transaction_queue_size': len(self.transaction_queue),
+            'transaction_queue_capacity': self.transaction_queue.maxlen,
             'active_aggregators': len(self.candle_aggregators),
+            'max_aggregators': self.max_aggregators,
             'position_triggers': sum(len(triggers) for triggers in self.position_triggers.values()),
             'is_running': self.is_running
         }

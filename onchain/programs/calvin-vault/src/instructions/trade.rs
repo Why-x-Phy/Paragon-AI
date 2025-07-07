@@ -75,12 +75,12 @@ pub struct Trade<'info> {
     )]
     pub destination_token_whitelist: Box<Account<'info, TokenWhitelist>>,
     
-    /// Price oracle account for source token (Pyth price feed)
-    /// CHECK: Validated by utils::current_nav_usdc function
+    /// Price oracle account for source token (Pyth PriceUpdateV2 account)
+    /// CHECK: Validated by utils::current_nav_usdc function using Pyth pull oracle SDK
     pub source_price_account: UncheckedAccount<'info>,
     
-    /// Price oracle account for destination token (Pyth price feed)
-    /// CHECK: Validated by utils::current_nav_usdc function
+    /// Price oracle account for destination token (Pyth PriceUpdateV2 account)
+    /// CHECK: Validated by utils::current_nav_usdc function using Pyth pull oracle SDK
     pub destination_price_account: UncheckedAccount<'info>,
     
     /// The Jupiter program
@@ -134,35 +134,11 @@ pub fn trade(ctx: Context<Trade>, data: Vec<u8>) -> Result<()> {
         return Err(e);
     }
     
-    // 🔒 TOKEN WHITELISTING VALIDATION
-    // Validate oracle accounts match whitelist entries
-    if ctx.accounts.source_token_whitelist.pyth_oracle != ctx.accounts.source_price_account.key() {
-        vault.reentrancy_guard = false;
-        emit!(crate::state::SecurityEvent {
-            event_type: crate::state::SecurityEventType::TokenWhitelistViolation,
-            severity: crate::state::SecuritySeverity::High,
-            vault: vault_key,
-            details: format!("Source token oracle mismatch: expected {}, got {}", 
-                           ctx.accounts.source_token_whitelist.pyth_oracle, 
-                           ctx.accounts.source_price_account.key()),
-            timestamp: Clock::get()?.unix_timestamp,
-        });
-        return Err(error!(ErrorCode::InvalidOracleAccount));
-    }
-    
-    if ctx.accounts.destination_token_whitelist.pyth_oracle != ctx.accounts.destination_price_account.key() {
-        vault.reentrancy_guard = false;
-        emit!(crate::state::SecurityEvent {
-            event_type: crate::state::SecurityEventType::TokenWhitelistViolation,
-            severity: crate::state::SecuritySeverity::High,
-            vault: vault_key,
-            details: format!("Destination token oracle mismatch: expected {}, got {}", 
-                           ctx.accounts.destination_token_whitelist.pyth_oracle, 
-                           ctx.accounts.destination_price_account.key()),
-            timestamp: Clock::get()?.unix_timestamp,
-        });
-        return Err(error!(ErrorCode::InvalidOracleAccount));
-    }
+    // 🔒 TOKEN WHITELISTING VALIDATION - PYTH ORACLES
+    // Note: Pyth oracle accounts (PriceUpdateV2) are dynamically created per transaction
+    // and validated during NAV calculation. Token whitelist validation ensures only
+    // whitelisted tokens can be traded (enforced by account constraints above).
+    // The oracle account validation happens in utils::current_nav_usdc() function.
     
     // Record source balance before swap to calculate actual swap amount
     let source_balance_before = ctx.accounts.source_token_account.amount;

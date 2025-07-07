@@ -139,7 +139,8 @@ class DataProcessor:
     async def fetch_sentiment_data_timescale(
         self, 
         symbol: str = "SOL", 
-        days: int = 30
+        days: int = 30,
+        db_manager: Optional['ProductionDBManager'] = None
     ) -> pd.DataFrame:
         """
         Fetch social sentiment data from TimescaleDB market_events table
@@ -153,12 +154,15 @@ class DataProcessor:
         """
         logger.info(f"Fetching social data from TimescaleDB for {symbol} ({days} days)")
         
-        db_manager = ProductionDBManager()
+        # Use provided db_manager or create a new one
+        local_db_manager = db_manager or ProductionDBManager()
+        should_close = db_manager is None
         try:
-            await db_manager.initialize()
+            if should_close:
+                await local_db_manager.initialize()
             
             # Get social data from TimescaleDB
-            social_data = await db_manager.get_social_data_by_symbol(symbol, days)
+            social_data = await local_db_manager.get_social_data_by_symbol(symbol, days)
             
             if social_data and len(social_data) > 0:
                 logger.info(f"Found {len(social_data)} social records in TimescaleDB for {symbol}")
@@ -182,7 +186,8 @@ class DataProcessor:
             logger.error(f"Error fetching social data from TimescaleDB: {e}")
             logger.info("Falling back to API call")
         finally:
-            await db_manager.close()
+            if should_close:
+                await local_db_manager.close()
         
         # If we reach here, either there was an error or no data in database
         # Fall back to API call
@@ -3575,7 +3580,8 @@ class DataProcessor:
         token_id: int, 
         start_time: datetime, 
         end_time: datetime, 
-        symbol: str = None
+        symbol: str = None,
+        db_manager: Optional['ProductionDBManager'] = None  # Add optional db_manager parameter
     ) -> Optional[pd.DataFrame]:
         """
         CLEAN INTERFACE: Prepare inference-ready data using proven training pipeline
@@ -3588,6 +3594,7 @@ class DataProcessor:
             start_time: Start time for data fetch  
             end_time: End time for data fetch
             symbol: Token symbol for social data (optional)
+            db_manager: Optional database manager to use (for thread safety)
             
         Returns:
             Clean DataFrame with all features engineered, ready for prepare_ml_data()
@@ -3596,9 +3603,10 @@ class DataProcessor:
         
         try:
             # 1. Fetch OHLCV data from database
-            from ..database.production_db import get_db_manager
-            
-            db_manager = await get_db_manager()
+            # Use provided db_manager or get the singleton instance
+            if db_manager is None:
+                from ..database.production_db import get_db_manager
+                db_manager = await get_db_manager()
             
             # Get OHLCV data using the same method as training pipeline
             ohlcv_data = await db_manager.get_ohlcv_data(
@@ -3682,7 +3690,7 @@ class DataProcessor:
                 try:
                     # Calculate days needed based on timespan
                     days_needed = (end_time - start_time).days + 1
-                    social_df = await self.fetch_sentiment_data_timescale(symbol, days_needed)
+                    social_df = await self.fetch_sentiment_data_timescale(symbol, days_needed, db_manager)
                     
                     if not social_df.empty:
                         # Merge social data with price data

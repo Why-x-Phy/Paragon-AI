@@ -178,8 +178,23 @@ class SimpleStrategyEngine:
         """Ensure database manager is initialized"""
         if self.db_manager is None:
             try:
-                self.db_manager = await get_db_manager()
-                logger.info("Database manager initialized")
+                # Check if we're in a different event loop than the main one
+                # This happens when called from scheduler threads
+                import asyncio
+                try:
+                    # Try to get the current running loop
+                    current_loop = asyncio.get_running_loop()
+                    
+                    # If we're in a thread with its own event loop, create a new DB manager
+                    # to avoid event loop conflicts
+                    from ..database.production_db import ProductionDBManager
+                    self.db_manager = ProductionDBManager()
+                    await self.db_manager.initialize()
+                    logger.info("Database manager initialized (thread-local)")
+                except RuntimeError:
+                    # No running loop, use the default get_db_manager
+                    self.db_manager = await get_db_manager()
+                    logger.info("Database manager initialized (main)")
             except Exception as e:
                 logger.error(f"Failed to initialize database manager: {e}")
                 raise
@@ -189,6 +204,7 @@ class SimpleStrategyEngine:
         if self.inference_processor is None:
             try:
                 await self._ensure_db_manager()
+                # Pass the thread-local db_manager to the inference processor
                 self.inference_processor = await create_inference_data_processor(self.db_manager, backtest_mode=self.backtest_mode)
                 logger.info(f"Inference data processor initialized (backtest_mode={self.backtest_mode})")
             except Exception as e:
@@ -344,6 +360,12 @@ class SimpleStrategyEngine:
                 logger.warning(f"Token {symbol} not found in database")
                 return None
             
+            # Handle both dictionary and object returns from get_token_by_symbol
+            if hasattr(token_info, 'token_id'):
+                token_id = token_info.token_id
+            else:
+                token_id = token_info['token_id']
+            
             # Get price from database (latest or at simulation time)
             if simulation_time:
                 # For backtesting: get the most recent price before or at simulation time
@@ -360,7 +382,7 @@ class SimpleStrategyEngine:
                 logger.debug(f"Looking for {symbol} price data from {start_time} to {simulation_time_utc}")
                 
                 ohlcv_data = await self.db_manager.get_ohlcv_data(
-                    token_id=token_info['token_id'],
+                    token_id=token_id,
                     resolution='1H',
                     start_time=start_time,
                     end_time=simulation_time_utc + timedelta(hours=1)  # Include simulation time
@@ -382,7 +404,8 @@ class SimpleStrategyEngine:
                     logger.warning(f"No OHLCV data found for {symbol} in range {start_time} to {simulation_time_utc}")
             else:
                 # For live trading: get latest price
-                price = await self.db_manager.get_latest_price(token_info['token_id'])
+                price = await self.db_manager.get_latest_price(token_id)
+                
             if price:
                 return float(price)
             
@@ -416,7 +439,11 @@ class SimpleStrategyEngine:
                 logger.error(f"Token {symbol} not found in database")
                 return None
             
-            token_address = token_info['address']
+            # Handle both dictionary and object returns from get_token_by_symbol
+            if hasattr(token_info, 'address'):
+                token_address = token_info.address
+            else:
+                token_address = token_info['address']
             logger.debug(f"Found token {symbol} with address {token_address}")
             
             # Get clean DataFrame from InferenceDataProcessor (with caching benefits)

@@ -170,7 +170,8 @@ class InferenceDataProcessor:
                 token_id=token['token_id'],
                 start_time=simulation_time - timedelta(hours=self.config.lookback_hours) if simulation_time else datetime.utcnow() - timedelta(hours=self.config.lookback_hours),
                 end_time=simulation_time if simulation_time else datetime.utcnow(),
-                symbol=token.get('symbol')
+                symbol=token.get('symbol'),
+                db_manager=self.db_manager  # Pass the db_manager for thread safety
             )
             
             if features_df is None:

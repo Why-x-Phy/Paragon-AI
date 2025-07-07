@@ -201,8 +201,28 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
     
     // 🔒 VALIDATE SHARE PRICE BOUNDS
     if vault.total_shares > 0 && vault_nav > 0 {
-        let share_price = vault_nav.checked_div(vault.total_shares).unwrap_or(0);
-        if share_price < MIN_SHARE_PRICE || share_price > MAX_SHARE_PRICE {
+        // Use precision-preserving arithmetic to avoid rounding down to 0
+        // Calculate share price as: (vault_nav * 1,000,000) / total_shares
+        // This matches the scaling used in shares calculation logic
+        let vault_nav_u128 = vault_nav as u128;
+        let total_shares_u128 = vault.total_shares as u128;
+        let scale_factor = 1_000_000u128; // Scale to preserve precision
+        
+        let share_price_scaled = vault_nav_u128
+            .checked_mul(scale_factor)
+            .ok_or(error!(ErrorCode::ArithmeticError))?
+            .checked_div(total_shares_u128)
+            .ok_or(error!(ErrorCode::ArithmeticError))?;
+        
+        // Convert back to u64 for bounds checking
+        let share_price = u64::try_from(share_price_scaled)
+            .map_err(|_| error!(ErrorCode::ArithmeticError))?;
+        
+        // Apply the same scaling to bounds for consistent comparison
+        let min_share_price_scaled = (MIN_SHARE_PRICE as u128) * scale_factor;
+        let max_share_price_scaled = (MAX_SHARE_PRICE as u128) * scale_factor;
+        
+        if share_price_scaled < min_share_price_scaled || share_price_scaled > max_share_price_scaled {
             vault.reentrancy_guard = false;
             emit!(crate::state::SecurityEvent {
                 event_type: crate::state::SecurityEventType::ArithmeticSafetyViolation,
@@ -339,10 +359,22 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
     }
     
     // 🎯 UPDATE HWM IF DEPOSIT PUSHES NAV ABOVE HWM
+    // Recalculate FULL NAV after deposit including all token positions
+    let nav_after_deposit = match utils::current_nav_usdc(
+        vault,
+        &ctx.accounts.vault_usdc_token,
+        nav_parsing_accounts,
+    ) {
+        Ok(nav) => nav,
+        Err(e) => {
+            vault.reentrancy_guard = false;
+            return Err(e);
+        }
+    };
+    
     // Deposits shouldn't trigger performance fees, so adjust HWM upward
-    let new_nav_after_deposit = vault_nav.saturating_add(amount_after_fee);
-    if new_nav_after_deposit > vault.high_water_mark_nav {
-        vault.high_water_mark_nav = new_nav_after_deposit;
+    if nav_after_deposit > vault.high_water_mark_nav {
+        vault.high_water_mark_nav = nav_after_deposit;
     }
     
     // Update vault state
@@ -367,7 +399,11 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         shares: shares_to_mint,
         fee: deposit_fee,
         user_tier: 2, // Default tier 2 - actual tier validation happens in verify_tier_and_check_cap
-        share_price: if vault.total_shares > 0 { vault_nav / vault.total_shares } else { 1_000_000 }, // 1 USDC default
+        share_price: if vault.total_shares > 0 { 
+            // Use precision-preserving calculation for event logging
+            let share_price_calc = (vault_nav as u128 * 1_000_000u128) / vault.total_shares as u128;
+            u64::try_from(share_price_calc).unwrap_or(1_000_000)
+        } else { 1_000_000 }, // 1 USDC default
         timestamp: Clock::get()?.unix_timestamp,
     });
     

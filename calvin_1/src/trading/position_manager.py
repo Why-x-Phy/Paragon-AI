@@ -162,6 +162,9 @@ class PositionManager:
             # Initialize database manager if not provided
             if self.db_manager is None:
                 self.db_manager = await get_db_manager()
+                self.logger.info("Database manager initialized (singleton)")
+            else:
+                self.logger.info("Using provided database manager for thread safety")
             
             # Load existing open positions
             await self._load_open_positions()
@@ -559,9 +562,28 @@ class PositionManager:
         try:
             # Import vault client here to avoid circular imports
             from ..vault.vault_client import VaultClient
+            from solana.rpc.async_api import AsyncClient
+            from solders.keypair import Keypair
+            import os
+            import json
             
-            # Create vault client instance
-            vault_client = VaultClient()
+            # Create vault client instance with proper parameters
+            rpc_url = os.getenv('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
+            vault_program_id = os.getenv('VAULT_PROGRAM_ID', 'tXMJu1KaBQU5DSk94QXMtigQpzxbK62WJVUs2Xmxz7z')
+            
+            # Load authority keypair
+            authority_key_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'onchain', 'calvin-ai-authority.json')
+            with open(authority_key_path, 'r') as f:
+                authority_key_data = json.load(f)
+            authority_keypair = Keypair.from_bytes(authority_key_data)
+            
+            # Create connection and vault client
+            connection = AsyncClient(rpc_url)
+            vault_client = VaultClient(
+                vault_program=vault_program_id,
+                connection=connection,
+                authority_keypair=authority_keypair
+            )
             
             # Get vault state asynchronously
             # Note: This is a sync method calling async, so we need to handle it carefully
@@ -649,9 +671,28 @@ class PositionManager:
         try:
             # Import vault client here to avoid circular imports
             from ..vault.vault_client import VaultClient
+            from solana.rpc.async_api import AsyncClient
+            from solders.keypair import Keypair
+            import os
+            import json
             
-            # Create and initialize vault client
-            vault_client = VaultClient()
+            # Create and initialize vault client with proper parameters
+            rpc_url = os.getenv('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
+            vault_program_id = os.getenv('VAULT_PROGRAM_ID', 'tXMJu1KaBQU5DSk94QXMtigQpzxbK62WJVUs2Xmxz7z')
+            
+            # Load authority keypair
+            authority_key_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'onchain', 'calvin-ai-authority.json')
+            with open(authority_key_path, 'r') as f:
+                authority_key_data = json.load(f)
+            authority_keypair = Keypair.from_bytes(authority_key_data)
+            
+            # Create connection and vault client
+            connection = AsyncClient(rpc_url)
+            vault_client = VaultClient(
+                vault_program=vault_program_id,
+                connection=connection,
+                authority_keypair=authority_keypair
+            )
             await vault_client.initialize()
             
             # Get vault state

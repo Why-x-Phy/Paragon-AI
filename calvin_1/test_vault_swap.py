@@ -106,11 +106,14 @@ async def execute_vault_swap(vault_client, jupiter_client, input_mint, output_mi
     
     try:
         # Step 1: Get Jupiter quote
+        # Get Jupiter quote - provide vault authority PDA as payer (expected by Jupiter for CPI)
+        vault_authority_pda = vault_client._get_vault_authority_pda()
         quote_response = await jupiter_client.get_quote(
             input_mint=input_mint,
             output_mint=output_mint,
             amount=amount,
-            slippage_bps=TEST_CONFIG['slippage_bps']
+            slippage_bps=TEST_CONFIG['slippage_bps'],
+            payer_pubkey=str(vault_authority_pda)  # Vault authority PDA (Jupiter expects this for CPI)
         )
         
         if not quote_response or 'error' in quote_response:
@@ -209,8 +212,7 @@ async def test_vault_swap():
     print()
     
     print(f"📊 Test Parameters:")
-    print(f"  - Amount: {TEST_CONFIG['amount_usdc']} {TEST_CONFIG['input_token']}")
-    print(f"  - Target token: {TEST_CONFIG['intermediate_token']}")
+    print(f"  - Converting ALL {TEST_CONFIG['intermediate_token']} back to {TEST_CONFIG['input_token']}")
     print(f"  - Slippage: {TEST_CONFIG['slippage_bps']/100}%")
     print(f"  - Network: {TEST_CONFIG['network']}")
     print()
@@ -325,31 +327,41 @@ async def test_vault_swap():
         print(f"  - Total NAV: ${total_nav:,.2f}")
         print(f"  - Available USDC: ${available_usdc:,.2f}")
         
-        if available_usdc < TEST_CONFIG['amount_usdc']:
-            logger.error(f"❌ Insufficient USDC in vault: ${available_usdc:.2f} < ${TEST_CONFIG['amount_usdc']}")
-            return False
-            
-        logger.info(f"✅ Vault has sufficient USDC for swap test")
+        logger.info(f"✅ Vault state retrieved successfully")
         
-        # Step 3: Execute reverse swap - FARTCOIN → USDC (testing fixed performance fees)
-        print(f"\n🔄 Step 3: Executing Reverse Swap - FARTCOIN → USDC (Testing Performance Fee Fix)")
+        # Step 3: Execute reverse swap - FARTCOIN → USDC (testing the complete system)
+        print(f"\n🔄 Step 3: Executing Reverse Swap - FARTCOIN → USDC (Testing Complete System)")
         print("=" * 40)
         
-        # Get the vault's current FARTCOIN balance
+        # Get all FARTCOIN balance to swap back to USDC
+        print(f"  - Swapping: ALL FARTCOIN → USDC")
+        
+        # Get FARTCOIN token account balance
+        from solders.pubkey import Pubkey
         vault_authority_pda = vault_client._get_vault_authority_pda()
-        fartcoin_mint = TEST_CONFIG['tokens'][TEST_CONFIG['intermediate_token']]
-        fartcoin_balance = await vault_client._get_vault_token_balance(vault_authority_pda, Pubkey.from_string(fartcoin_mint))
+        fartcoin_mint = Pubkey.from_string(TEST_CONFIG['tokens'][TEST_CONFIG['intermediate_token']])
         
-        if fartcoin_balance == 0:
-            logger.error("❌ No FARTCOIN balance found in vault to swap")
+        # Get the vault's FARTCOIN token account using proper ATA derivation
+        from spl.token.constants import TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
+        
+        # Calculate associated token address manually using proper ATA derivation
+        # Note: TOKEN_PROGRAM_ID and ASSOCIATED_TOKEN_PROGRAM_ID are already Pubkey objects from spl.token.constants
+        fartcoin_account_address, _ = Pubkey.find_program_address(
+            [bytes(vault_authority_pda), bytes(TOKEN_PROGRAM_ID), bytes(fartcoin_mint)],
+            ASSOCIATED_TOKEN_PROGRAM_ID
+        )
+        
+        # Get current FARTCOIN balance
+        fartcoin_balance_response = await vault_client.client.get_token_account_balance(fartcoin_account_address)
+        fartcoin_amount_lamports = int(fartcoin_balance_response.value.amount)
+        
+        print(f"  - FARTCOIN balance: {fartcoin_amount_lamports:,} lamports")
+        
+        if fartcoin_amount_lamports == 0:
+            print("❌ No FARTCOIN to swap back to USDC")
             return False
-            
-        print(f"  - Current FARTCOIN balance: {fartcoin_balance:.6f}")
         
-        # Convert FARTCOIN balance to lamports (FARTCOIN has 6 decimals)
-        fartcoin_amount_lamports = int(fartcoin_balance * 1_000_000)
-        
-        # Swap FARTCOIN → USDC
+        # Swap FARTCOIN → USDC  
         input_mint = TEST_CONFIG['tokens'][TEST_CONFIG['intermediate_token']]  # FARTCOIN
         output_mint = TEST_CONFIG['tokens'][TEST_CONFIG['input_token']]        # USDC
         
@@ -369,7 +381,7 @@ async def test_vault_swap():
             logger.warning(f"⚠️ High price impact: {swap_results['price_impact']:.4f}%")
         
         print(f"  ✅ Reverse swap executed successfully!")
-        print(f"    - Swapped: {fartcoin_balance:.6f} FARTCOIN")
+        print(f"    - Swapped: {swap_results['input_formatted']:.6f} FARTCOIN")
         print(f"    - Received: ${swap_results['output_formatted']:.6f} USDC")
         print(f"    - Price impact: {swap_results['price_impact']:.4f}%")
         print(f"    - Transaction: {swap_results['transaction_signature']}")
@@ -383,7 +395,7 @@ async def test_vault_swap():
         swap_stats['duration_seconds'] = (swap_stats['end_time'] - swap_stats['start_time']).total_seconds()
         
         print(f"📊 Reverse Swap Results:")
-        print(f"  - Input: {fartcoin_balance:.6f} FARTCOIN")
+        print(f"  - Input: {swap_results['input_formatted']:.6f} FARTCOIN")
         print(f"  - Output: ${swap_results['output_formatted']:.6f} USDC")
         print(f"  - Price impact: {swap_stats['total_price_impact']:.4f}%")
         print(f"  - Execution time: {swap_stats['duration_seconds']:.1f} seconds")
@@ -400,9 +412,9 @@ async def test_vault_swap():
                     status='healthy',
                     details={
                         'test_type': 'jupiter_vault_integration',
-                        'input_usdc': swap_stats['initial_usdc'],
-                        'output_amount': swap_results['output_formatted'],
-                        'output_token': TEST_CONFIG['intermediate_token'],
+                        'input_amount': swap_results['input_formatted'],
+                        'input_token': TEST_CONFIG['intermediate_token'],
+                        'output_usdc': swap_results['output_formatted'],
                         'price_impact': swap_stats['total_price_impact'],
                         'duration_seconds': swap_stats['duration_seconds'],
                         'transaction_signature': swap_results['transaction_signature'],
@@ -446,7 +458,7 @@ async def test_vault_swap():
         if validation_passed:
             print(f"\n🎉 SUCCESS: Vault swap functionality is working correctly!")
             print(f"   📊 Performance Summary:")
-            print(f"   - Swap executed: ${swap_stats['initial_usdc']:.2f} USDC → {swap_results['output_formatted']:.6f} FARTCOIN")
+            print(f"   - Swap executed: {swap_results['input_formatted']:.6f} FARTCOIN → ${swap_results['output_formatted']:.2f} USDC")
             print(f"   - Price impact: {swap_stats['total_price_impact']:.4f}%")
             print(f"   - Execution time: {swap_stats['duration_seconds']:.1f}s")
             print(f"   - Transaction: {swap_results['transaction_signature']}")
@@ -497,8 +509,8 @@ async def main():
     
     print("🔥 WARNING: Real transaction mode!")
     print("   This will execute actual swaps with real vault funds!")
-    print(f"   Trading ${args.amount} USDC for FARTCOIN")
-    print(f"   Expected cost: ~${args.amount * 0.01:.2f} to ${args.amount * 0.03:.2f} in slippage and fees")
+    print(f"   Trading ALL FARTCOIN back to USDC")
+    print(f"   Expected cost: Variable slippage and fees based on FARTCOIN balance")
     response = input("   Continue with real execution? (yes/no): ")
     if response.lower() != 'yes':
         print("   Cancelled.")

@@ -2,7 +2,9 @@
   "license": "ISC",
   "scripts": {
     "lint:fix": "prettier */*.js \"*/**/*{.js,.ts}\" -w",
-    "lint": "prettier */*.js \"*/**/*{.js,.ts}\" --check"
+    "lint": "prettier */*.js \"*/**/*{.js,.ts}\" --check",
+    "test:switchboard": "npx ts-node scripts/test-switchboard-feeds.ts",
+    "test:switchboard-integration": "npx ts-node scripts/test-switchboard-integration.ts"
   },
   "dependencies": {
     "@auth/nextjs": "^0.0.0-380f8d56",
@@ -10,6 +12,8 @@
     "@pythnetwork/hermes-client": "^2.0.0",
     "@pythnetwork/pyth-solana-receiver": "^0.10.1",
     "@solana/spl-token": "^0.4.13",
+    "@switchboard-xyz/common": "^3.4.1",
+    "@switchboard-xyz/on-demand": "^2.11.0",
     "next-auth": "^5.0.0-beta.28"
   },
   "devDependencies": {

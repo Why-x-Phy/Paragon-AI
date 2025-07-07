@@ -15,24 +15,38 @@ import "@solana/wallet-adapter-react-ui/styles.css";
 
 export const SolanaProvider = ({ children }) => {
   // The network can be set to 'devnet', 'testnet', or 'mainnet-beta'
-  const network = WalletAdapterNetwork.Devnet;
+  const network = WalletAdapterNetwork.Mainnet;
 
   // You can also provide a custom RPC endpoint
   const endpoint = useMemo(() => "https://mainnet.helius-rpc.com/?api-key=acfda155-4d7f-4930-8ac4-ddd9eebfb70d", []);
 
+  // Configure connection config to support versioned transactions
+  const connectionConfig = useMemo(() => ({
+    commitment: 'confirmed',
+    wsEndpoint: undefined,
+    // Enable support for versioned transactions (version 0)
+    // This is crucial for Pyth price feed transactions
+    maxSupportedTransactionVersion: 0,
+  }), []);
+
   const wallets = useMemo(
     () => [
-      new PhantomWalletAdapter(),
-      new SolflareWalletAdapter(),
+      new PhantomWalletAdapter({ network }),
+      new SolflareWalletAdapter({ network }),
       new LedgerWalletAdapter(),
-      new WalletConnectWalletAdapter(),
+      new WalletConnectWalletAdapter({ 
+        network,
+        options: {
+          projectId: 'calvin-vault',
+        }
+      }),
       new CoinbaseWalletAdapter(),
     ],
-    []
+    [network]
   );
 
   return (
-    <ConnectionProvider endpoint={endpoint}>
+    <ConnectionProvider endpoint={endpoint} config={connectionConfig}>
       <WalletProvider wallets={wallets} autoConnect>
         <WalletModalProvider>{children}</WalletModalProvider>
       </WalletProvider>

@@ -71,11 +71,11 @@ class CalvinVaultSystem:
             await db_manager.health_check()
             logger.info("✅ Database connection established")
             
-            # Initialize WebSocket Feed Manager for all tracked tokens
+            # Initialize WebSocket Feed Manager (but don't start connections yet)
             from src.data.websocket_feed import WebSocketFeedManager
             self.websocket_manager = WebSocketFeedManager()
-            await self.websocket_manager.initialize()
-            logger.info("✅ WebSocket Feed Manager initialized")
+            # Note: WebSocket connections will be started in background during start()
+            logger.info("✅ WebSocket Feed Manager created (connections will start in background)")
             
             # Initialize inference scheduler with vault trading
             self.scheduler = HourlyInferenceScheduler()
@@ -152,11 +152,11 @@ class CalvinVaultSystem:
             
             self.running = True
             
-            # Start WebSocket feeds for all tracked tokens FIRST
-            await self.websocket_manager.start()
-            logger.info("✅ WebSocket feeds started for all tracked tokens")
+            # Start WebSocket feeds for all tracked tokens (non-blocking)
+            asyncio.create_task(self._start_websocket_feeds())
+            logger.info("🔄 WebSocket feeds starting in background...")
             
-            # Start inference and trading scheduler
+            # Start inference and trading scheduler (should not be blocked by WebSocket)
             await self.scheduler.start_async()
             logger.info("✅ Enhanced inference scheduler started with vault trading")
             
@@ -177,6 +177,18 @@ class CalvinVaultSystem:
             await self.shutdown()
             raise
 
+    async def _start_websocket_feeds(self):
+        """Start WebSocket feeds in background (non-blocking)"""
+        try:
+            # Initialize and start WebSocket connections
+            await self.websocket_manager.initialize()
+            logger.info("✅ WebSocket Feed Manager initialized")
+            
+            await self.websocket_manager.start()
+            logger.info("✅ WebSocket feeds started for all tracked tokens")
+        except Exception as e:
+            logger.error(f"❌ WebSocket feeds startup failed: {e}")
+    
     async def _start_emergency_monitoring(self):
         """Start emergency monitoring in background"""
         try:
@@ -206,13 +218,12 @@ class CalvinVaultSystem:
             # Check WebSocket feed health
             if self.websocket_manager:
                 ws_stats = self.websocket_manager.get_stats()
-                logger.info(f"📡 WebSocket Health: {ws_stats['tokens_subscribed']} tokens, {ws_stats['price_updates_received']} updates")
+                logger.info(f"📡 WebSocket Health: {ws_stats['tokens_tracked']} tokens, {ws_stats['price_updates_received']} updates")
                 
                 # Refresh tokens periodically (every 6 hours)
                 if ws_stats['last_token_refresh']:
                     last_refresh = ws_stats['last_token_refresh']
                     if isinstance(last_refresh, str):
-                        from datetime import datetime
                         last_refresh = datetime.fromisoformat(last_refresh.replace('Z', '+00:00'))
                     
                     hours_since_refresh = (datetime.utcnow() - last_refresh).total_seconds() / 3600
@@ -493,7 +504,18 @@ class CalvinVaultSystem:
             
             if cycles_count > 0:
                 last_cycle = recent_cycles[0]['cycle_timestamp']
-                hours_since_last = (datetime.utcnow() - last_cycle).total_seconds() / 3600
+                # Ensure both datetimes are timezone-aware
+                if last_cycle.tzinfo is None:
+                    # Add UTC timezone if missing
+                    import pytz
+                    last_cycle = pytz.UTC.localize(last_cycle)
+                
+                current_utc = datetime.utcnow()
+                if current_utc.tzinfo is None:
+                    import pytz
+                    current_utc = pytz.UTC.localize(current_utc)
+                    
+                hours_since_last = (current_utc - last_cycle).total_seconds() / 3600
                 
                 if hours_since_last < 2:  # Recent activity
                     return {

@@ -10,7 +10,10 @@ export default {
         colors: {
           primary: '#B73E15',
           secondary: '#6B6969',
-        }
+        },
+        fontFamily: {
+          orbitron: ['Orbitron', 'sans-serif'],
+        },
       },
     },
     plugins: [],

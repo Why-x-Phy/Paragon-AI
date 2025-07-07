@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Any, Tuple, Union
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
+import time  # Added for health check throttling
 
 import asyncpg
 import redis.asyncio as redis
@@ -277,9 +278,20 @@ class ProductionDBManager:
         
         self.redis_url = self.config.get('REDIS_URL')
         
-        # Connection pool settings
-        self.max_connections = int(self.config.get('PGBOUNCER_POOL_SIZE', 25))
+        # Connection pool settings - INCREASED POOL SIZE
+        self.max_connections = int(self.config.get('PGBOUNCER_POOL_SIZE', 50))  # Increased from 25
         self.connection_timeout = float(self.config.get('DB_CONNECTION_TIMEOUT', 10.0))
+        
+        # 🚨 HEALTH CHECK THROTTLING TO PREVENT DATABASE SPAM
+        self._health_check_throttle = {}
+        self._health_check_interval = 1800  # Only allow health checks every 30 minutes per component (1800 seconds)
+        
+        # Connection pool monitoring
+        self._pool_stats = {
+            'connection_errors': 0,
+            'health_checks_throttled': 0,
+            'pool_exhaustion_events': 0
+        }
         
         # Cache settings
         self.cache_ttl = {
@@ -292,7 +304,7 @@ class ProductionDBManager:
         # Token cache
         self._token_cache: Dict[str, TokenInfo] = {}
         self._token_id_cache: Dict[int, TokenInfo] = {}
-        
+
     async def initialize(self):
         """Initialize database connections and pools"""
         try:
@@ -330,9 +342,11 @@ class ProductionDBManager:
             # Create asyncpg pool for direct operations (uses basic postgresql:// URL)
             self.pg_pool = await asyncpg.create_pool(
                 self.pg_url,  # Use basic URL without +asyncpg
-                min_size=5,
-                max_size=self.max_connections,
+                min_size=10,  # Increased from 5
+                max_size=self.max_connections,  # Now 50 instead of 25
                 command_timeout=60,
+                max_queries=50000,  # Allow many queries per connection
+                max_inactive_connection_lifetime=300,  # 5 minutes
                 statement_cache_size=0  # Disable prepared statement cache for PgBouncer compatibility
             )
             
@@ -1675,8 +1689,20 @@ class ProductionDBManager:
             return []
 
     async def record_health_check(self, component: str, status: str, details: Dict = None):
-        """Record a health check event with proper async connection handling"""
+        """Record a health check event with throttling to prevent database spam"""
         try:
+            # 🚨 THROTTLE HEALTH CHECKS TO PREVENT DATABASE SPAM
+            current_time = time.time()
+            last_check = self._health_check_throttle.get(component, 0)
+            
+            if current_time - last_check < self._health_check_interval:
+                # Throttled - don't record
+                self._pool_stats['health_checks_throttled'] += 1
+                return
+            
+            # Update throttle timestamp
+            self._health_check_throttle[component] = current_time
+            
             # Use a timeout to prevent hanging connections
             async with asyncio.timeout(5.0):  # 5 second timeout
                 query = """
@@ -1693,17 +1719,31 @@ class ProductionDBManager:
                     except Exception as exec_error:
                         # Don't let execution errors propagate and cause connection issues
                         self.logger.error(f"Failed to execute health check query: {exec_error}")
+                        self._pool_stats['connection_errors'] += 1
                         
         except asyncio.TimeoutError:
             self.logger.warning(f"Health check recording timed out for component: {component}")
+            self._pool_stats['connection_errors'] += 1
         except Exception as e:
             # Catch all exceptions to prevent unhandled async task errors
             self.logger.error(f"Failed to record health check for {component}: {e}")
+            self._pool_stats['connection_errors'] += 1
             # Don't re-raise the exception as this would create "Future exception was never retrieved"
 
     async def health_check(self) -> bool:
         """Enhanced health check with connection pool monitoring"""
         try:
+            # Monitor pool stats
+            if self.pg_pool:
+                pool_size = self.pg_pool.get_size()
+                idle_size = self.pg_pool.get_idle_size()
+                active_connections = pool_size - idle_size
+                
+                # Check for pool exhaustion
+                if idle_size == 0:
+                    self._pool_stats['pool_exhaustion_events'] += 1
+                    self.logger.warning(f"🚨 Connection pool exhausted! {active_connections}/{pool_size} connections active")
+            
             # Quick PostgreSQL check with timeout
             async with asyncio.timeout(3.0):
                 async with self.pg_pool.acquire() as conn:
@@ -1718,10 +1758,29 @@ class ProductionDBManager:
             
         except asyncio.TimeoutError:
             self.logger.error("Health check timed out - connection pool may be exhausted")
+            self._pool_stats['connection_errors'] += 1
             return False
         except Exception as e:
             self.logger.error(f"Health check failed: {e}")
+            self._pool_stats['connection_errors'] += 1
             return False
+
+    def get_pool_stats(self) -> Dict[str, Any]:
+        """Get connection pool statistics"""
+        pool_info = {}
+        if self.pg_pool:
+            pool_info = {
+                'total_connections': self.pg_pool.get_size(),
+                'idle_connections': self.pg_pool.get_idle_size(),
+                'active_connections': self.pg_pool.get_size() - self.pg_pool.get_idle_size(),
+                'max_connections': self.max_connections
+            }
+        
+        return {
+            **self._pool_stats,
+            'pool_info': pool_info,
+            'health_check_throttle_active_components': len(self._health_check_throttle)
+        }
 
     async def get_database_stats(self) -> Dict:
         """Get database statistics"""

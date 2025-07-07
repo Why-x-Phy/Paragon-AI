@@ -1,0 +1,13 @@
+{
+  "name": "pyth-oracle-service",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "node test-pyth-integration.js"
+  },
+  "dependencies": {
+    "@pythnetwork/hermes-client": "latest",
+    "@pythnetwork/pyth-solana-receiver": "latest",
+    "rpc-websockets": "7.11.0"
+  }
+}

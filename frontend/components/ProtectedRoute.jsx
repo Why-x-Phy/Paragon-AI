@@ -3,6 +3,8 @@
 import React from 'react'
 import { useDiscordAuth } from './provider/DiscordAuthProvider'
 import DiscordAuthButton from './DiscordAuthButton'
+import Image from 'next/image'
+import PerformanceBox from './PerformanceBox'
 
 const ProtectedRoute = ({ children, requireVaultAccess = true }) => {
   const { isLoading, isAuthenticated, canAccessVault, userTier } = useDiscordAuth()
@@ -20,24 +22,19 @@ const ProtectedRoute = ({ children, requireVaultAccess = true }) => {
 
   if (!isAuthenticated) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
-        <div className="max-w-md w-full px-6 py-8 bg-white dark:bg-gray-800 rounded-xl shadow-lg text-center">
-          <div className="mb-6">
-            <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100 mb-2">
-              Calvin Vault Access
-            </h1>
-            <p className="text-gray-600 dark:text-gray-400">
-              Connect your Discord account to access the Calvin vault system
-            </p>
-          </div>
-          
-          <div className="mb-6">
-            <DiscordAuthButton />
-          </div>
-          
-          <div className="text-sm text-gray-500 dark:text-gray-400">
-            <p>You must be a member of the Calvin Discord server with the <span className="font-medium text-green-600">$CALVIN Whale</span> role to access the vault.</p>
-          </div>
+      <div className="relative min-h-screen flex items-center bg-[url('/CalvinVault.png')] bg-cover bg-center bg-no-repeat overflow-hidden">
+        <div className="absolute top-8 right-8">
+          <DiscordAuthButton />
+        </div>
+        <div className="p-3 md:p-8">
+          <PerformanceBox />
+        </div>
+        <div className="absolute bottom-8 left-4 sm:left-8 text-white text-xl font-bold flex items-center gap-2">
+          <div className='h-6 w-2 sm:h-8 md:w-3 md:h-10 bg-[#B73E15]' />
+          <p className='md:text-4xl text-lg sm:text-2xl font-orbitron'>Welcome to the Vault</p>
+        </div>
+        <div className="absolute bottom-8 right-4 sm:right-8 text-white text-xl font-bold flex items-center gap-2">
+        <Image src="/logo.png" alt="Logo" className='w-24 sm:w-32 md:w-48' width={100} height={100} />
         </div>
       </div>
     )

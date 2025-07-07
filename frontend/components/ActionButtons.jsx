@@ -118,7 +118,7 @@ export default function ActionButtons() {
                     className="flex-1" 
                     variant="outline" 
                     icon="/stake.svg" 
-                    textSize="sm:text-base" 
+                    textSize="sm:text-base text-white" 
                     onClick={handleStake}
                     loading={txStates.stake === 'pending' || txStates.unstake === 'pending' || isStakingDataLoading}
                     disabled={txStates.stake === 'pending' || txStates.unstake === 'pending' || isStakingDataLoading}

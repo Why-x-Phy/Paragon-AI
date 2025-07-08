@@ -17,8 +17,17 @@ export const SolanaProvider = ({ children }) => {
   // The network can be set to 'devnet', 'testnet', or 'mainnet-beta'
   const network = WalletAdapterNetwork.Mainnet;
 
-  // You can also provide a custom RPC endpoint
-  const endpoint = useMemo(() => "https://mainnet.helius-rpc.com/?api-key=acfda155-4d7f-4930-8ac4-ddd9eebfb70d", []);
+  // Use environment variable for RPC endpoint
+  const endpoint = useMemo(() => {
+    const rpcUrl = process.env.NEXT_PUBLIC_RPC_ENDPOINT;
+    if (rpcUrl) {
+      return rpcUrl;
+    }
+    
+    // Fallback to public endpoint (rate limited)
+    console.warn('⚠️ NEXT_PUBLIC_RPC_ENDPOINT not set, using public endpoint with rate limits');
+    return clusterApiUrl(network);
+  }, [network]);
 
   // Configure connection config to support versioned transactions
   const connectionConfig = useMemo(() => ({

@@ -752,7 +752,7 @@ class LSTMModelRegistry:
             # Try to get adaptive parameters from the adaptive strategy engine
             try:
                 from . import adaptive_strategy
-                adaptive_engine = adaptive_strategy._adaptive_engine_instance
+                adaptive_engine = adaptive_strategy._adaptive_strategy_instance
                 
                 if adaptive_engine and symbol in adaptive_engine.strategy_parameters:
                     # Get adapted parameters with _adaptive flag

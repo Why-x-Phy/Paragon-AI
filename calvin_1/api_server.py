@@ -10,9 +10,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import Dict, Any
+from fastapi import Request
 
 from src.vault.trades_api import simple_trades_api
+from src.vault.performance_api import simple_performance_api
 from src.utils.logger import log
+from src.config.config import config
+import aiohttp
+import json
 
 logger = log
 
@@ -34,12 +39,13 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the trades API on startup"""
+    """Initialize the APIs on startup"""
     try:
         await simple_trades_api.initialize()
-        logger.info("🚀 Calvin AI Trades API server started")
+        await simple_performance_api.initialize()
+        logger.info("🚀 Calvin AI API server started (trades + performance)")
     except Exception as e:
-        logger.error(f"❌ Failed to initialize trades API: {e}")
+        logger.error(f"❌ Failed to initialize APIs: {e}")
 
 @app.get("/")
 async def root():
@@ -77,22 +83,86 @@ async def get_trades(limit: int = 30) -> Dict[str, Any]:
             detail=f"Failed to fetch trades: {str(e)}"
         )
 
+@app.get("/api/performance")
+async def get_performance() -> Dict[str, Any]:
+    """
+    Get live portfolio performance statistics
+    
+    Returns:
+        Dict with performance metrics for different time periods
+    """
+    try:
+        # Get performance data
+        data = await simple_performance_api.get_live_performance()
+        
+        logger.debug(f"✅ Served performance data to frontend")
+        return data
+        
+    except Exception as e:
+        logger.error(f"❌ Performance API error: {e}")
+        
+        # Return error response
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch performance: {str(e)}"
+        )
+
+@app.post("/api/solana/rpc")
+async def solana_rpc_proxy(request: Request):
+    """
+    Proxy Solana RPC requests to Helius to hide API key from frontend
+    """
+    try:
+        # Get the request body (JSON-RPC payload)
+        body = await request.json()
+        
+        # Get Helius RPC URL with API key from environment
+        helius_api_key = config.helius_api_key
+        if not helius_api_key:
+            raise HTTPException(status_code=500, detail="Helius API key not configured")
+        
+        helius_rpc_url = f"https://mainnet.helius-rpc.com/?api-key={helius_api_key}"
+        
+        # Forward the request to Helius
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                helius_rpc_url,
+                json=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                },
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                # Return the response from Helius
+                response_data = await response.json()
+                return response_data
+                
+    except Exception as e:
+        logger.error(f"❌ RPC proxy error: {e}")
+        raise HTTPException(status_code=500, detail=f"RPC proxy failed: {str(e)}")
+
 @app.get("/health")
 async def health_check():
     """Detailed health check"""
     try:
-        # Test database connection
+        # Test database connections
         if not simple_trades_api.db_manager:
             await simple_trades_api.initialize()
+        if not simple_performance_api.db_manager:
+            await simple_performance_api.initialize()
         
-        # Try to fetch one trade to test the full pipeline
-        test_data = await simple_trades_api.get_live_trades(limit=1)
+        # Try to fetch data to test the full pipeline
+        test_trades = await simple_trades_api.get_live_trades(limit=1)
+        test_performance = await simple_performance_api.get_live_performance()
         
         return {
             "status": "healthy",
             "database": "connected",
             "trades_api": "operational",
-            "sample_trades": len(test_data.get('trades', []))
+            "performance_api": "operational",
+            "sample_trades": len(test_trades.get('trades', [])),
+            "performance_timestamp": test_performance.get('timestamp', 'unknown')
         }
     except Exception as e:
         logger.error(f"❌ Health check failed: {e}")

@@ -335,6 +335,9 @@ class SimpleStrategyEngine:
             # 10. Cache the signal
             await self._cache_signal(trading_signal)
             
+            # 11. Store prediction in database (NEW: Fix for missing predictions)
+            await self._store_prediction(trading_signal, metadata)
+            
             return trading_signal
             
         except Exception as e:
@@ -685,6 +688,40 @@ class SimpleStrategyEngine:
             
         except Exception as e:
             logger.warning(f"Failed to cache signal: {e}")
+
+    async def _store_prediction(self, signal: TradingSignal, metadata: ModelMetadata):
+        """Store the model prediction in the database"""
+        if not self.db_manager or self.backtest_mode:
+            return
+            
+        try:
+            # Get token_id from database
+            token_info = await self.db_manager.get_token_by_symbol(signal.symbol)
+            if not token_info:
+                logger.warning(f"Token not found for symbol {signal.symbol}, skipping prediction storage")
+                return
+            
+            # Create prediction data
+            from ..database.production_db import ModelPredictionData
+            prediction_data = ModelPredictionData(
+                prediction_id=None,  # Will be auto-generated
+                token_id=token_info['token_id'],
+                model_name=f"LSTM_{signal.symbol}",
+                model_version=signal.model_version,
+                prediction_time=signal.timestamp,
+                prediction_action=signal.signal_type.value,
+                confidence_score=signal.confidence,
+                predicted_price_change=signal.predicted_change_pct,
+                prediction_horizon_minutes=60,  # Default 1 hour
+                input_features=None  # Could add feature data later if needed
+            )
+            
+            # Save to database
+            prediction_id = await self.db_manager.save_model_prediction(prediction_data)
+            logger.debug(f"Stored prediction {prediction_id} for {signal.symbol}: {signal.signal_type.value} ({signal.confidence:.2f} confidence)")
+            
+        except Exception as e:
+            logger.warning(f"Failed to store prediction for {signal.symbol}: {e}")
 
     async def generate_signals_batch(self, symbols: List[str]) -> Dict[str, Optional[TradingSignal]]:
         """Generate signals for multiple tokens in parallel"""

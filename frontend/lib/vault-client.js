@@ -200,6 +200,52 @@ export class VaultClient {
   // ======================= USER DATA FETCHING =======================
 
   /**
+   * Get total Calvin tokens staked across all users
+   */
+  async getTotalStakedCalvin() {
+    try {
+      if (!this.stakingProgram) {
+        await this.initialize();
+      }
+
+      // Get the stake vault PDA (this holds all staked Calvin tokens)
+      const [stakeVaultPDA] = PublicKey.findProgramAddressSync(
+        [Buffer.from("stake_vault")],
+        this.stakingProgram.programId
+      );
+
+      // Query the stake vault account directly to get total_staked field
+      try {
+        const stakeVaultAccount = await this.stakingProgram.account.stakeVault.fetch(stakeVaultPDA);
+        const totalStaked = stakeVaultAccount.totalStaked;
+        
+        return {
+          totalStaked: totalStaked.toString(),
+          totalStakedFormatted: this.formatTokenAmount(totalStaked, 6), // Calvin has 6 decimals per constants.rs
+          stakeVaultPDA: stakeVaultPDA.toString(),
+          tokenAccount: null // Not using token account directly
+        };
+      } catch (accountError) {
+        console.log('Stake vault account not found, returning zero:', accountError.message);
+        return {
+          totalStaked: '0',
+          totalStakedFormatted: '0',
+          stakeVaultPDA: stakeVaultPDA.toString(),
+          tokenAccount: null
+        };
+      }
+    } catch (error) {
+      console.error('Error fetching total staked Calvin:', error);
+      return {
+        totalStaked: '0',
+        totalStakedFormatted: '0',
+        stakeVaultPDA: null,
+        tokenAccount: null
+      };
+    }
+  }
+
+  /**
    * Get user's staking information
    */
   async getUserStakeInfo() {

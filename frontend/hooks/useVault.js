@@ -20,6 +20,7 @@ export const useVault = () => {
   const [userVaultPosition, setUserVaultPosition] = useState(null);
   const [userTokenBalances, setUserTokenBalances] = useState(null);
   const [vaultStats, setVaultStats] = useState(null);
+  const [totalStakedCalvin, setTotalStakedCalvin] = useState(null);
   
   // Transaction states
   const [txStates, setTxStates] = useState({
@@ -85,15 +86,28 @@ export const useVault = () => {
     }
   }, [vaultClient]);
 
+  // Fetch total staked Calvin tokens
+  const fetchTotalStakedCalvin = useCallback(async () => {
+    if (!vaultClient) return;
+
+    try {
+      const totalStaked = await vaultClient.getTotalStakedCalvin();
+      setTotalStakedCalvin(totalStaked);
+    } catch (err) {
+      console.error('Error fetching total staked Calvin:', err);
+      // Don't set error for total staked as it's less critical
+    }
+  }, [vaultClient]);
+
   // Refresh all data
   const refreshData = useCallback(async () => {
     setRefreshing(true);
     try {
-      await Promise.all([fetchUserData(), fetchVaultStats()]);
+      await Promise.all([fetchUserData(), fetchVaultStats(), fetchTotalStakedCalvin()]);
     } finally {
       setRefreshing(false);
     }
-  }, [fetchUserData, fetchVaultStats]);
+  }, [fetchUserData, fetchVaultStats, fetchTotalStakedCalvin]);
 
   // Stake CALVIN tokens
   const stakeCalvin = useCallback(async (amount) => {
@@ -286,8 +300,9 @@ export const useVault = () => {
     if (wallet.connected && vaultClient) {
       fetchUserData();
       fetchVaultStats();
+      fetchTotalStakedCalvin();
     }
-  }, [wallet.connected, vaultClient, fetchUserData, fetchVaultStats]);
+  }, [wallet.connected, vaultClient, fetchUserData, fetchVaultStats, fetchTotalStakedCalvin]);
 
   // Auto-refresh data periodically
   useEffect(() => {
@@ -309,6 +324,7 @@ export const useVault = () => {
     userVaultPosition,
     userTokenBalances,
     vaultStats,
+    totalStakedCalvin,
     tierInfo,
     
     // Actions

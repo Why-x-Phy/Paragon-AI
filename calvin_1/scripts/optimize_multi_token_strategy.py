@@ -62,7 +62,7 @@ TOKENS_CONFIG = [
     {
         "token_address": "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
         "symbol": "Fartcoin",
-        "model_path": "models/Fartcoin_lstm_20250528.h5",
+        "model_path": "models/Fartcoin_lstm_20250615.h5",
         "days_for_data": 90,
         "n_trials": 3000
     },

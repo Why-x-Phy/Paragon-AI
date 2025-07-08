@@ -234,6 +234,9 @@ class AdaptiveStrategyEngine:
                 if cached_params:
                     # FIXED: Ensure cached params use normalized symbol
                     cached_params['symbol'] = normalized_symbol
+                    # Convert ISO string back to datetime object
+                    if 'last_updated' in cached_params and isinstance(cached_params['last_updated'], str):
+                        cached_params['last_updated'] = datetime.fromisoformat(cached_params['last_updated'])
                     self.strategy_parameters[normalized_symbol] = StrategyParameters(**cached_params)
                 else:
                     # Initialize with defaults using normalized symbol

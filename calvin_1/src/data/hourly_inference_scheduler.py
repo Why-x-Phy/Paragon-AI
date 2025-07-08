@@ -1199,11 +1199,15 @@ class HourlyInferenceScheduler:
                 return 0.0
             
             allocations = portfolio_signals.asset_allocations
-            if len(allocations) <= 1:
+            
+            # Exclude USDC from correlation analysis
+            non_usdc_allocations = {k: v for k, v in allocations.items() if k != 'USDC'}
+            
+            if len(non_usdc_allocations) <= 1:
                 return 100.0  # Single asset = maximum correlation risk
             
-            # Get token symbols for correlation analysis
-            symbols = list(allocations.keys())
+            # Get token symbols for correlation analysis (excluding USDC)
+            symbols = list(non_usdc_allocations.keys())
             
             # Simple correlation risk calculation based on:
             # 1. Number of assets (more assets = lower correlation risk)
@@ -1213,12 +1217,12 @@ class HourlyInferenceScheduler:
             # Base correlation risk for crypto assets (they tend to be highly correlated)
             base_crypto_correlation = 70.0
             
-            # Diversification benefit: reduce risk based on number of assets
-            num_assets = len(allocations)
+            # Diversification benefit: reduce risk based on number of assets (excluding USDC)
+            num_assets = len(non_usdc_allocations)
             diversification_factor = min(0.5, (num_assets - 1) / 10)  # Max 50% reduction for 11+ assets
             
-            # Concentration penalty: increase risk for concentrated positions
-            allocation_values = [alloc.target_exposure_pct for alloc in allocations.values()]
+            # Concentration penalty: increase risk for concentrated positions (excluding USDC)
+            allocation_values = [alloc.target_exposure_pct for alloc in non_usdc_allocations.values()]
             max_allocation = max(allocation_values) if allocation_values else 0
             concentration_penalty = max(0, (max_allocation - 20) / 2)  # Penalty for >20% allocations
             

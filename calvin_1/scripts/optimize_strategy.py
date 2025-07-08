@@ -49,23 +49,30 @@ except Exception as e:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
 
-from data.data_processor import DataProcessor
-from model.ml_model import MLModel
-from model.profit_functions import simple_backtest_strategy # Assuming this is the correct path
-from utils.logger import log_manager, log
+from src.data.data_processor import DataProcessor
+from src.model.ml_model import MLModel
+from src.model.profit_functions import simple_backtest_strategy # Assuming this is the correct path
+from src.utils.logger import log_manager, log
 
 logger = log
 
 # --- Configuration ---
-TOKEN_ADDRESS = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"  # Default to SOL
-SYMBOL = "JUP"
+TOKEN_ADDRESS = "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump"  # Default to SOL
+SYMBOL = "Fartcoin"
 RESOLUTION = "1H" # Using 1H as per recent backtests
 DAYS_FOR_DATA = 90  # Use a reasonable amount of data for optimization
 SEQUENCE_LENGTH = 36 # Should match model training
 PREDICTION_HORIZON = 1 # For 1-step ahead predictions as per strategy
-MODEL_PATH = "models/JUP_lstm_20250603.h5"  # Set to a specific model path or leave as None to use latest
+MODEL_PATH = "models/Fartcoin_lstm_v1.0.0_20250615.h5"  # Set to a specific model path or leave as None to use latest
 N_TRIALS = 500 # Reduced from 3000 since we only have 2 parameters to optimize
-MIN_TRADES_FOR_VALID_STRATEGY = 5 # Reduced minimum trades for faster optimization
+
+# TRADE RANGE OPTIMIZATION: Target a specific range of trades
+MIN_TRADES_FOR_VALID_STRATEGY = 5  # Minimum trades required
+MAX_TRADES_FOR_VALID_STRATEGY = 90  # Maximum trades desired
+OPTIMAL_TRADE_RANGE = (30, 60)  # Ideal range for trade count (min, max)
+
+# Penalty weights for trades outside the optimal range
+TRADE_RANGE_PENALTY_WEIGHT = 0.3  # How much to penalize for being outside optimal range
 
 # SIMPLIFIED: Two-parameter optimization for magnitude-based strategy
 # - buy_threshold: percentage increase needed to trigger buy (0.5% to 8%)
@@ -154,7 +161,7 @@ def load_data_and_predictions():
 
 
 def objective(trial: optuna.Trial) -> float:
-    """Objective function for Optuna to optimize. Returns total_return for single-objective optimization."""
+    """Objective function for Optuna to optimize. Returns total_return adjusted for trade count optimization."""
     try:
         ohlcv_df, prices, predictions = load_data_and_predictions()
     except ValueError as e:
@@ -184,10 +191,14 @@ def objective(trial: optuna.Trial) -> float:
     total_return = results.get('Total Return', -100.0) # Default to very low if not found
     total_trades = results.get('Total Trades', 0)
 
-    # Check minimum trades requirement
+    # Check minimum and maximum trades requirements
     if total_trades < MIN_TRADES_FOR_VALID_STRATEGY:
         logger.info(f"Trial {trial.number} pruned due to insufficient trades ({total_trades}). Return: {total_return if total_return is not None else 'N/A'}")
         return -50.0 # Penalize for insufficient trades
+    
+    if total_trades > MAX_TRADES_FOR_VALID_STRATEGY:
+        logger.info(f"Trial {trial.number} pruned due to excessive trades ({total_trades}). Return: {total_return if total_return is not None else 'N/A'}")
+        return -30.0 # Penalize for too many trades (less severe than too few)
 
     # Handle invalid metrics
     if total_return is None or np.isnan(total_return) or np.isinf(total_return):
@@ -196,8 +207,30 @@ def objective(trial: optuna.Trial) -> float:
     if total_return == -100.0:
         logger.warning(f"Trial {trial.number} resulted in invalid metrics. Return: {total_return}, Trades: {total_trades}. Params: {trial.params}")
 
-    logger.info(f"Trial {trial.number}: Buy={buy_threshold:.3f}, Sell={sell_threshold:.3f}, Total Return={total_return:.2f}%, Trades={total_trades}")
-    return total_return
+    # TRADE RANGE OPTIMIZATION: Apply bonus/penalty based on trade count
+    trade_adjustment = 0.0
+    optimal_min, optimal_max = OPTIMAL_TRADE_RANGE
+    
+    if optimal_min <= total_trades <= optimal_max:
+        # Bonus for being in optimal range
+        trade_adjustment = 2.0  # Small bonus for optimal trade count
+        logger.info(f"Trial {trial.number}: OPTIMAL RANGE - Buy={buy_threshold:.3f}, Sell={sell_threshold:.3f}, Total Return={total_return:.2f}%, Trades={total_trades} ✓")
+    else:
+        # Penalty for being outside optimal range
+        if total_trades < optimal_min:
+            # Too few trades - penalty proportional to how far below optimal
+            distance_penalty = (optimal_min - total_trades) * TRADE_RANGE_PENALTY_WEIGHT
+            trade_adjustment = -distance_penalty
+        else:
+            # Too many trades - penalty proportional to how far above optimal
+            distance_penalty = (total_trades - optimal_max) * TRADE_RANGE_PENALTY_WEIGHT
+            trade_adjustment = -distance_penalty
+        
+        logger.info(f"Trial {trial.number}: Buy={buy_threshold:.3f}, Sell={sell_threshold:.3f}, Total Return={total_return:.2f}%, Trades={total_trades}, Adjustment={trade_adjustment:.2f}")
+
+    # Return adjusted score (total return + trade range adjustment)
+    adjusted_score = total_return + trade_adjustment
+    return adjusted_score
 
 def get_trial_results(trial_params: dict) -> dict:
     """Get backtest results for a specific set of trial parameters."""
@@ -302,10 +335,15 @@ def main():
     final_value = best_results.get('Final Portfolio Value', 'N/A')
     sharpe_ratio = best_results.get('Sharpe Ratio', 'N/A')
     
-    logger.info(f"  Best Trial:")
-    logger.info(f"    Total Return: {best_trial.value:.2f}%")
+    # Calculate trade range performance
+    optimal_min, optimal_max = OPTIMAL_TRADE_RANGE
+    trade_range_status = "OPTIMAL" if optimal_min <= total_trades <= optimal_max else "OUTSIDE RANGE"
+    
+    logger.info(f"  Best Trial (Trade Range Optimized):")
+    logger.info(f"    Adjusted Score: {best_trial.value:.2f}% (includes trade range bonus/penalty)")
+    logger.info(f"    Total Return: {best_results.get('Total Return', 'N/A'):.2f}%")
+    logger.info(f"    Trade Count: {total_trades} ({trade_range_status}) - Target: {optimal_min}-{optimal_max}")
     logger.info(f"    Sharpe Ratio: {sharpe_ratio:.2f}" if sharpe_ratio != 'N/A' else "    Sharpe Ratio: N/A")
-    logger.info(f"    Total Trades: {total_trades}")
     logger.info(f"    Win Rate: {safe_format_percent(win_rate)}")
     logger.info(f"    Max Drawdown: {safe_format_percent(max_drawdown)}")
     logger.info(f"    Final Portfolio Value: {safe_format_currency(final_value)}")
@@ -314,13 +352,20 @@ def main():
     # Save best results to file
     best_results_file = os.path.join(log_dir, f"{study_name}_best_results.txt")
     with open(best_results_file, 'w') as f:
-        f.write("Best Results from Single-Objective Optimization:\n")
+        f.write("Best Results from Trade Range Optimized Strategy:\n")
         f.write("=" * 80 + "\n\n")
         
-        f.write("BEST TOTAL RETURN:\n")
-        f.write(f"  Total Return: {best_trial.value:.2f}%\n")
+        f.write("OPTIMIZATION SETTINGS:\n")
+        f.write(f"  Target Trade Range: {optimal_min}-{optimal_max} trades\n")
+        f.write(f"  Trade Range Penalty Weight: {TRADE_RANGE_PENALTY_WEIGHT}\n")
+        f.write(f"  Min Valid Trades: {MIN_TRADES_FOR_VALID_STRATEGY}\n")
+        f.write(f"  Max Valid Trades: {MAX_TRADES_FOR_VALID_STRATEGY}\n\n")
+        
+        f.write("BEST TRIAL RESULTS:\n")
+        f.write(f"  Adjusted Score: {best_trial.value:.2f}% (includes trade range bonus/penalty)\n")
+        f.write(f"  Total Return: {best_results.get('Total Return', 'N/A'):.2f}%\n")
+        f.write(f"  Trade Count: {total_trades} ({trade_range_status})\n")
         f.write(f"  Sharpe Ratio: {sharpe_ratio:.2f}\n" if sharpe_ratio != 'N/A' else "  Sharpe Ratio: N/A\n")
-        f.write(f"  Total Trades: {total_trades}\n")
         f.write(f"  Win Rate: {safe_format_percent(win_rate)}\n")
         f.write(f"  Max Drawdown: {safe_format_percent(max_drawdown)}\n")
         f.write(f"  Final Portfolio Value: {safe_format_currency(final_value)}\n")

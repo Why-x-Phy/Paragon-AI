@@ -91,8 +91,8 @@ class StrategyConfig:
     cache_predictions_seconds: int = 30
     
     # Strategy settings
-    default_buy_threshold: float = 0.02  # 2%
-    default_sell_threshold: float = 0.03  # 3%
+    default_buy_threshold: float = 0.01  # 1%
+    default_sell_threshold: float = 0.015  # 1.5%
     default_confidence_threshold: float = None  # Will use config.MIN_PREDICTION_CONFIDENCE
     position_size_pct: float = 0.10  # 10% of available cash
     transaction_cost_pct: float = 0.001  # 0.1% fee

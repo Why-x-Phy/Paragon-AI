@@ -896,8 +896,8 @@ async def test_model(args: Dict[str, Any]) -> None:
         include_detailed_trades=True,
         verbosity=1,
         resolution=resolution,
-        buy_threshold=0.02,  # Buy when predicted increase >= 2%
-        sell_threshold=0.03  # Sell when predicted decrease >= 3%
+        buy_threshold=0.01,  # Buy when predicted increase >= 1%
+        sell_threshold=0.015  # Sell when predicted decrease >= 1.5%
     )
     
     # Log backtest results (only the new/correct ones)

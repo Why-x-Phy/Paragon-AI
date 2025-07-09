@@ -708,8 +708,8 @@ def simple_directional_loss(y_true, y_pred):
     return combined_loss
 
 def simple_backtest_strategy(prices, predictions, ohlcv_df=None, include_detailed_trades=False, verbosity=0, resolution="1H",
-                             buy_threshold=0.02,  # Buy when predicted increase >= 2%
-                             sell_threshold=0.03,  # Sell when predicted decrease >= 3%
+                             buy_threshold=0.01,  # Buy when predicted increase >= 1%
+                             sell_threshold=0.015,  # Sell when predicted decrease >= 1.5%
                              **kwargs):  # Accept any additional parameters but ignore them
     """
     SIMPLE magnitude-based backtest strategy:

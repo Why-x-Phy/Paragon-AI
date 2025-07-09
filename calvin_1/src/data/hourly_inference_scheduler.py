@@ -170,6 +170,17 @@ class HourlyInferenceScheduler:
             else:
                 self.logger.info(f"📋 Using pre-configured {len(self.config.active_tokens)} tokens")
             
+            # 🆕 START ADAPTIVE STRATEGY MONITORING
+            if self.config.adaptive_strategy_enabled:
+                try:
+                    from ..inference.adaptive_strategy import get_adaptive_strategy_engine
+                    adaptive_engine = await get_adaptive_strategy_engine()
+                    await adaptive_engine.start_adaptation_monitoring()
+                    self.logger.info("✅ Adaptive strategy monitoring started")
+                except Exception as e:
+                    self.logger.error(f"⚠️ Failed to start adaptive strategy monitoring: {e}")
+                    self.logger.warning("Continuing without adaptive strategy monitoring")
+            
             self.logger.info(f"✅ Inference scheduler initialized for {len(self.config.active_tokens)} tokens")
             
         except Exception as e:
@@ -240,7 +251,7 @@ class HourlyInferenceScheduler:
             self.stop_event.clear()
             
             # 🕐 NEW TIMING SCHEDULE
-            # XX:55 - Adaptive Strategy Updates (5 min before hour)
+            # XX:55 - Adaptive Strategy Updates (5 min before trading)
             # XX:01 - Data Fetch + Inference + Trading (1 min after hour for fresh data)
             
             if self.config.adaptive_strategy_enabled:
@@ -1476,8 +1487,8 @@ class HourlyInferenceScheduler:
         try:
             from ..inference.adaptive_strategy import get_adaptive_strategy_engine
             
-            # Get adaptive strategy engine
-            adaptive_engine = await get_adaptive_strategy_engine()
+            # Get adaptive strategy engine (pass our thread-local db_manager)
+            adaptive_engine = await get_adaptive_strategy_engine(db_manager=self.db_manager)
             
             # Update parameters for all active tokens
             updated_count = 0

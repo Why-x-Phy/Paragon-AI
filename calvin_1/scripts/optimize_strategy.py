@@ -245,8 +245,8 @@ def get_trial_results(trial_params: dict) -> dict:
             include_detailed_trades=False,
             verbosity=0,
             resolution=RESOLUTION,
-            buy_threshold=trial_params.get("buy_threshold", 0.02),
-            sell_threshold=trial_params.get("sell_threshold", 0.03)
+            buy_threshold=trial_params.get("buy_threshold", 0.01),
+            sell_threshold=trial_params.get("sell_threshold", 0.015)
         )
         return results
     except Exception as e:

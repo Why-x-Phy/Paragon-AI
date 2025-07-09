@@ -487,7 +487,10 @@ class PortfolioCoordinator:
             # 7. Cache and track performance
             self._update_performance_tracking(portfolio_signal)
             
-            # 8. Update signal performance from verified trades (simple database query)
+            # 🆕 8. Feed ALL signals to adaptive strategy engine for performance tracking
+            await self._update_adaptive_strategy_with_signals(individual_signals)
+            
+            # 9. Update signal performance from verified trades (simple database query)
             await self._update_signal_performance_from_verified_trades()
             
             processing_time = (datetime.now() - start_time).total_seconds() * 1000
@@ -1082,6 +1085,49 @@ class PortfolioCoordinator:
         except Exception as e:
             logger.error(f"Failed to update signal performance from verified trades: {e}")
 
+    async def _update_adaptive_strategy_with_signals(self, signals: List[TradingSignal]):
+        """Feed generated signals to the adaptive strategy engine for performance tracking."""
+        try:
+            # Get the adaptive strategy engine directly
+            from .adaptive_strategy import get_adaptive_strategy_engine
+            adaptive_engine = await get_adaptive_strategy_engine()
+            
+            # Track all signals (both actionable and non-actionable)
+            signals_tracked = 0
+            for signal in signals:
+                try:
+                    # For now, we don't have actual returns yet, so we'll estimate success
+                    # based on whether the signal would have been actionable
+                    is_actionable = (
+                        signal.signal_type in [SignalType.BUY, SignalType.SELL] and
+                        abs(signal.predicted_change_pct) >= 0.015  # Use magnitude directly, not confidence
+                    )
+                    
+                    # Estimate "success" based on predicted change magnitude
+                    # This is a placeholder until we have actual trade results
+                    magnitude = abs(signal.predicted_change_pct)
+                    estimated_success = is_actionable and magnitude >= 0.02  # 2%+ changes more likely successful
+                    estimated_return = signal.predicted_change_pct if estimated_success else -magnitude * 0.4
+                    
+                    # Update the adaptive strategy with signal performance
+                    await adaptive_engine.update_signal_performance(
+                        symbol=signal.symbol,
+                        signal=signal,
+                        actual_return=estimated_return,
+                        success=estimated_success
+                    )
+                    
+                    signals_tracked += 1
+                    
+                except Exception as signal_error:
+                    logger.warning(f"Failed to track signal for {signal.symbol}: {signal_error}")
+                    continue
+            
+            logger.debug(f"🧠 Adaptive strategy updated with {signals_tracked}/{len(signals)} signals")
+
+        except Exception as e:
+            logger.error(f"Failed to update adaptive strategy engine: {e}")
+
     async def get_portfolio_status(self) -> Dict[str, Any]:
         """Get current portfolio status and performance metrics"""
         try:
@@ -1128,11 +1174,11 @@ class PortfolioCoordinator:
 # Global coordinator instance for reuse across the application
 _coordinator_instance: Optional[PortfolioCoordinator] = None
 
-async def get_portfolio_coordinator() -> PortfolioCoordinator:
+async def get_portfolio_coordinator(config: Optional[PortfolioConfig] = None, db_manager: Optional['ProductionDBManager'] = None) -> PortfolioCoordinator:
     """Get or create the global portfolio coordinator instance"""
     global _coordinator_instance
     if _coordinator_instance is None:
-        _coordinator_instance = PortfolioCoordinator()
+        _coordinator_instance = PortfolioCoordinator(config, db_manager)
         await _coordinator_instance.initialize()
     return _coordinator_instance
 

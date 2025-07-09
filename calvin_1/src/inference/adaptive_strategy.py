@@ -58,16 +58,16 @@ class AdaptationMethod(Enum):
 class StrategyParameters:
     """Adaptive strategy parameters for a token"""
     symbol: str
-    buy_threshold: float = 0.02    # FIXED: 2% as decimal fraction (was 2.0)
-    sell_threshold: float = 0.03   # FIXED: 3% as decimal fraction (was 3.0)
+    buy_threshold: float = 0.01     # 1.0% default - balanced for crypto hourly moves
+    sell_threshold: float = 0.015   # 1.5% default - balanced for crypto hourly moves
     confidence_threshold: float = 0.10  # Minimal threshold - strategy thresholds are primary
     position_size_pct: float = 10.0     # Position size as % of portfolio
     
-    # Adaptation ranges (also convert to decimal fractions)
-    min_buy_threshold: float = 0.005   # FIXED: 0.5% as decimal (was 0.5)
-    max_buy_threshold: float = 0.05    # FIXED: 5% as decimal (was 5.0)
-    min_sell_threshold: float = 0.01   # FIXED: 1% as decimal (was 1.0) 
-    max_sell_threshold: float = 0.08   # FIXED: 8% as decimal (was 8.0)
+    # Adaptation ranges (REVISED for crypto hourly predictions)
+    min_buy_threshold: float = 0.002   # 0.2% minimum - catch small moves
+    max_buy_threshold: float = 0.03    # 3.0% maximum - crypto can move fast
+    min_sell_threshold: float = 0.003   # 0.3% minimum - quick exits
+    max_sell_threshold: float = 0.04    # 4.0% maximum - let winners run in crypto
     min_confidence: float = 0.05  # Very low minimum
     max_confidence: float = 0.20  # Low maximum - strategy thresholds are primary
     
@@ -104,10 +104,10 @@ class AdaptationConfig:
     target_win_rate: float = 0.55           # Target win rate for optimization
     max_win_rate_threshold: float = 0.70    # Above this, decrease thresholds
     
-    # Volatility adaptation
-    low_volatility_threshold: float = 0.02   # 2% daily volatility
-    high_volatility_threshold: float = 0.06  # 6% daily volatility
-    volatility_adaptation_factor: float = 0.5  # How much to adjust for volatility
+    # Volatility adaptation (adjusted for crypto hourly timeframes)
+    low_volatility_threshold: float = 0.015  # 1.5% hourly volatility - low for crypto
+    high_volatility_threshold: float = 0.04  # 4% hourly volatility - high for crypto
+    volatility_adaptation_factor: float = 0.3  # How much to adjust for volatility
     
     # A/B testing
     enable_ab_testing: bool = True
@@ -130,9 +130,10 @@ class AdaptiveStrategyEngine:
     - A/B testing results
     """
     
-    def __init__(self, portfolio_coordinator: Optional[PortfolioCoordinator] = None):
+    def __init__(self, portfolio_coordinator: Optional[PortfolioCoordinator] = None, db_manager: Optional['ProductionDBManager'] = None):
         self.portfolio_coordinator = portfolio_coordinator
-        self.db_manager = None  # Will be set during initialization
+        self.db_manager = db_manager  # Accept existing database manager to prevent pool exhaustion
+        self._external_db_manager = db_manager is not None  # Track if db_manager was provided externally
         self.redis_client = None  # Will be set during initialization
         
         # Load configuration
@@ -176,9 +177,9 @@ class AdaptiveStrategyEngine:
             target_win_rate=float(os.getenv('TARGET_WIN_RATE', 0.55)),
             max_win_rate_threshold=float(os.getenv('MAX_WIN_RATE_THRESHOLD', 0.70)),
             
-            low_volatility_threshold=float(os.getenv('LOW_VOLATILITY_THRESHOLD', 0.02)),
-            high_volatility_threshold=float(os.getenv('HIGH_VOLATILITY_THRESHOLD', 0.06)),
-            volatility_adaptation_factor=float(os.getenv('VOLATILITY_ADAPTATION_FACTOR', 0.5)),
+            low_volatility_threshold=float(os.getenv('LOW_VOLATILITY_THRESHOLD', 0.015)),
+            high_volatility_threshold=float(os.getenv('HIGH_VOLATILITY_THRESHOLD', 0.04)),
+            volatility_adaptation_factor=float(os.getenv('VOLATILITY_ADAPTATION_FACTOR', 0.3)),
             
             enable_ab_testing=os.getenv('ENABLE_AB_TESTING', 'true').lower() == 'true',
             ab_test_allocation=float(os.getenv('AB_TEST_ALLOCATION', 0.1)),
@@ -191,17 +192,20 @@ class AdaptiveStrategyEngine:
     async def initialize(self):
         """Initialize the adaptive strategy engine"""
         try:
-            # Initialize database manager
+            # Use provided database manager or get singleton (prevent creating new pools)
             if self.db_manager is None:
                 self.db_manager = await get_db_manager()
+                logger.info("Using singleton database manager")
+            else:
+                logger.info("Using provided database manager (thread-local)")
             
             # Initialize Redis client
             redis_url = os.getenv('REDIS_URL', 'redis://:AppCherry1926@172.31.31.43:6379/0')
             self.redis_client = redis.from_url(redis_url, decode_responses=True)
             
-            # Initialize portfolio coordinator if not provided
+            # Initialize portfolio coordinator if not provided (pass our db_manager)
             if self.portfolio_coordinator is None:
-                self.portfolio_coordinator = await get_portfolio_coordinator()
+                self.portfolio_coordinator = await get_portfolio_coordinator(db_manager=self.db_manager)
             
             # Load existing strategy parameters
             await self._load_strategy_parameters()
@@ -327,8 +331,8 @@ class AdaptiveStrategyEngine:
                 logger.warning(f"Database error getting token info for {normalized_symbol}: {db_error}")
                 # Fallback: return cached conditions or default
                 return self.market_conditions.get(normalized_symbol, MarketConditions(
-                    volatility_24h=0.02,  # Default 2% volatility
-                    volatility_7d=0.02,
+                    volatility_24h=0.01,  # Default 1% hourly volatility
+                    volatility_7d=0.01,
                     momentum_24h=0.0,     # Neutral momentum
                     momentum_7d=0.0,
                     trend_strength=0.5,   # Moderate trend
@@ -339,8 +343,8 @@ class AdaptiveStrategyEngine:
             if not token_info:
                 logger.warning(f"Token info not found for {normalized_symbol}")
                 return self.market_conditions.get(normalized_symbol, MarketConditions(
-                    volatility_24h=0.02,  # Default 2% volatility
-                    volatility_7d=0.02,
+                    volatility_24h=0.01,  # Default 1% hourly volatility
+                    volatility_7d=0.01,
                     momentum_24h=0.0,     # Neutral momentum
                     momentum_7d=0.0,
                     trend_strength=0.5,   # Moderate trend
@@ -364,8 +368,8 @@ class AdaptiveStrategyEngine:
                 logger.warning(f"Database error getting OHLCV data for {normalized_symbol}: {db_error}")
                 # Return cached conditions if database fails
                 return self.market_conditions.get(normalized_symbol, MarketConditions(
-                    volatility_24h=0.02,
-                    volatility_7d=0.02,
+                    volatility_24h=0.01,  # Default 1% hourly volatility
+                    volatility_7d=0.01,
                     momentum_24h=0.0,
                     momentum_7d=0.0,
                     trend_strength=0.5,
@@ -377,8 +381,8 @@ class AdaptiveStrategyEngine:
                 logger.warning(f"Insufficient price data for {normalized_symbol}: got {len(price_data) if price_data else 0}, need 24+")
                 # Return a default market condition instead of the cached one to prevent test failures
                 return MarketConditions(
-                    volatility_24h=0.02,  # Default 2% volatility
-                    volatility_7d=0.02,
+                    volatility_24h=0.01,  # Default 1% hourly volatility
+                    volatility_7d=0.01,
                     momentum_24h=0.0,     # Neutral momentum
                     momentum_7d=0.0,
                     trend_strength=0.5,   # Moderate trend
@@ -401,13 +405,27 @@ class AdaptiveStrategyEngine:
             # Calculate returns
             df['returns'] = df['close'].pct_change()
             
-            # Calculate volatility (24h and 7d)
-            volatility_24h = df['returns'].tail(24).std() * np.sqrt(24)  # Annualized
-            volatility_7d = df['returns'].std() * np.sqrt(24 * 7)        # Annualized
+            # Calculate volatility (24h and 7d) - HOURLY volatility for hourly trading
+            returns_array = df['returns'].dropna()
+            if len(returns_array) >= 24:
+                # Hourly volatility (not annualized) - more relevant for hourly trading
+                volatility_24h = returns_array.tail(24).std()  # Just hourly std dev
+            else:
+                volatility_24h = returns_array.std() if len(returns_array) > 1 else 0.01
+                
+            # 7-day average hourly volatility
+            volatility_7d = returns_array.std() if len(returns_array) > 1 else 0.01
             
-            # Calculate momentum
-            momentum_24h = (df['close'].iloc[-1] / df['close'].iloc[-24] - 1) * 100
-            momentum_7d = (df['close'].iloc[-1] / df['close'].iloc[0] - 1) * 100
+            # Calculate momentum - ensure we have enough data
+            if len(df) >= 24:
+                momentum_24h = (df['close'].iloc[-1] / df['close'].iloc[-24] - 1) * 100
+            else:
+                momentum_24h = 0.0
+                
+            if len(df) >= 2:
+                momentum_7d = (df['close'].iloc[-1] / df['close'].iloc[0] - 1) * 100
+            else:
+                momentum_7d = 0.0
             
             # Calculate trend strength using moving averages
             if len(df) >= 168:  # 7 days of hourly data
@@ -416,7 +434,8 @@ class AdaptiveStrategyEngine:
                 
                 # Trend strength: how consistently price is above/below MA
                 trend_signals = np.where(df['close'] > df['sma_24'], 1, -1)
-                trend_strength = abs(trend_signals.tail(24).mean())
+                # Fix: use numpy array operations instead of .tail()
+                trend_strength = abs(np.mean(trend_signals[-24:]))
             else:
                 trend_strength = 0.0
             
@@ -444,8 +463,8 @@ class AdaptiveStrategyEngine:
             logger.error(f"Failed to analyze market conditions for {symbol}: {e}")
             # Return cached conditions or safe defaults
             return self.market_conditions.get(symbol.upper(), MarketConditions(
-                volatility_24h=0.02,
-                volatility_7d=0.02,
+                volatility_24h=0.01,  # Default 1% hourly volatility
+                volatility_7d=0.01,
                 momentum_24h=0.0,
                 momentum_7d=0.0,
                 trend_strength=0.5,
@@ -457,7 +476,7 @@ class AdaptiveStrategyEngine:
         """Classify market regime based on volatility, momentum, and trend"""
         
         # Volatility-based classification first
-        if volatility > 0.10:  # > 10% daily volatility
+        if volatility > 0.06:  # > 6% hourly volatility (extreme even for crypto)
             return MarketRegime.EXTREME_VOLATILITY
         elif volatility > self.config.high_volatility_threshold:
             return MarketRegime.HIGH_VOLATILITY
@@ -488,13 +507,12 @@ class AdaptiveStrategyEngine:
             if time_since_adaptation.total_seconds() < self.config.adaptation_frequency_minutes * 60:
                 return False  # Not time for adaptation yet
             
-            # Check if we have enough signals for meaningful adaptation
-            params = self.strategy_parameters[normalized_symbol]
-            if params.total_signals < self.config.min_signals_for_adaptation:
-                return False
-            
-            # Analyze current market conditions
+            # Analyze current market conditions first
             conditions = await self.analyze_market_conditions(normalized_symbol)
+            
+            # Check if we have enough signals for performance-based adaptation
+            params = self.strategy_parameters[normalized_symbol]
+            has_sufficient_signals = params.total_signals >= self.config.min_signals_for_adaptation
             
             # Store original parameters for comparison
             original_params = StrategyParameters(**asdict(params))
@@ -502,17 +520,19 @@ class AdaptiveStrategyEngine:
             # Apply adaptation methods
             adapted = False
             
+            # Always allow volatility, momentum, and regime-based adaptation (market-driven)
             if self.config.adaptation_method in [AdaptationMethod.VOLATILITY_BASED, AdaptationMethod.HYBRID]:
                 adapted |= await self._adapt_for_volatility(normalized_symbol, conditions)
-            
-            if self.config.adaptation_method in [AdaptationMethod.PERFORMANCE_BASED, AdaptationMethod.HYBRID]:
-                adapted |= await self._adapt_for_performance(normalized_symbol)
             
             if self.config.adaptation_method in [AdaptationMethod.MOMENTUM_BASED, AdaptationMethod.HYBRID]:
                 adapted |= await self._adapt_for_momentum(normalized_symbol, conditions)
             
             if self.config.adaptation_method in [AdaptationMethod.REGIME_SWITCHING, AdaptationMethod.HYBRID]:
                 adapted |= await self._adapt_for_regime(normalized_symbol, conditions)
+            
+            # Only apply performance-based adaptation if we have sufficient signals
+            if has_sufficient_signals and self.config.adaptation_method in [AdaptationMethod.PERFORMANCE_BASED, AdaptationMethod.HYBRID]:
+                adapted |= await self._adapt_for_performance(normalized_symbol)
             
             if adapted:
                 # Apply smoothing to prevent oscillation
@@ -719,6 +739,14 @@ class AdaptiveStrategyEngine:
             adapted.confidence_threshold * smoothing
         )
         
+        # CRITICAL: Enforce min/max bounds AFTER smoothing
+        smoothed.buy_threshold = max(smoothed.min_buy_threshold, 
+                                    min(smoothed.max_buy_threshold, smoothed.buy_threshold))
+        smoothed.sell_threshold = max(smoothed.min_sell_threshold, 
+                                     min(smoothed.max_sell_threshold, smoothed.sell_threshold))
+        smoothed.confidence_threshold = max(smoothed.min_confidence, 
+                                          min(smoothed.max_confidence, smoothed.confidence_threshold))
+        
         return smoothed
     
     async def _record_adaptation(self, symbol: str, original: StrategyParameters, 
@@ -785,8 +813,8 @@ class AdaptiveStrategyEngine:
         if normalized_symbol not in self.strategy_parameters:
             # Return default parameters if symbol not found
             return {
-                'buy_threshold': 0.02,  # 2%
-                'sell_threshold': 0.03,  # 3%
+                'buy_threshold': 0.01,   # 1.0% - crypto hourly default
+                'sell_threshold': 0.015,  # 1.5% - crypto hourly default
                 'confidence_threshold': 0.10  # 10%
             }
         
@@ -852,80 +880,172 @@ class AdaptiveStrategyEngine:
         except Exception as e:
             logger.error(f"Failed to update signal performance for {symbol}: {e}")
 
+    async def update_performance_from_database_record(self, symbol: str, trade_data: Dict[str, Any], 
+                                                     actual_return: float, success: bool):
+        """Update performance tracking from database trade record (no mock signals needed)"""
+        try:
+            # FIXED: Normalize symbol to uppercase for consistent lookup
+            normalized_symbol = symbol.upper()
+            
+            if normalized_symbol not in self.strategy_parameters:
+                return
+            
+            params = self.strategy_parameters[normalized_symbol]
+            
+            # Update performance metrics
+            params.total_signals += 1
+            if success:
+                params.profitable_signals += 1
+            
+            params.win_rate = params.profitable_signals / params.total_signals
+            
+            # Update running average return
+            if params.total_signals == 1:
+                params.avg_return = actual_return
+            else:
+                # Exponential moving average
+                alpha = 0.1  # Weight for new observation
+                params.avg_return = (1 - alpha) * params.avg_return + alpha * actual_return
+            
+            params.last_updated = datetime.now()
+            
+            # Add to performance history (using database data directly)
+            performance_record = {
+                'timestamp': trade_data.get('confirmed_at', datetime.now()),
+                'signal_type': trade_data.get('trade_type', 'unknown'),
+                'signal_strength': 'moderate',  # Default for database records
+                'predicted_return': trade_data.get('predicted_change_pct', 0.0),
+                'actual_return': actual_return,
+                'success': success,
+                'confidence': trade_data.get('signal_confidence', 0.0) / 100.0,
+                'source': 'database_verified'
+            }
+            
+            self.performance_history[normalized_symbol].append(performance_record)
+            
+            # Cache updated parameters
+            await self._cache_parameters(normalized_symbol, params)
+            
+            self.stats['total_signals_analyzed'] += 1
+            
+            logger.debug(f"Updated performance from DB for {normalized_symbol}: "
+                       f"signals={params.total_signals}, "
+                       f"win_rate={params.win_rate:.3f}, "
+                       f"avg_return={params.avg_return:.3f}%")
+            
+        except Exception as e:
+            logger.error(f"Failed to update performance from database for {symbol}: {e}")
+    
     async def update_performance_from_verified_trades(self):
-        """Update signal performance from verified trades in database"""
+        """Update signal performance from both generated signals and actual trades"""
         try:
             if not self.db_manager:
                 return
             
-            # Query verified trades from the last 24 hours
+            # Query that combines model_predictions with actual trades for complete picture
             query = """
                 SELECT 
                     tk.symbol,
-                    t.trade_type,
-                    t.signal_confidence,
-                    t.predicted_change_pct,
-                    t.execution_status,
-                    t.price as entry_price,
-                    t.actual_output_amount,
+                    mp.prediction_action as trade_type,
+                    mp.confidence_score as signal_confidence,
+                    mp.predicted_price_change as predicted_change_pct,
+                    mp.prediction_time as confirmed_at,
+                    mp.model_version,
+                    mp.prediction_id,
+                    -- Trade execution data (if available)
+                    CASE 
+                        WHEN t.trade_id IS NOT NULL THEN t.execution_status
+                        ELSE 'no_trade'
+                    END as execution_status,
                     t.value_usdc,
-                    t.confirmed_at
-                FROM trades t
-                JOIN tokens tk ON t.token_id = tk.token_id
-                WHERE t.execution_status IN ('confirmed', 'failed')
-                  AND t.confirmed_at >= NOW() - INTERVAL '24 hours'
-                  AND t.cycle_timestamp IS NOT NULL
-                  AND t.signal_confidence IS NOT NULL
-                ORDER BY t.confirmed_at DESC
-                LIMIT 100
+                    t.actual_output_amount,
+                    t.price as entry_price
+                FROM model_predictions mp
+                JOIN tokens tk ON mp.token_id = tk.token_id
+                LEFT JOIN trades t ON (
+                    t.token_id = mp.token_id 
+                    AND t.cycle_timestamp BETWEEN mp.prediction_time - INTERVAL '10 minutes' 
+                                                AND mp.prediction_time + INTERVAL '10 minutes'
+                    AND ((mp.prediction_action = 'buy' AND t.trade_type = 'buy') 
+                         OR (mp.prediction_action = 'sell' AND t.trade_type = 'sell'))
+                )
+                WHERE mp.prediction_time >= NOW() - INTERVAL '24 hours'
+                  AND mp.confidence_score IS NOT NULL
+                ORDER BY mp.prediction_time DESC
+                LIMIT 200
             """
             
             async with self.db_manager.pg_pool.acquire() as conn:
                 rows = await conn.fetch(query)
             
             if not rows:
+                logger.debug("No model predictions found in last 24 hours")
                 return
             
-            # Process verified trades and update strategy parameters
+            # Process signals (both traded and non-traded) and update strategy parameters
+            signals_processed = 0
             for row in rows:
                 symbol = row['symbol']
-                trade_successful = row['execution_status'] == 'confirmed'
                 predicted_change = row['predicted_change_pct'] or 0.0
+                confidence = row['signal_confidence'] or 0.0
+                execution_status = row['execution_status']
                 
-                # Calculate actual return based on trade execution results
-                if trade_successful and row['actual_output_amount'] and row['value_usdc']:
-                    # For buy trades, calculate return based on tokens received vs USDC spent
-                    if row['trade_type'] == 'buy':
-                        # We spent value_usdc and got actual_output_amount tokens
-                        # Return is based on whether we got more/less tokens than expected
-                        expected_tokens = row['value_usdc'] / row['entry_price'] if row['entry_price'] > 0 else 0
-                        if expected_tokens > 0:
-                            actual_return = ((float(row['actual_output_amount']) - expected_tokens) / expected_tokens) * 100
+                # Determine success and actual return based on execution status
+                if execution_status == 'confirmed':
+                    # Signal resulted in successful trade - calculate actual return
+                    trade_successful = True
+                    if row['actual_output_amount'] and row['value_usdc'] and row['entry_price']:
+                        if row['trade_type'] == 'buy':
+                            expected_tokens = row['value_usdc'] / row['entry_price']
+                            if expected_tokens > 0:
+                                actual_return = ((float(row['actual_output_amount']) - expected_tokens) / expected_tokens) * 100
+                            else:
+                                actual_return = 0.0
                         else:
-                            actual_return = 0.0
+                            actual_return = predicted_change  # Use predicted as proxy for sell trades
                     else:
-                        # For sell trades, return is based on USDC received vs tokens sold
-                        actual_return = predicted_change  # Use predicted as proxy for now
-                else:
-                    # Trade failed or insufficient data
-                    actual_return = -abs(predicted_change) if predicted_change != 0 else -2.0
+                        actual_return = predicted_change * 0.8  # Assume 80% of predicted for successful trades
+                        
+                elif execution_status == 'failed':
+                    # Signal resulted in failed trade
+                    trade_successful = False
+                    actual_return = -abs(predicted_change) * 0.5  # Failed trades lose half predicted amount
+                    
+                else:  # execution_status == 'no_trade'
+                    # Signal generated but no trade executed (below threshold or filtered out)
+                    # Estimate success based on predicted change magnitude - larger changes more likely successful
+                    magnitude = abs(predicted_change)
+                    trade_successful = magnitude >= 0.015  # 1.5%+ changes assumed more likely successful
+                    if trade_successful:
+                        actual_return = predicted_change * 0.4  # Conservative estimate for non-traded signals
+                    else:
+                        actual_return = -magnitude * 0.3  # Small predicted changes penalized less
                 
-                # Create a mock signal for the update (we only need basic info)
-                from ..inference.strategy_engine import TradingSignal, SignalType, SignalStrength
-                mock_signal = TradingSignal(
-                    symbol=symbol,
-                    signal_type=SignalType.BUY if row['trade_type'] == 'buy' else SignalType.SELL,
-                    confidence=row['signal_confidence'] / 100.0,  # Convert from 0-100 to 0-1
-                    predicted_change_pct=predicted_change,
-                    strength=SignalStrength.MODERATE,
-                    timestamp=row['confirmed_at'],
-                    model_version="verified_trade"
-                )
+                # Create trade data dictionary for the new method
+                trade_data = {
+                    'trade_type': row['trade_type'],
+                    'signal_confidence': row['signal_confidence'],
+                    'predicted_change_pct': predicted_change,
+                    'confirmed_at': row['confirmed_at'],
+                    'execution_status': execution_status,
+                    'model_version': row['model_version']
+                }
                 
-                # Update signal performance
-                await self.update_signal_performance(symbol, mock_signal, actual_return, trade_successful)
+                # Update performance using database-specific method (no mock signals)
+                await self.update_performance_from_database_record(symbol, trade_data, actual_return, trade_successful)
+                signals_processed += 1
             
-            logger.info(f"🔄 Updated adaptive strategy performance from {len(rows)} verified trades")
+            logger.info(f"📊 Processed {signals_processed} signals from database for adaptive strategy")
+            
+            # Log breakdown by execution status
+            if signals_processed > 0:
+                status_counts = {}
+                for row in rows:
+                    status = row['execution_status']
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                
+                status_summary = ", ".join([f"{status}: {count}" for status, count in status_counts.items()])
+                logger.info(f"📈 Signal breakdown: {status_summary}")
             
         except Exception as e:
             logger.error(f"Failed to update performance from verified trades: {e}")
@@ -1008,7 +1128,8 @@ class AdaptiveStrategyEngine:
         try:
             await self.stop_adaptation_monitoring()
             
-            if self.db_manager:
+            # Only close db_manager if we created it (not if it was provided)
+            if self.db_manager and not self._external_db_manager:
                 await self.db_manager.close()
             
             if self.redis_client:
@@ -1028,13 +1149,14 @@ _adaptive_strategy_instance: Optional[AdaptiveStrategyEngine] = None
 
 
 async def get_adaptive_strategy_engine(
-    portfolio_coordinator: Optional[PortfolioCoordinator] = None
+    portfolio_coordinator: Optional[PortfolioCoordinator] = None,
+    db_manager: Optional['ProductionDBManager'] = None
 ) -> AdaptiveStrategyEngine:
     """Get singleton adaptive strategy engine instance"""
     global _adaptive_strategy_instance
     
     if _adaptive_strategy_instance is None:
-        _adaptive_strategy_instance = AdaptiveStrategyEngine(portfolio_coordinator)
+        _adaptive_strategy_instance = AdaptiveStrategyEngine(portfolio_coordinator, db_manager)
         await _adaptive_strategy_instance.initialize()
     
     return _adaptive_strategy_instance

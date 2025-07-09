@@ -72,8 +72,8 @@ class ModelMetadata:
     direction_accuracy: Optional[float] = None
     
     # Strategy parameters
-    buy_threshold: float = 0.02  # Default 2%
-    sell_threshold: float = 0.03  # Default 3%
+    buy_threshold: float = 0.01  # Default 1%
+    sell_threshold: float = 0.015  # Default 1.5%
     confidence_threshold: float = 0.10  # Will be overridden by global config in practice
     
     # Model hash for integrity checking
@@ -305,8 +305,8 @@ class LSTMModelRegistry:
                 rmse=kwargs.get('rmse'),
                 direction_accuracy=kwargs.get('direction_accuracy'),
                 model_hash=self._calculate_model_hash(model_path_obj),
-                buy_threshold=kwargs.get('buy_threshold', 0.02),
-                sell_threshold=kwargs.get('sell_threshold', 0.03),
+                buy_threshold=kwargs.get('buy_threshold', 0.01),
+                sell_threshold=kwargs.get('sell_threshold', 0.015),
                 confidence_threshold=kwargs.get('confidence_threshold', 0.10)
             )
             
@@ -730,8 +730,8 @@ class LSTMModelRegistry:
         
         if not metadata:
             return {
-                'buy_threshold': 0.02,
-                'sell_threshold': 0.03,
+                'buy_threshold': 0.01,
+                'sell_threshold': 0.015,
                 'confidence_threshold': config.MIN_PREDICTION_CONFIDENCE  # Always use global config
             }
         
@@ -778,8 +778,8 @@ class LSTMModelRegistry:
             # Emergency fallback to global config
             from ..config.config import config
             return {
-                'buy_threshold': 0.02,
-                'sell_threshold': 0.03,
+                'buy_threshold': 0.01,
+                'sell_threshold': 0.015,
                 'confidence_threshold': config.MIN_PREDICTION_CONFIDENCE,  # Uses 0.10
                 '_adaptive': False
             }

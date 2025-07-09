@@ -28,10 +28,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data.data_processor import DataProcessor
 from src.model.ml_model import MLModel
 from src.model.profit_functions import simple_backtest_strategy
-from src.utils.logger import setup_logger
+from src.utils.logger import log as logger
 
 # Setup logging
-logger = setup_logger("adaptive_backtest")
+# logger = setup_logger("adaptive_backtest")
 
 # Import adaptive strategy components
 from src.inference.adaptive_strategy import (

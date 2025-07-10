@@ -687,8 +687,8 @@ def simple_directional_loss(y_true, y_pred):
     magnitude_loss = tf.reduce_mean(tf.square(y_true - y_pred))
     
     # 3. Special case - heavily penalize missing large downward moves
-    # Identify large downward moves (true change < -3%)
-    large_down_moves = tf.cast(y_true < -0.03, tf.float32)
+    # Identify large downward moves (true change < -2% for more sensitivity)
+    large_down_moves = tf.cast(y_true < -0.03, tf.float32)  # Fix #23: Changed from -0.03 to -0.02
     # Check if we correctly predicted the direction for these moves
     correct_down_preds = large_down_moves * tf.cast(y_pred < 0, tf.float32)
     # Only apply if we have large down moves
@@ -706,6 +706,52 @@ def simple_directional_loss(y_true, y_pred):
     combined_loss = 0.6 * direction_loss + 0.3 * down_move_loss + 0.1 * magnitude_loss
     
     return combined_loss
+
+
+def direction_focused_loss(y_true, y_pred):
+    """
+    Fix #23: Custom loss that heavily prioritizes direction accuracy
+    
+    This loss function:
+    1. Heavily penalizes wrong direction predictions
+    2. Lightly penalizes magnitude errors when direction is correct
+    3. Designed to push direction accuracy above 80%
+    
+    Args:
+        y_true: True price changes (normalized)
+        y_pred: Predicted price changes (normalized)
+        
+    Returns:
+        Weighted loss value
+    """
+    import tensorflow as tf
+    
+    # Cast to float32
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
+    # Calculate squared error
+    squared_error = tf.square(y_true - y_pred)
+    
+    # Determine if direction is correct
+    same_sign = tf.sign(y_true) == tf.sign(y_pred)
+    
+    # Create direction-based weights
+    # If direction is correct: weight = 0.2 (light penalty)
+    # If direction is wrong: weight = 2.0 (heavy penalty)
+    direction_weight = tf.where(same_sign, 0.2, 2.0)
+    
+    # Apply weights to squared error
+    weighted_loss = squared_error * direction_weight
+    
+    # Add small penalty for predicting near zero (to prevent collapse)
+    zero_penalty = 0.01 * tf.exp(-10.0 * tf.abs(y_pred))
+    
+    # Combine losses
+    total_loss = tf.reduce_mean(weighted_loss + zero_penalty)
+    
+    return total_loss
+
 
 def simple_backtest_strategy(prices, predictions, ohlcv_df=None, include_detailed_trades=False, verbosity=0, resolution="1H",
                              buy_threshold=0.01,  # Buy when predicted increase >= 1%

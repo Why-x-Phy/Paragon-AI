@@ -728,7 +728,7 @@ async def train_model(args: Dict[str, Any]) -> None:
         return
     
     # Prepare data for ML
-    sequence_length = args.get('sequence_length', 36)
+    sequence_length = args.get('sequence_length', 24)
     prediction_steps = args.get('prediction_horizon', 1)
     
     logger.info(f"Preparing ML data with sequence_length={sequence_length}, prediction_horizon={prediction_steps} steps")
@@ -858,7 +858,7 @@ async def test_model(args: Dict[str, Any]) -> None:
         return
     
     # Prepare test data using a consistent dataframe
-    sequence_length = args.get('sequence_length', 36)  # Should match the model's expected input
+    sequence_length = args.get('sequence_length', 24)  # Should match the model's expected input
     prediction_steps = args.get('prediction_horizon', 1)  # Use 1 to match optimization script default
     
     logger.info(f"Testing with sequence_length={sequence_length}, prediction_horizon={prediction_steps} steps")
@@ -895,28 +895,37 @@ async def test_model(args: Dict[str, Any]) -> None:
     logger.info("RUNNING BACKTEST WITH REAL PRICE DATA")
     logger.info("="*70)
 
-    # Run ONLY our new simple backtest using the optimized strategy
-    from src.model.profit_functions import simple_backtest_strategy
-    backtest_results = simple_backtest_strategy(
-        prices=y_true_orig,
-        predictions=y_pred_orig,
-        ohlcv_df=df_for_ml, # Use the SAME processed DataFrame for consistent calculations
-        include_detailed_trades=True,
+    # Run ONLY our FIXED backtest using the corrected strategy
+    from src.model.profit_functions_fixed import fixed_backtest_strategy
+    backtest_results = fixed_backtest_strategy(
+        actual_prices=y_true_orig,
+        predicted_prices=y_pred_orig,
+        initial_cash=10000,
+        position_size_pct=0.075,
+        transaction_fee_pct=0.001,
+        slippage_pct=0.001,
+        buy_threshold=0.02,  # Buy when predicted increase >= 2%
+        sell_threshold=0.025,  # Sell when predicted decrease >= 2.5%
+        stop_loss_pct=0.05,
+        take_profit_pct=0.10,
+        enable_stops=True,
         verbosity=1,
-        resolution=resolution,
-        buy_threshold=0.01,  # Buy when predicted increase >= 1%
-        sell_threshold=0.015  # Sell when predicted decrease >= 1.5%
+        resolution=resolution
     )
     
-    # Log backtest results (only the new/correct ones)
-    logger.info(f"Backtest Results:")
-    logger.info(f"  Total Return: {backtest_results['Total Return']:.2f}%")
-    logger.info(f"  Buy & Hold Return: {backtest_results['Buy & Hold Return']:.2f}%")
-    logger.info(f"  Win Rate: {backtest_results['Win Rate']:.2f}%")
-    logger.info(f"  Max Drawdown: {backtest_results['Max Drawdown']:.2f}%")
-    logger.info(f"  Sharpe Ratio: {backtest_results['Sharpe Ratio']:.2f}")
-    logger.info(f"  Total Trades: {backtest_results['Total Trades']}")
-    logger.info(f"  Final Portfolio Value: ${backtest_results['Final Portfolio Value']:.2f}")
+    # Log backtest results (using the fixed function keys)
+    logger.info(f"FIXED Backtest Results:")
+    logger.info(f"  Total Return: {backtest_results['total_return_pct']:.2f}%")
+    logger.info(f"  Buy & Hold Return: {backtest_results['buy_hold_return_pct']:.2f}%")
+    logger.info(f"  Win Rate: {backtest_results['win_rate']:.2f}%")
+    logger.info(f"  Max Drawdown: {backtest_results['max_drawdown_pct']:.2f}%")
+    logger.info(f"  Sharpe Ratio: {backtest_results['sharpe_ratio']:.2f}")
+    logger.info(f"  Total Trades: {backtest_results['num_trades']}")
+    logger.info(f"  Final Portfolio Value: ${backtest_results['final_value']:.2f}")
+    logger.info(f"  Winning Trades: {backtest_results['winning_trades']}")
+    logger.info(f"  Losing Trades: {backtest_results['losing_trades']}")
+    if 'exit_reasons' in backtest_results:
+        logger.info(f"  Exit Reasons: {backtest_results['exit_reasons']}")
     
     # Plot if requested
     if args.get('plot', False):
@@ -1148,7 +1157,7 @@ async def plot_price_comparison_cmd(args: Dict[str, Any]) -> None:
         return
     
     # Prepare test data
-    sequence_length = args.get('sequence_length', 36)
+    sequence_length = args.get('sequence_length', 24)
     prediction_steps = args.get('prediction_horizon', 1)
     
     logger.info(f"Preparing data with sequence_length={sequence_length}, prediction_horizon={prediction_steps} steps")
@@ -1231,7 +1240,7 @@ def parse_arguments():
     train_parser.add_argument('--days', type=int, default=30, help='Number of days of historical data to use')
     train_parser.add_argument('--resolution', type=str, default='1H', help='Data resolution (1m, 5m, 15m, 1H, 4H, 1D)')
     train_parser.add_argument('--model-type', type=str, default=config.model_type, help='Type of ML model to use')
-    train_parser.add_argument('--sequence-length', type=int, default=36, help='Number of time steps in each input sequence')
+    train_parser.add_argument('--sequence-length', type=int, default=24, help='Number of time steps in each input sequence')
     train_parser.add_argument('--prediction-horizon', type=int, default=1, help='Number of time steps in the future to predict')
     train_parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     train_parser.add_argument('--batch-size', type=int, default=64, help='Training batch size')
@@ -1249,7 +1258,7 @@ def parse_arguments():
     test_parser.add_argument('--model-path', type=str, help='Path to the model to test')
     test_parser.add_argument('--days', type=int, default=10, help='Number of days of historical data to use')
     test_parser.add_argument('--resolution', type=str, default='1H', help='Data resolution (1m, 5m, 15m, 1h, 4h, 1d)')
-    test_parser.add_argument('--sequence-length', type=int, default=36, help='Number of time steps in each input sequence')
+    test_parser.add_argument('--sequence-length', type=int, default=24, help='Number of time steps in each input sequence')
     test_parser.add_argument('--prediction-horizon', type=int, default=1, help='Number of time steps in the future to predict')
     test_parser.add_argument('--plot', action='store_true', help='Plot test results')
     
@@ -1275,7 +1284,7 @@ def parse_arguments():
     plot_prices_parser.add_argument('--model-path', type=str, help='Path to the model to use')
     plot_prices_parser.add_argument('--days', type=int, default=30, help='Number of days of historical data to use')
     plot_prices_parser.add_argument('--resolution', type=str, default='1h', help='Data resolution (1m, 5m, 15m, 1h, 4h, 1d)')
-    plot_prices_parser.add_argument('--sequence-length', type=int, default=36, help='Number of time steps in each input sequence')
+    plot_prices_parser.add_argument('--sequence-length', type=int, default=24, help='Number of time steps in each input sequence')
     plot_prices_parser.add_argument('--prediction-horizon', type=int, default=1, help='Number of time steps in the future to predict')
     plot_prices_parser.add_argument('--output-file', type=str, help='Output filename for the plot')
     

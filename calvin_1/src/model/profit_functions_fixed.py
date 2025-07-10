@@ -20,7 +20,7 @@ def fixed_backtest_strategy(
     actual_prices: np.ndarray,
     predicted_prices: np.ndarray,
     initial_cash: float = 10000,
-    position_size_pct: float = 0.95,  # Use 95% of available capital
+    position_size_pct: float = 0.05,  # Use 95% of available capital
     transaction_fee_pct: float = 0.001,  # 0.1% more realistic for crypto
     slippage_pct: float = 0.001,  # 0.1% slippage
     buy_threshold: float = 0.01,  # Buy when predicted increase >= 1%

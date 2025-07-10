@@ -202,7 +202,8 @@ class LSTMModelRegistry:
             # Sort models using the same priority logic as _find_model_key
             def sort_key(item):
                 model_file, parsed = item
-                # Priority: new format first, then date (newest first), then semantic version
+                # Priority: improved models first, then new format, then date (newest first), then semantic version
+                is_improved = parsed.get('is_improved', False)
                 is_new = not parsed['is_legacy']
                 date_version = parsed['date_version']
                 semantic_parts = [0, 0, 0]  # Default for legacy
@@ -215,7 +216,7 @@ class LSTMModelRegistry:
                     except (ValueError, IndexError):
                         pass
                 
-                return (is_new, date_version, semantic_parts)
+                return (is_improved, is_new, date_version, semantic_parts)
             
             # Get the latest model for this symbol
             latest_model = max(symbol_models, key=sort_key)
@@ -225,7 +226,8 @@ class LSTMModelRegistry:
             if len(symbol_models) > 1:
                 latest_file, latest_parsed = latest_model
                 skipped_count = len(symbol_models) - 1
-                logger.debug(f"📊 {symbol}: Selected latest model {latest_parsed['filename']}, skipping {skipped_count} older versions")
+                model_type = "improved" if latest_parsed.get('is_improved', False) else ("new format" if not latest_parsed['is_legacy'] else "legacy")
+                logger.debug(f"📊 {symbol}: Selected {model_type} model {latest_parsed['filename']}, skipping {skipped_count} older versions")
         
         # 🆕 REGISTER ONLY THE LATEST MODELS
         logger.info(f"🎯 Optimization: Registering {len(models_to_register)} latest models (skipping {total_models_available - len(models_to_register)} older versions)")
@@ -278,7 +280,26 @@ class LSTMModelRegistry:
                 return False
             
             # Load model to get input shape
-            model = tf.keras.models.load_model(str(model_path))
+            # Prepare custom objects for model loading
+            from ..model.profit_functions import (
+                simple_directional_loss, 
+                direction_focused_loss,
+                directional_loss,
+                profit_loss,
+                combined_profit_mse_loss,
+                direction_accuracy
+            )
+            
+            custom_objects = {
+                'simple_directional_loss': simple_directional_loss,
+                'direction_focused_loss': direction_focused_loss,
+                'directional_loss': directional_loss,
+                'profit_loss': profit_loss,
+                'combined_profit_mse_loss': combined_profit_mse_loss,
+                'direction_accuracy': direction_accuracy
+            }
+            
+            model = tf.keras.models.load_model(str(model_path), custom_objects=custom_objects)
             input_shape = model.input_shape[1:]  # Remove batch dimension
             sequence_length = input_shape[0] if len(input_shape) > 0 else 0
             
@@ -347,7 +368,26 @@ class LSTMModelRegistry:
         
         # Load model to get input shape
         try:
-            model = tf.keras.models.load_model(str(model_path))
+            # Prepare custom objects for model loading
+            from ..model.profit_functions import (
+                simple_directional_loss, 
+                direction_focused_loss,
+                directional_loss,
+                profit_loss,
+                combined_profit_mse_loss,
+                direction_accuracy
+            )
+            
+            custom_objects = {
+                'simple_directional_loss': simple_directional_loss,
+                'direction_focused_loss': direction_focused_loss,
+                'directional_loss': directional_loss,
+                'profit_loss': profit_loss,
+                'combined_profit_mse_loss': combined_profit_mse_loss,
+                'direction_accuracy': direction_accuracy
+            }
+            
+            model = tf.keras.models.load_model(str(model_path), custom_objects=custom_objects)
             input_shape = model.input_shape[1:]  # Remove batch dimension
             sequence_length = input_shape[0] if len(input_shape) > 0 else 0
             
@@ -393,7 +433,8 @@ class LSTMModelRegistry:
             with open(metadata_file, 'w') as f:
                 json.dump(self._serialize_metadata(metadata), f, indent=2)
             
-            logger.info(f"Registered model: {model_key} (symbol: {symbol}, legacy: {parsed['is_legacy']})")
+            model_type = "improved" if parsed.get('is_improved', False) else ("new format" if not parsed['is_legacy'] else "legacy")
+            logger.info(f"Registered model: {model_key} (symbol: {symbol}, type: {model_type})")
             
         except Exception as e:
             logger.error(f"Failed to load model {model_path}: {e}")
@@ -405,6 +446,7 @@ class LSTMModelRegistry:
         Supports:
         - Legacy: symbol_modeltype_YYYYMMDD.h5 (e.g., "Fartcoin_lstm_20250614.h5")
         - New: symbol_modeltype_vMAJOR.MINOR.PATCH_YYYYMMDD.h5 (e.g., "Fartcoin_lstm_v1.0.0_20250614.h5")
+        - Improved: symbol_modeltype_improved_vMAJOR.MINOR.PATCH_YYYYMMDD.h5 (e.g., "Fartcoin_lstm_improved_v1.0.0_20250614.h5")
         
         Returns:
             Dict with parsed components or None if invalid format
@@ -417,13 +459,23 @@ class LSTMModelRegistry:
         symbol = parts[0]
         model_type = parts[1]
         
+        # Check for "improved" models
+        is_improved = False
+        improved_index = -1
+        for i, part in enumerate(parts):
+            if part == 'improved':
+                is_improved = True
+                improved_index = i
+                break
+        
         # Check for new format with semantic version
         semantic_version = None
         date_version = None
         is_legacy = True
         
         # Look for semantic version pattern (vX.Y.Z)
-        for i, part in enumerate(parts[2:], 2):
+        start_index = improved_index + 1 if is_improved else 2
+        for i, part in enumerate(parts[start_index:], start_index):
             if part.startswith('v') and '.' in part:
                 # Found semantic version
                 semantic_version = part
@@ -452,6 +504,7 @@ class LSTMModelRegistry:
             'semantic_version': semantic_version,
             'date_version': date_version,
             'is_legacy': is_legacy,
+            'is_improved': is_improved,  # NEW: Track if this is an improved model
             'filename': filename
         }
 
@@ -544,7 +597,28 @@ class LSTMModelRegistry:
         
         try:
             logger.info(f"Loading model from disk: {metadata.model_path}")
-            model = tf.keras.models.load_model(metadata.model_path)
+            
+            # Prepare custom objects for model loading (including custom loss functions)
+            from ..model.profit_functions import (
+                simple_directional_loss, 
+                direction_focused_loss,
+                directional_loss,
+                profit_loss,
+                combined_profit_mse_loss,
+                direction_accuracy
+            )
+            
+            custom_objects = {
+                'simple_directional_loss': simple_directional_loss,
+                'direction_focused_loss': direction_focused_loss,
+                'directional_loss': directional_loss,
+                'profit_loss': profit_loss,
+                'combined_profit_mse_loss': combined_profit_mse_loss,
+                'direction_accuracy': direction_accuracy
+            }
+            
+            # Load model with custom objects
+            model = tf.keras.models.load_model(metadata.model_path, custom_objects=custom_objects)
             
             # Verify model integrity
             if self._verify_model_integrity(metadata):
@@ -584,10 +658,12 @@ class LSTMModelRegistry:
                     symbol_models.append((key, metadata))
             
             if symbol_models:
-                # Sort by priority: new format > legacy format, then by date, then by semantic version
+                # Sort by priority: improved models > new format > legacy format, then by date, then by semantic version
                 def sort_key(item):
                     key, metadata = item
-                    # Priority: new format first, then date (newest first), then semantic version
+                    # Priority: improved models first, then new format, then date (newest first), then semantic version
+                    # Check if this is an improved model by looking at the model path
+                    is_improved = '_improved_' in metadata.model_path or 'lstm_improved' in metadata.model_path
                     is_new = not metadata.is_legacy
                     date_version = metadata.version
                     semantic_parts = [0, 0, 0]  # Default for legacy
@@ -600,7 +676,7 @@ class LSTMModelRegistry:
                         except (ValueError, IndexError):
                             pass
                     
-                    return (is_new, date_version, semantic_parts)
+                    return (is_improved, is_new, date_version, semantic_parts)
                 
                 # Get the highest priority model
                 latest_item = max(symbol_models, key=sort_key)
@@ -665,7 +741,26 @@ class LSTMModelRegistry:
                 if not metadata:
                     return None
                 
-                model = tf.keras.models.load_model(metadata.model_path)
+                # Prepare custom objects for model loading
+                from ..model.profit_functions import (
+                    simple_directional_loss, 
+                    direction_focused_loss,
+                    directional_loss,
+                    profit_loss,
+                    combined_profit_mse_loss,
+                    direction_accuracy
+                )
+                
+                custom_objects = {
+                    'simple_directional_loss': simple_directional_loss,
+                    'direction_focused_loss': direction_focused_loss,
+                    'directional_loss': directional_loss,
+                    'profit_loss': profit_loss,
+                    'combined_profit_mse_loss': combined_profit_mse_loss,
+                    'direction_accuracy': direction_accuracy
+                }
+                
+                model = tf.keras.models.load_model(metadata.model_path, custom_objects=custom_objects)
                 
                 # Restore cached weights
                 weights_data = pickle.loads(serialized_weights)
@@ -833,7 +928,7 @@ class LSTMModelRegistry:
                 self.data_processor = DataProcessor()
             
             # Prepare data for prediction
-            sequence_length = metadata.sequence_length
+            sequence_length = metadata.sequence_length if metadata.sequence_length else 24  # Default to 24 for new models
             X, _, _, _ = self.data_processor.prepare_ml_data(
                 ohlcv_data,
                 target_col='close',

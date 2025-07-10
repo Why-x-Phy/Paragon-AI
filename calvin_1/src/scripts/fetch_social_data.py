@@ -3,7 +3,7 @@
 Script to fetch social data for tokens from LunarCrush API
 
 Usage:
-    python src/scripts/fetch_social_data.py --days 20
+    python src/scripts/fetch_social_data.py --days 10
     python src/scripts/fetch_social_data.py --schedule <minutes>
 """
 import os
@@ -57,6 +57,13 @@ async def fetch_and_store_social_data_timescale(
     Returns:
         bool: True if successful, False otherwise
     """
+    # Check if this is an excluded infrastructure token
+    excluded_symbols = {'USDC', 'SOL', 'WBTC', 'WETH'}
+    if symbol.upper() in excluded_symbols:
+        logger.warning(f"⚠️  {symbol} is an infrastructure token that doesn't need social data. Skipping fetch.")
+        logger.info("Infrastructure tokens (USDC, SOL, WBTC, WETH) are excluded from social data fetching to improve performance.")
+        return False
+    
     db_manager = ProductionDBManager()
     api = LunarCrushAPI()
     
@@ -216,6 +223,29 @@ async def fetch_data_for_all_tokens(interval="1w", days=30, batch_size=100):
         
         if not tokens:
             logger.warning("No active tokens found in database")
+            return
+        
+        # Define infrastructure tokens to exclude from social data fetching
+        # These tokens don't need social metrics and just slow down the process
+        excluded_symbols = {'USDC', 'SOL', 'WBTC', 'WETH'}
+        
+        # Filter out excluded tokens
+        filtered_tokens = []
+        excluded_count = 0
+        for token in tokens:
+            if token['symbol'] in excluded_symbols:
+                logger.debug(f"Excluding infrastructure token {token['symbol']} from social data fetching")
+                excluded_count += 1
+            else:
+                filtered_tokens.append(token)
+        
+        if excluded_count > 0:
+            logger.info(f"Excluded {excluded_count} infrastructure tokens from social data fetching: {', '.join(excluded_symbols)}")
+        
+        tokens = filtered_tokens
+        
+        if not tokens:
+            logger.warning("No tokens left after filtering infrastructure tokens")
             return
         
         # Filter and categorize tokens by their LunarCrush status

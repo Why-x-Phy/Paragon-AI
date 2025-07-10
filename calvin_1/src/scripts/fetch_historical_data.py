@@ -4,7 +4,7 @@ Script to fetch and store historical OHLCV data from BirdEye API
 with support for multiple API keys, configurable resolution, and time periods.
 
 Usage:
-    python src/scripts/fetch_historical_data.py --all-tokens --resolution 1H --days 20 --max-workers 4
+    python src/scripts/fetch_historical_data.py --token-address 7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs --resolution 1H --days 90 --max-workers 4
 """
 
 import os

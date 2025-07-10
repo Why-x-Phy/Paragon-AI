@@ -721,7 +721,7 @@ class MLModel:
         from src.model.profit_functions import (
             profit_loss, directional_loss, combined_profit_mse_loss, 
             cumulative_return_metric, win_rate_metric, sharpe_ratio_metric,
-            direction_accuracy
+            direction_accuracy, simple_directional_loss, direction_focused_loss
         )
         
         custom_objects = {
@@ -731,7 +731,9 @@ class MLModel:
             'cumulative_return_metric': cumulative_return_metric,
             'win_rate_metric': win_rate_metric,
             'sharpe_ratio_metric': sharpe_ratio_metric,
-            'direction_accuracy': direction_accuracy
+            'direction_accuracy': direction_accuracy,
+            'simple_directional_loss': simple_directional_loss,
+            'direction_focused_loss': direction_focused_loss
         }
         
         # Load the model with custom objects

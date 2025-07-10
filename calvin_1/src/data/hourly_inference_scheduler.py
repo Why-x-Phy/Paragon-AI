@@ -229,14 +229,15 @@ class HourlyInferenceScheduler:
             self.logger.info(f"✅ Using {len(self.config.active_tokens)} tokens from TRACKED_TOKENS env var")
             self.logger.info(f"📋 First 5 tokens: {[addr[:8]+'...' for addr in self.config.active_tokens[:5]]}")
         else:
-            # Final fallback to default tokens
+            # Final fallback to default tokens (includes infrastructure tokens for correlation features)
             self.config.active_tokens = [
-                'So11111111111111111111111111111111111111112',  # SOL
-                'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',  # USDC  
+                'So11111111111111111111111111111111111111112',  # SOL - needed for correlation features
+                'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',  # USDC - needed for correlation features
                 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',  # BONK
                 'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',  # JUP
             ]
             self.logger.warning("⚠️ Using minimal fallback tokens (4 tokens)")
+            self.logger.info("📊 Note: SOL/USDC included for correlation features but excluded from trading")
     
     def start_scheduler(self):
         """Start the enhanced inference data scheduler with optimized timing"""

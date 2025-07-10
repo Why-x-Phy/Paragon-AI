@@ -129,7 +129,7 @@ def load_data_and_predictions():
     _, X_test, _, y_test = data_processor.prepare_ml_data(
         df.copy(),
         target_col='close',
-        sequence_length=SEQUENCE_LENGTH,
+        sequence_length=SEQUENCE_LENGTH if SEQUENCE_LENGTH else 24,  # Default to 24 for new models
         prediction_horizon=PREDICTION_HORIZON,
         test_size=0.99,  # Same as main.py
         include_feature_names=False

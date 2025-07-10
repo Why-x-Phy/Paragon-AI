@@ -413,26 +413,39 @@ class PortfolioCoordinator:
         try:
             self.tracked_symbols = set()
             
+            # Define tokens to exclude from inference/trading
+            # NOTE: We still fetch OHLCV data for these tokens since they're needed for 
+            # intermarket correlation features (BTC/ETH correlations, etc.)
+            excluded_symbols = {'USDC', 'SOL', 'WBTC', 'WETH'}
+            
             # Get all active tokens from database
             active_tokens = await self.db_manager.get_active_tokens()
             
-            # Filter to only tracked tokens
+            # Filter to only tracked tokens AND exclude specified tokens
             for token in active_tokens:
                 if token['address'] in self.tracked_tokens_addresses:
+                    # Skip excluded tokens
+                    if token['symbol'] in excluded_symbols:
+                        logger.info(f"🚫 Excluding {token['symbol']} from inference (infrastructure token)")
+                        continue
+                    
                     self.tracked_symbols.add(token['symbol'])
             
-            # Fallback: if no tracked symbols found, use available models
+            # Fallback: if no tracked symbols found, use available models (with exclusions)
             if not self.tracked_symbols:
                 logger.warning("No tracked symbols found in database, using available models")
                 models = self.model_registry.list_models()
-                self.tracked_symbols = set([model.symbol for model in models])
+                for model in models:
+                    if model.symbol not in excluded_symbols:
+                        self.tracked_symbols.add(model.symbol)
             
-            logger.info(f"Loaded {len(self.tracked_symbols)} tracked symbols")
+            logger.info(f"✅ Loaded {len(self.tracked_symbols)} tracked symbols (excluded: {excluded_symbols})")
+            logger.info(f"📋 Trading symbols: {sorted(list(self.tracked_symbols))}")
             
         except Exception as e:
             logger.error(f"Failed to load tracked symbols: {e}")
-            # Fallback to basic symbols
-            self.tracked_symbols = {'BONK', 'JUP', 'SOL', 'Fartcoin'}
+            # Fallback to basic symbols (excluding infrastructure tokens)
+            self.tracked_symbols = {'BONK', 'JUP', 'Fartcoin'}
 
     async def generate_portfolio_signals(self, simulation_time: Optional[datetime] = None, override_portfolio_state: Optional[Dict[str, Any]] = None) -> Optional[PortfolioSignal]:
         """

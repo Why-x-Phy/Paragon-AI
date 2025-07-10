@@ -26,6 +26,45 @@ from src.model.ml_model_improved import ImprovedMLModel
 from src.data.data_processor import DataProcessor
 from datetime import datetime
 import numpy as np
+import re
+import glob
+
+
+def get_next_version(symbol: str, models_dir: str = "models") -> str:
+    """
+    Find the latest version for a symbol and increment it
+    
+    Returns:
+        Next version string (e.g., "v1.0.1", "v1.1.0", "v2.0.0")
+    """
+    # Look for existing models
+    pattern = f"{models_dir}/{symbol}_lstm_improved_v*.h5"
+    existing_models = glob.glob(pattern)
+    
+    if not existing_models:
+        return "v1.0.0"
+    
+    # Extract version numbers
+    versions = []
+    for model_path in existing_models:
+        # Extract version from filename (e.g., "v1.0.0" from "BONK_lstm_improved_v1.0.0_20250710.h5")
+        match = re.search(r'v(\d+)\.(\d+)\.(\d+)', model_path)
+        if match:
+            major, minor, patch = map(int, match.groups())
+            versions.append((major, minor, patch))
+    
+    if not versions:
+        return "v1.0.0"
+    
+    # Get the latest version
+    latest = max(versions)
+    major, minor, patch = latest
+    
+    # Increment patch version by default
+    # You could add logic here to increment minor/major based on changes
+    patch += 1
+    
+    return f"v{major}.{minor}.{patch}"
 
 
 def train_improved_model(
@@ -68,16 +107,14 @@ def train_improved_model(
     
     # Prepare ML data
     print("\n🔧 Preparing ML features...")
-    X, y, train_idx, test_idx = data_processor.prepare_ml_data(
+    X_train, X_test, y_train, y_test = data_processor.prepare_ml_data(
         df, 
-        sequence_length=36, 
+        sequence_length=24,  # Fix #19: Try 18 hours (between 12 and 24)
         prediction_horizon=1,
         test_size=0.2,
-        test_mode=False  # Use proper train/test split
+        test_mode=False,  # Use proper train/test split
+        include_feature_names=False  # Don't return feature names, just the 4 arrays
     )
-    
-    X_train, y_train = X[train_idx], y[train_idx]
-    X_test, y_test = X[test_idx], y[test_idx]
     
     print(f"✅ Training samples: {len(X_train)}")
     print(f"✅ Validation samples: {len(X_test)}")
@@ -104,7 +141,8 @@ def train_improved_model(
     
     # Generate model name
     timestamp = datetime.now().strftime('%Y%m%d')
-    model_name = f"{symbol}_lstm_improved_v1.0.0_{timestamp}"
+    next_version = get_next_version(symbol)
+    model_name = f"{symbol}_lstm_improved_{next_version}_{timestamp}"
     
     # Train model
     print(f"\n🎯 Starting training...")
@@ -162,7 +200,7 @@ if __name__ == "__main__":
                         help='Maximum training epochs')
     parser.add_argument('--optimization-target', type=str, 
                         default='simple_directional',
-                        choices=['mse', 'simple_directional', 'profit', 'direction'],
+                        choices=['mse', 'simple_directional', 'profit', 'direction', 'direction_focused'],
                         help='Loss function to use')
     
     args = parser.parse_args()

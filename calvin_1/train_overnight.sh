@@ -14,15 +14,30 @@ set -e  # Exit on any error
 
 # Token configurations: "TOKEN_ADDRESS:SYMBOL"
 TOKENS=(
-    "3iQL8BFS2vE7mww4ehAqQHAsbmRNCrPxizWAT2Zfyr9y:VIRTUAL"
+    "J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr:SPX"
+    "2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv:PENGU"
+    "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm:\$WIF"
+    "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE:ORCA"
+    "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN:TRUMP"
+    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263:Bonk"
+    "MNDEFzGvMt87ueuHvVU9VcTqsAP5b3fTGPsHuuPA5ey:MNDE"
     "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE:ORCA"
     "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5:MEW"
+    "85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ:W"
+    "3iQL8BFS2vE7mww4ehAqQHAsbmRNCrPxizWAT2Zfyr9y:VIRTUAL"
+    "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3:PYTH"
+    "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL:JTO"
+    "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R:RAY"
+    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN:JUP"
+    "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof:RENDER"
+    
 )
 
-# Training parameters
-EPOCHS=175
-DAYS=100
-COOLING_MINUTES=2
+# Training parameters (updated for improved model training)
+EPOCHS=50
+DAYS=60
+OPTIMIZATION_TARGET="direction_focused"
+COOLING_MINUTES=0
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -36,23 +51,23 @@ train_model() {
     local token_address=$1
     local symbol=$2
     
-    log "🚀 Starting training for $symbol ($token_address)"
-    log "⚙️  Training parameters: ${EPOCHS} epochs, ${DAYS} days of data"
+    log "🚀 Starting improved model training for $symbol ($token_address)"
+    log "⚙️  Training parameters: ${EPOCHS} epochs, ${DAYS} days of data, ${OPTIMIZATION_TARGET} optimization"
     
-    # Run training command
-    python main.py train \
+    # Run improved training command with direction-focused optimization
+    python train_improved_model.py \
         --token-address "$token_address" \
         --symbol "$symbol" \
+        --days "$DAYS" \
         --epochs "$EPOCHS" \
-        --plot \
-        --days "$DAYS"
+        --optimization-target "$OPTIMIZATION_TARGET"
     
     local exit_code=$?
     
     if [ $exit_code -eq 0 ]; then
-        log "✅ Successfully completed training for $symbol"
+        log "✅ Successfully completed improved training for $symbol"
     else
-        log "❌ Training failed for $symbol (exit code: $exit_code)"
+        log "❌ Improved training failed for $symbol (exit code: $exit_code)"
         return $exit_code
     fi
 }
@@ -70,8 +85,9 @@ cooling_break() {
 # MAIN EXECUTION
 # =============================================================================
 
-log "🌙 Starting overnight training session"
+log "🌙 Starting overnight improved model training session"
 log "📊 Will train ${#TOKENS[@]} models with ${COOLING_MINUTES}-minute cooling breaks"
+log "🎯 Using ${OPTIMIZATION_TARGET} optimization for better direction accuracy"
 log "💾 Models will be saved to: $(pwd)/models/"
 
 # Record start time
@@ -89,7 +105,7 @@ for i in "${!TOKENS[@]}"; do
     
     # Train the model
     if train_model "$token_address" "$symbol"; then
-        log "🎯 Model training completed for $symbol"
+        log "🎯 Improved model training completed for $symbol"
         
         # Cooling break (except after the last model)
         if [ $current_num -lt $total_num ]; then
@@ -113,10 +129,10 @@ total_minutes=$(( (end_time - start_time) / 60 ))
 hours=$((total_minutes / 60))
 minutes=$((total_minutes % 60))
 
-log "🏁 Overnight training session completed!"
+log "🏁 Overnight improved model training session completed!"
 log "⏱️  Total time: ${hours}h ${minutes}m"
-log "📁 Check the models/ directory for your new trained models"
-log "💤 Sweet dreams! Your models are ready for testing."
+log "📁 Check the models/ directory for your new direction-focused models"
+log "💤 Sweet dreams! Your improved models are ready for testing."
 
 # List generated models
 log "📋 Generated model files:"

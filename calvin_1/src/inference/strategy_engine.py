@@ -481,7 +481,7 @@ class SimpleStrategyEngine:
             _, X_test, _, _ = data_processor.prepare_ml_data(
                 features_df,
                 target_col='close',
-                sequence_length=metadata.sequence_length,
+                sequence_length=metadata.sequence_length if metadata.sequence_length else 24,  # Use model's sequence length or default to 24
                 prediction_horizon=1,
                 test_size=0.0,  # Use all data
                 include_feature_names=False,

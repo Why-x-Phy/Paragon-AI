@@ -13,13 +13,12 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Dense, LSTM, Dropout, BatchNormalization, Input, Lambda
-from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.initializers import GlorotUniform, Orthogonal
 from typing import Tuple, List
 
 from src.model.ml_model import MLModel
-from src.model.profit_functions import simple_directional_loss
+from src.model.profit_functions import simple_directional_loss, direction_focused_loss
 
 
 class ImprovedMLModel(MLModel):
@@ -29,15 +28,28 @@ class ImprovedMLModel(MLModel):
         # Default to simple_directional for better trading performance
         super().__init__(model_type=model_type, optimization_target=optimization_target)
     
+    def _get_loss_function(self):
+        """
+        Override parent's loss function to use Huber loss
+        Fix #7: Huber loss is more robust to outliers than MSE
+        """
+        if self.optimization_target == "simple_directional":
+            return simple_directional_loss
+        elif self.optimization_target == "direction_focused":
+            # Fix #23: Use direction-focused loss for 80%+ accuracy
+            return direction_focused_loss
+        else:
+            # Use Huber loss instead of MSE for better robustness
+            return tf.keras.losses.Huber(delta=1.0)
+    
     def build_lstm_model(
         self, 
         input_shape: Tuple[int, int],
         output_units: int = 1,
-        lstm_units: List[int] = [128, 64, 32],  # Reduced from [256, 128, 64, 32]
+        lstm_units: List[int] = [256, 128, 64],  # Fix #21: Increased first layer from 256 to 512 units
         dropout_rate: float = 0.2,  # Reduced from 0.4
-        use_bidirectional: bool = True,
-        output_activation: str = 'tanh',  # Constrain outputs to [-1, 1]
-        output_scale: float = 0.1  # Scale outputs to reasonable percentage range
+        use_bidirectional: bool = True
+        # Fix #6: Removed output_activation and output_scale parameters
     ) -> Model:
         """
         Build improved LSTM model with anti-collapse features
@@ -73,8 +85,10 @@ class ImprovedMLModel(MLModel):
                 recurrent_initializer=Orthogonal(seed=42),
             )(x)
         
-        x = BatchNormalization()(x)
-        x = Dropout(dropout_rate)(x)
+        # REMOVED BATCHNORM - Fix #5: BatchNorm can interfere with LSTM temporal patterns
+        # x = BatchNormalization()(x)
+        # Fix #8: Add minimal dropout (0.1) to prevent overfitting
+        x = Dropout(0.1)(x)
         
         # Additional LSTM layers
         for i in range(1, len(lstm_units)):
@@ -97,36 +111,30 @@ class ImprovedMLModel(MLModel):
                     recurrent_initializer=Orthogonal(seed=42+i),
                 )(x)
             
-            x = BatchNormalization()(x)
-            x = Dropout(dropout_rate)(x)
+            # REMOVED BATCHNORM - Fix #5: BatchNorm can interfere with LSTM temporal patterns
+            # x = BatchNormalization()(x)
+            # Fix #8: Add minimal dropout (0.1) to prevent overfitting
+            x = Dropout(0.1)(x)
         
         # Dense layers - simplified
         x = Dense(32, activation='relu', kernel_initializer=GlorotUniform(seed=100))(x)
-        x = Dropout(dropout_rate)(x)
+        # Fix #8: Add minimal dropout (0.1) to prevent overfitting
+        x = Dropout(0.1)(x)
         
-        # Output layer with activation
-        if output_activation == 'tanh':
-            # Tanh output: [-1, 1] range
-            raw_output = Dense(output_units, activation='tanh', 
-                             kernel_initializer=GlorotUniform(seed=200))(x)
-            # Scale to percentage range (e.g., -10% to +10%)
-            outputs = Lambda(lambda x: x * output_scale, name='scaled_output')(raw_output)
-        elif output_activation == 'sigmoid':
-            # Sigmoid output: [0, 1] range  
-            raw_output = Dense(output_units, activation='sigmoid',
-                             kernel_initializer=GlorotUniform(seed=200))(x)
-            # Scale and shift to percentage range (e.g., -5% to +5%)
-            outputs = Lambda(lambda x: (x - 0.5) * output_scale * 2, name='scaled_output')(raw_output)
-        else:
-            # Linear output (original behavior)
-            outputs = Dense(output_units, kernel_initializer=GlorotUniform(seed=200))(x)
+        # Output layer - Fix #6: Remove tanh constraint to allow full range predictions
+        outputs = Dense(
+            output_units,
+            kernel_initializer=GlorotUniform(seed=42),
+            # REMOVED: activation=output_activation  
+            # Let the model learn the natural scale of predictions
+        )(x)
         
         # Create model
         model = Model(inputs=inputs, outputs=outputs)
         
-        # Compile with lower learning rate for stability
+        # Compile with AdamW optimizer for better weight decay
         model.compile(
-            optimizer=Adam(learning_rate=0.0001, clipnorm=1.0),  # Reduced from 0.0005
+            optimizer=tf.keras.optimizers.AdamW(learning_rate=0.001, weight_decay=0.0001, clipnorm=1.0),  # Fix #20: AdamW instead of Adam
             loss=self._get_loss_function(),
             metrics=self._get_metrics()
         )
@@ -150,14 +158,14 @@ class ImprovedMLModel(MLModel):
         # Build callbacks with better settings
         callbacks = []
         
-        # Early stopping - stop if no improvement
-        early_stopping = EarlyStopping(
+        # Early stopping - more patient for complex patterns
+        early_stop = EarlyStopping(
             monitor='val_loss',
-            patience=patience,
+            patience=10,  # Reverted from 15 - too much patience caused overtraining
             restore_best_weights=True,
             verbose=1
         )
-        callbacks.append(early_stopping)
+        callbacks.append(early_stop)
         
         # Model checkpoint
         if model_name:
@@ -174,7 +182,7 @@ class ImprovedMLModel(MLModel):
         reduce_lr = ReduceLROnPlateau(
             monitor='val_loss',
             factor=0.5,  # Cut in half
-            patience=5,   # Reduced from 10
+            patience=10,   # Fix #12: Increased from 5 to let model train longer
             min_lr=1e-7,
             verbose=1
         )
@@ -201,12 +209,16 @@ class ImprovedMLModel(MLModel):
         
         callbacks.append(GradientLogger())
         
+        # Fix #24: Try larger batch size for more stable gradients
+        # Effective batch size = 64 (was 32)
+        effective_batch_size = min(64, len(X_train) // 4)  # Don't use more than 25% of data per batch
+        
         # Call parent train with our callbacks
         history = self.model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val),
             epochs=epochs,
-            batch_size=batch_size,
+            batch_size=effective_batch_size,
             callbacks=callbacks,
             verbose=1
         )

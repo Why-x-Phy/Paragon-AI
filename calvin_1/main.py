@@ -744,7 +744,8 @@ async def train_model(args: Dict[str, Any]) -> None:
     
     # Initialize and train model
     model_type = args.get('model_type', config.model_type)
-    ml_model = MLModel(model_type=model_type)
+    optimization_target = args.get('optimization_target', 'mse')  # Default to MSE
+    ml_model = MLModel(model_type=model_type, optimization_target=optimization_target)
     
     # Check if we should use bidirectional LSTM
     use_bidirectional = args.get('bidirectional', True)
@@ -1237,6 +1238,9 @@ def parse_arguments():
     train_parser.add_argument('--plot', action='store_true', help='Plot training results')
     train_parser.add_argument('--bidirectional', action='store_true', default=True, help='Use bidirectional LSTM')
     train_parser.add_argument('--no-bidirectional', dest='bidirectional', action='store_false', help='Disable bidirectional LSTM')
+    train_parser.add_argument('--optimization-target', type=str, default='mse', 
+                            choices=['mse', 'profit', 'direction', 'combined', 'simple_directional'],
+                            help='Loss function to optimize (default: mse)')
     
     
     test_parser = subparsers.add_parser('test', help='Test the ML model')

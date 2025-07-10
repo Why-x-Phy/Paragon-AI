@@ -3727,7 +3727,7 @@ class DataProcessor:
 
     def save_scalers(self, symbol: str, model_version: str) -> None:
         """Save fitted scalers to disk for use in production"""
-        import joblib
+        import pickle
         
         # Create scalers directory if it doesn't exist
         scalers_dir = os.path.join(self.data_dir, "scalers")
@@ -3735,24 +3735,27 @@ class DataProcessor:
         
         # Save price scaler
         price_scaler_path = os.path.join(scalers_dir, f"{symbol}_{model_version}_price_scaler.pkl")
-        joblib.dump(self.price_scaler, price_scaler_path)
+        with open(price_scaler_path, 'wb') as f:
+            pickle.dump(self.price_scaler, f)
         logger.info(f"Saved price scaler to {price_scaler_path}")
         
         # Save feature scaler
         feature_scaler_path = os.path.join(scalers_dir, f"{symbol}_{model_version}_feature_scaler.pkl")
-        joblib.dump(self.feature_scaler, feature_scaler_path)
+        with open(feature_scaler_path, 'wb') as f:
+            pickle.dump(self.feature_scaler, f)
         logger.info(f"Saved feature scaler to {feature_scaler_path}")
     
     def load_scalers(self, symbol: str, model_version: str) -> bool:
         """Load fitted scalers from disk for production use"""
-        import joblib
+        import pickle
         
         scalers_dir = os.path.join(self.data_dir, "scalers")
         
         # Load price scaler
         price_scaler_path = os.path.join(scalers_dir, f"{symbol}_{model_version}_price_scaler.pkl")
         if os.path.exists(price_scaler_path):
-            self.price_scaler = joblib.load(price_scaler_path)
+            with open(price_scaler_path, 'rb') as f:
+                self.price_scaler = pickle.load(f)
             logger.info(f"Loaded price scaler from {price_scaler_path}")
         else:
             logger.warning(f"Price scaler not found at {price_scaler_path}")
@@ -3761,7 +3764,8 @@ class DataProcessor:
         # Load feature scaler
         feature_scaler_path = os.path.join(scalers_dir, f"{symbol}_{model_version}_feature_scaler.pkl")
         if os.path.exists(feature_scaler_path):
-            self.feature_scaler = joblib.load(feature_scaler_path)
+            with open(feature_scaler_path, 'rb') as f:
+                self.feature_scaler = pickle.load(f)
             logger.info(f"Loaded feature scaler from {feature_scaler_path}")
         else:
             logger.warning(f"Feature scaler not found at {feature_scaler_path}")

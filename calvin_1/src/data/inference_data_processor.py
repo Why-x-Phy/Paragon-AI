@@ -166,10 +166,20 @@ class InferenceDataProcessor:
                 return None
             
             # 5. Apply clean feature engineering using DataProcessor interface
+            # CRITICAL: Use the SAME corrected end_time as _fetch_ohlcv_data to avoid double incomplete candle fetch
+            if simulation_time:
+                corrected_end_time = simulation_time
+            else:
+                # Use the same complete candle logic as _fetch_ohlcv_data
+                now = datetime.utcnow()
+                corrected_end_time = now.replace(minute=0, second=0, microsecond=0)
+                if now.minute > 0 or now.second > 0:
+                    corrected_end_time = corrected_end_time - timedelta(hours=1)
+            
             features_df = await self.data_processor.prepare_inference_ready_data(
                 token_id=token['token_id'],
-                start_time=simulation_time - timedelta(hours=self.config.lookback_hours) if simulation_time else datetime.utcnow() - timedelta(hours=self.config.lookback_hours),
-                end_time=simulation_time if simulation_time else datetime.utcnow(),
+                start_time=corrected_end_time - timedelta(hours=self.config.lookback_hours),
+                end_time=corrected_end_time,  # Use corrected end_time to avoid incomplete candles
                 symbol=token.get('symbol'),
                 db_manager=self.db_manager  # Pass the db_manager for thread safety
             )
@@ -239,8 +249,20 @@ class InferenceDataProcessor:
     async def _fetch_ohlcv_data(self, token_id: int, resolution: str, simulation_time: Optional[datetime] = None) -> Optional[List]:
         """Fetch OHLCV data from database"""
         try:
-            # Use simulation time for backtesting, current time for live trading
-            end_time = simulation_time if simulation_time else datetime.utcnow()
+            if simulation_time:
+                # Use simulation time for backtesting
+                end_time = simulation_time
+            else:
+                # For live trading: Use the LATEST COMPLETE hour to avoid incomplete candles
+                now = datetime.utcnow()
+                end_time = now.replace(minute=0, second=0, microsecond=0)
+                # If we're still in the current hour, go back to the previous complete hour
+                if now.minute > 0 or now.second > 0:
+                    end_time = end_time - timedelta(hours=1)  # Simpler: just subtract 1 hour
+                    self.logger.info(f"🕐 Live trading: Using latest COMPLETE hour {end_time} (current time: {now})")
+                else:
+                    self.logger.info(f"🕐 Live trading: Current hour just started, using {end_time} (current time: {now})")
+            
             start_time = end_time - timedelta(hours=self.config.lookback_hours)
             
             ohlcv_data = await self.db_manager.get_ohlcv_data(

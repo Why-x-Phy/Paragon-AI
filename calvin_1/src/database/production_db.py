@@ -748,7 +748,7 @@ class ProductionDBManager:
                        volume, volume_usd, trades_count, data_source
                 FROM ohlcv 
                 WHERE {' AND '.join(conditions)}
-                ORDER BY time DESC
+                ORDER BY time ASC
             """
             
             if limit:

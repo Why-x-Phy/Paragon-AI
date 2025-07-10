@@ -174,7 +174,8 @@ class HourlyInferenceScheduler:
             if self.config.adaptive_strategy_enabled:
                 try:
                     from ..inference.adaptive_strategy import get_adaptive_strategy_engine
-                    adaptive_engine = await get_adaptive_strategy_engine()
+                    # FIXED: Pass our database manager to ensure thread-local usage
+                    adaptive_engine = await get_adaptive_strategy_engine(db_manager=self.db_manager)
                     await adaptive_engine.start_adaptation_monitoring()
                     self.logger.info("✅ Adaptive strategy monitoring started")
                 except Exception as e:

@@ -352,8 +352,13 @@ class AdaptiveStrategyEngine:
                     last_updated=datetime.now()
                 ))
 
-            # Get 7 days of hourly data
-            end_time = datetime.now()
+            # Get 7 days of hourly data - FIXED: Use latest COMPLETE hour to avoid incomplete candles
+            now = datetime.now()
+            end_time = now.replace(minute=0, second=0, microsecond=0)
+            # If we're still in the current hour, go back to the previous complete hour
+            if now.minute > 0 or now.second > 0:
+                end_time = end_time - timedelta(hours=1)
+                logger.debug(f"Adaptive strategy using latest COMPLETE hour {end_time} for {normalized_symbol} (current time: {now})")
             start_time = end_time - timedelta(days=7)
             
             price_data = None
@@ -510,17 +515,22 @@ class AdaptiveStrategyEngine:
             # Analyze current market conditions first
             conditions = await self.analyze_market_conditions(normalized_symbol)
             
-            # Check if we have enough signals for performance-based adaptation
+            # Check if we have enough signals for ANY adaptation (SAFETY: prevent premature adaptations)
             params = self.strategy_parameters[normalized_symbol]
             has_sufficient_signals = params.total_signals >= self.config.min_signals_for_adaptation
+            
+            # SAFETY CHECK: Don't adapt without sufficient signal history
+            if not has_sufficient_signals:
+                logger.debug(f"Skipping adaptation for {normalized_symbol}: only {params.total_signals}/{self.config.min_signals_for_adaptation} signals")
+                return False
             
             # Store original parameters for comparison
             original_params = StrategyParameters(**asdict(params))
             
-            # Apply adaptation methods
+            # Apply adaptation methods (only after sufficient signal history)
             adapted = False
             
-            # Always allow volatility, momentum, and regime-based adaptation (market-driven)
+            # Apply market-based adaptations (volatility, momentum, regime)
             if self.config.adaptation_method in [AdaptationMethod.VOLATILITY_BASED, AdaptationMethod.HYBRID]:
                 adapted |= await self._adapt_for_volatility(normalized_symbol, conditions)
             
@@ -530,8 +540,8 @@ class AdaptiveStrategyEngine:
             if self.config.adaptation_method in [AdaptationMethod.REGIME_SWITCHING, AdaptationMethod.HYBRID]:
                 adapted |= await self._adapt_for_regime(normalized_symbol, conditions)
             
-            # Only apply performance-based adaptation if we have sufficient signals
-            if has_sufficient_signals and self.config.adaptation_method in [AdaptationMethod.PERFORMANCE_BASED, AdaptationMethod.HYBRID]:
+            # Apply performance-based adaptation
+            if self.config.adaptation_method in [AdaptationMethod.PERFORMANCE_BASED, AdaptationMethod.HYBRID]:
                 adapted |= await self._adapt_for_performance(normalized_symbol)
             
             if adapted:
@@ -1152,9 +1162,18 @@ async def get_adaptive_strategy_engine(
     portfolio_coordinator: Optional[PortfolioCoordinator] = None,
     db_manager: Optional['ProductionDBManager'] = None
 ) -> AdaptiveStrategyEngine:
-    """Get singleton adaptive strategy engine instance"""
+    """Get adaptive strategy engine instance with thread-local support"""
     global _adaptive_strategy_instance
     
+    # FIXED: If a specific db_manager is provided (thread-local usage),
+    # create a new instance instead of using singleton to avoid event loop conflicts
+    if db_manager is not None:
+        logger.info("Creating thread-local adaptive strategy instance")
+        thread_instance = AdaptiveStrategyEngine(portfolio_coordinator, db_manager)
+        await thread_instance.initialize()
+        return thread_instance
+    
+    # Use singleton only when no specific db_manager is provided (main thread usage)
     if _adaptive_strategy_instance is None:
         _adaptive_strategy_instance = AdaptiveStrategyEngine(portfolio_coordinator, db_manager)
         await _adaptive_strategy_instance.initialize()

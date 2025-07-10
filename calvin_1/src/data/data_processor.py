@@ -12,6 +12,7 @@ import concurrent.futures
 import pandas_ta as ta
 from scipy import stats
 import asyncio
+import joblib
 
 from .birdeye_api import BirdEyeAPI
 from .helius_api import HeliusAPI
@@ -40,6 +41,9 @@ class DataProcessor:
         
         # Store last known prices for predictions
         self.last_prices = {}
+        
+        # Store prices at sequence end for test set
+        self.prices_at_sequence_end_test = None
     
     def fetch_price_data(
         self, 
@@ -3720,3 +3724,47 @@ class DataProcessor:
         except Exception as e:
             logger.error(f"Error preparing inference data for token {token_id}: {e}")
             return None
+
+    def save_scalers(self, symbol: str, model_version: str) -> None:
+        """Save fitted scalers to disk for use in production"""
+        import joblib
+        
+        # Create scalers directory if it doesn't exist
+        scalers_dir = os.path.join(self.data_dir, "scalers")
+        os.makedirs(scalers_dir, exist_ok=True)
+        
+        # Save price scaler
+        price_scaler_path = os.path.join(scalers_dir, f"{symbol}_{model_version}_price_scaler.pkl")
+        joblib.dump(self.price_scaler, price_scaler_path)
+        logger.info(f"Saved price scaler to {price_scaler_path}")
+        
+        # Save feature scaler
+        feature_scaler_path = os.path.join(scalers_dir, f"{symbol}_{model_version}_feature_scaler.pkl")
+        joblib.dump(self.feature_scaler, feature_scaler_path)
+        logger.info(f"Saved feature scaler to {feature_scaler_path}")
+    
+    def load_scalers(self, symbol: str, model_version: str) -> bool:
+        """Load fitted scalers from disk for production use"""
+        import joblib
+        
+        scalers_dir = os.path.join(self.data_dir, "scalers")
+        
+        # Load price scaler
+        price_scaler_path = os.path.join(scalers_dir, f"{symbol}_{model_version}_price_scaler.pkl")
+        if os.path.exists(price_scaler_path):
+            self.price_scaler = joblib.load(price_scaler_path)
+            logger.info(f"Loaded price scaler from {price_scaler_path}")
+        else:
+            logger.warning(f"Price scaler not found at {price_scaler_path}")
+            return False
+        
+        # Load feature scaler
+        feature_scaler_path = os.path.join(scalers_dir, f"{symbol}_{model_version}_feature_scaler.pkl")
+        if os.path.exists(feature_scaler_path):
+            self.feature_scaler = joblib.load(feature_scaler_path)
+            logger.info(f"Loaded feature scaler from {feature_scaler_path}")
+        else:
+            logger.warning(f"Feature scaler not found at {feature_scaler_path}")
+            return False
+        
+        return True

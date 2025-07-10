@@ -798,6 +798,13 @@ async def train_model(args: Dict[str, Any]) -> None:
     metrics = ml_model.evaluate(X_test, y_test, include_backtest=False)  # FIXED: Disable broken backtest
     ml_model.save_evaluation_metrics(metrics, model_name)
     
+    # Save the model and get the path
+    model_path = ml_model.save(model_name)
+    
+    # Save the fitted scalers for production use
+    data_processor.save_scalers(symbol, model_name)
+    logger.info(f"Saved fitted scalers for production use")
+    
     # Plot results if requested
     if args.get('plot', False):
         ml_model.plot_training_history(history, f"{model_name}_training_history.png")

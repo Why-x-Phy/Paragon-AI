@@ -233,7 +233,8 @@ class AdaptiveBacktester:
                 symbol=symbol,
                 buy_threshold=0.01,    # Start with default 1%
                 sell_threshold=0.015   # Start with default 1.5%
-            )
+            ),
+            market_conditions=MarketConditions()  # Initialize with default market conditions
         )
         
         # Trading state

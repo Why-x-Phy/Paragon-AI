@@ -468,6 +468,16 @@ class SimpleStrategyEngine:
             # Use EXACT same DataProcessor.prepare_ml_data() call as test_simple_inference.py
             from ..data.data_processor import DataProcessor
             data_processor = DataProcessor()
+            
+            # Try to load scalers for this specific model
+            model_version = metadata.version
+            if data_processor.load_scalers(symbol, model_version):
+                logger.info(f"Loaded scalers for {symbol} model {model_version}")
+                data_processor._scalers_loaded = True
+            else:
+                logger.warning(f"No scalers found for {symbol} model {model_version}, using default scaling")
+                data_processor._scalers_loaded = False
+            
             _, X_test, _, _ = data_processor.prepare_ml_data(
                 features_df,
                 target_col='close',
@@ -552,28 +562,43 @@ class SimpleStrategyEngine:
             # 1. Inverse scaled using the price_scaler 
             # 2. Converted to absolute price using: price * (1 + percentage_change)
             
-            # SIMPLIFIED APPROACH: Use the same simple logic as test_simple_inference.py
-            # The model output is already scaled appropriately, we just need to apply it
-            
+            # Try to load the scaler for this specific model
             try:
-                # Use the SAME data_processor that was used for feature preparation
+                # Check if we have a data processor with loaded scalers
                 if hasattr(self, '_current_data_processor') and self._current_data_processor is not None:
                     data_processor = self._current_data_processor
                     
-                    # Use the same inverse_transform_predictions method as training
-                    scaled_predictions = np.array([raw_prediction])  # Single prediction
-                    prices_at_sequence_end = np.array([current_price])  # Current price is the reference
+                    # Try to load scalers if not already loaded
+                    if not hasattr(data_processor, '_scalers_loaded') or not data_processor._scalers_loaded:
+                        # Extract model version from metadata
+                        model_version = metadata.version
+                        if data_processor.load_scalers(symbol, model_version):
+                            logger.info(f"Loaded scalers for {symbol} model {model_version}")
+                            data_processor._scalers_loaded = True
+                        else:
+                            logger.warning(f"Could not load scalers for {symbol} model {model_version}")
+                            data_processor._scalers_loaded = False
                     
-                    # This uses the exact same logic as test_simple_inference.py
-                    absolute_predictions = data_processor.inverse_transform_predictions(
-                        scaled_predictions, prices_at_sequence_end
-                    )
-                    predicted_price = absolute_predictions[0]
-                    
-                    # Calculate the actual percentage change for logging
-                    percentage_change = (predicted_price / current_price - 1) * 100
-                    
-                    logger.debug(f"Prediction conversion for {symbol}: raw={raw_prediction:.6f}, pct_change={percentage_change:.3f}%, price=${current_price:.6f} -> ${predicted_price:.6f}")
+                    # If scalers are loaded, use proper inverse transform
+                    if hasattr(data_processor, '_scalers_loaded') and data_processor._scalers_loaded:
+                        # Use the same inverse_transform_predictions method as training
+                        scaled_predictions = np.array([raw_prediction])  # Single prediction
+                        prices_at_sequence_end = np.array([current_price])  # Current price is the reference
+                        
+                        # This uses the exact same logic as test_simple_inference.py
+                        absolute_predictions = data_processor.inverse_transform_predictions(
+                            scaled_predictions, prices_at_sequence_end
+                        )
+                        predicted_price = absolute_predictions[0]
+                        
+                        # Calculate the actual percentage change for logging
+                        percentage_change = (predicted_price / current_price - 1) * 100
+                        
+                        logger.debug(f"Prediction conversion for {symbol} (with scaler): raw={raw_prediction:.6f}, pct_change={percentage_change:.3f}%, price=${current_price:.6f} -> ${predicted_price:.6f}")
+                    else:
+                        # No scalers available, use fallback
+                        logger.warning(f"No scalers available for {symbol}, using fallback conversion")
+                        predicted_price = current_price * (1 + raw_prediction)
                 else:
                     # No data_processor available, fallback
                     logger.warning(f"No data_processor available for {symbol}, using fallback conversion")

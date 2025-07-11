@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Calvin Vault Real Swap Test Script
+Calvin Vault Token Liquidation Script
 
-This script tests the complete vault trading functionality by executing a real
-swap through the Calvin vault smart contract using actual vault funds.
+This script liquidates a specific token from the Calvin vault back to USDC.
+Simply provide the token mint address and it will sell all tokens.
 
 Usage:
-    python test_vault_swap.py [--amount 10.0] [--delay 5]
+    python test_vault_swap.py <token_mint_address> [--network mainnet]
+    
+Example:
+    python test_vault_swap.py EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm  # Sell all WIF
 
 WARNING: This script will execute real transactions with real vault funds.
 """
@@ -27,21 +30,8 @@ from src.vault.vault_client import VaultClient
 from src.vault.jupiter_client import JupiterV6Client
 from src.database.production_db import get_db_manager
 
-# Test configuration
-TEST_CONFIG = {
-    'input_token': 'USDC',
-    'intermediate_token': 'FARTCOIN',
-    'amount_usdc': 10.0,  # $10 test swap
-    'slippage_bps': 300,  # 3.0% slippage tolerance
-    'network': 'mainnet',
-    'swap_delay_seconds': 5,  # Wait between swaps
-    
-    # Token addresses
-    'tokens': {
-        'USDC': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-        'FARTCOIN': '9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump'
-    }
-}
+# Constants
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 # Setup logging
 logging.basicConfig(
@@ -50,70 +40,89 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-async def perform_swap(jupiter_client, input_mint, output_mint, amount, input_symbol, output_symbol, swap_number):
-    """Perform a single swap and return the results"""
-    print(f"\n💱 Swap {swap_number}: Getting Jupiter quote for {input_symbol} → {output_symbol}...")
-    
-    print(f"  - Input mint: {input_mint}")
-    print(f"  - Output mint: {output_mint}")
-    print(f"  - Amount: {amount:,} lamports")
-    
-    quote_response = await jupiter_client.get_quote(
-        input_mint=input_mint,
-        output_mint=output_mint,
-        amount=amount,
-        slippage_bps=TEST_CONFIG['slippage_bps']
-    )
-    
-    if not quote_response or 'error' in quote_response:
-        logger.error(f"❌ Failed to get Jupiter quote: {quote_response}")
-        return None
+async def get_token_info(db_manager, token_mint: str) -> Dict[str, any]:
+    """Get token info from database or return basic info"""
+    try:
+        if db_manager:
+            # Try to get token info from database
+            for token in db_manager._token_cache.values():
+                if token.address == token_mint:
+                    return {
+                        'symbol': token.symbol,
+                        'name': token.name,
+                        'decimals': token.decimals
+                    }
         
-    # Parse quote details directly from the quote object (Jupiter V6 returns quote directly)
-    input_amount = int(quote_response.get('inAmount', 0))
-    output_amount = int(quote_response.get('outAmount', 0))
-    price_impact = float(quote_response.get('priceImpactPct', 0))
-    
-    # Calculate output in human-readable format
-    if output_symbol == 'USDC':
-        output_formatted = output_amount / 1_000_000  # USDC has 6 decimals
-    else:
-        output_formatted = output_amount / 1_000_000  # Fartcoin has 6 decimals
-    
-    input_formatted = input_amount / 1_000_000  # Both tokens have 6 decimals
-    
-    print(f"  ✅ Quote received:")
-    print(f"    - Input: {input_amount:,} lamports ({input_formatted:.6f} {input_symbol})")
-    print(f"    - Output: {output_amount:,} lamports ({output_formatted:.6f} {output_symbol})")
-    print(f"    - Price impact: {price_impact:.4f}%")
-    
-    return {
-        'input_amount': input_amount,
-        'output_amount': output_amount,
-        'input_formatted': input_formatted,
-        'output_formatted': output_formatted,
-        'price_impact': price_impact,
-        'quote_data': quote_response
-    }
+        # If not found, return default info
+        return {
+            'symbol': f'TOKEN_{token_mint[:6]}',
+            'name': 'Unknown Token',
+            'decimals': 6  # Most SPL tokens use 6 decimals
+        }
+    except Exception as e:
+        logger.warning(f"Could not get token info: {e}")
+        return {
+            'symbol': f'TOKEN_{token_mint[:6]}',
+            'name': 'Unknown Token',
+            'decimals': 6
+        }
 
-async def execute_vault_swap(vault_client, jupiter_client, input_mint, output_mint, amount, input_symbol, output_symbol, swap_number):
-    """Execute an actual swap transaction through the vault"""
-    print(f"\n🔥 Swap {swap_number}: EXECUTING {input_symbol} → {output_symbol} transaction...")
+async def execute_liquidation(vault_client, jupiter_client, token_mint: str, token_info: Dict):
+    """Execute the liquidation of a token to USDC"""
+    print(f"\n🔥 EXECUTING LIQUIDATION: {token_info['symbol']} → USDC")
+    print("=" * 60)
     
-    print(f"  - Input mint: {input_mint}")
-    print(f"  - Output mint: {output_mint}")
-    print(f"  - Amount: {amount:,} lamports")
+    # Track execution time
+    start_time = datetime.utcnow()
     
     try:
-        # Step 1: Get Jupiter quote
-        # Get Jupiter quote - provide vault authority PDA as payer (expected by Jupiter for CPI)
+        # Get vault authority PDA
+        from solders.pubkey import Pubkey
         vault_authority_pda = vault_client._get_vault_authority_pda()
+        token_mint_pubkey = Pubkey.from_string(token_mint)
+        
+        # Get the vault's token account using proper ATA derivation
+        from spl.token.constants import TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
+        
+        # Calculate associated token address
+        token_account_address, _ = Pubkey.find_program_address(
+            [bytes(vault_authority_pda), bytes(TOKEN_PROGRAM_ID), bytes(token_mint_pubkey)],
+            ASSOCIATED_TOKEN_PROGRAM_ID
+        )
+        
+        # Get current token balance
+        try:
+            balance_response = await vault_client.client.get_token_account_balance(token_account_address)
+            token_amount_lamports = int(balance_response.value.amount)
+        except Exception as e:
+            print(f"❌ Failed to get token balance: {e}")
+            print(f"   Token account might not exist or have zero balance")
+            return None
+        
+        # Calculate human-readable balance
+        decimals = token_info['decimals']
+        token_balance_human = token_amount_lamports / (10 ** decimals)
+        
+        print(f"📊 Token Balance:")
+        print(f"  - Token: {token_info['symbol']} ({token_info['name']})")
+        print(f"  - Mint: {token_mint}")
+        print(f"  - Balance: {token_amount_lamports:,} lamports")
+        print(f"  - Balance (human): {token_balance_human:.6f} {token_info['symbol']}")
+        
+        if token_amount_lamports == 0:
+            print(f"❌ No {token_info['symbol']} tokens to liquidate")
+            return None
+        
+        # Get Jupiter quote
+        print(f"\n📈 Getting Jupiter quote...")
+        vault_authority_pda_str = str(vault_authority_pda)
+        
         quote_response = await jupiter_client.get_quote(
-            input_mint=input_mint,
-            output_mint=output_mint,
-            amount=amount,
-            slippage_bps=TEST_CONFIG['slippage_bps'],
-            payer_pubkey=str(vault_authority_pda)  # Vault authority PDA (Jupiter expects this for CPI)
+            input_mint=token_mint,
+            output_mint=USDC_MINT,
+            amount=token_amount_lamports,
+            slippage_bps=300,  # 3% slippage
+            payer_pubkey=vault_authority_pda_str
         )
         
         if not quote_response or 'error' in quote_response:
@@ -125,154 +134,137 @@ async def execute_vault_swap(vault_client, jupiter_client, input_mint, output_mi
         output_amount = int(quote_response.get('outAmount', 0))
         price_impact = float(quote_response.get('priceImpactPct', 0))
         
-        input_formatted = input_amount / 1_000_000
-        output_formatted = output_amount / 1_000_000
+        output_usdc = output_amount / 1_000_000  # USDC has 6 decimals
         
-        print(f"  📊 Quote details:")
-        print(f"    - Input: {input_amount:,} lamports ({input_formatted:.6f} {input_symbol})")
-        print(f"    - Expected output: {output_amount:,} lamports ({output_formatted:.6f} {output_symbol})")
+        print(f"  ✅ Quote received:")
+        print(f"    - Selling: {token_balance_human:.6f} {token_info['symbol']}")
+        print(f"    - Expected USDC: ${output_usdc:,.2f}")
         print(f"    - Price impact: {price_impact:.4f}%")
         
-        # Step 2: Get swap instruction from Jupiter V6 client
-        print(f"  🔧 Getting swap instruction from Jupiter V6...")
+        # Get swap instruction
+        print(f"\n🔧 Building swap transaction...")
         
-        # ✅ CRITICAL FIX: Use vault authority PDA for Jupiter instruction generation
-        # The vault smart contract expects this PDA to be in the Jupiter accounts
-        vault_authority_pda = vault_client._get_vault_authority_pda()
-        print(f"  🔧 Using vault authority PDA (expected by vault): {vault_authority_pda}")
-        
-        # Get swap transaction data using our new Jupiter V6 client
         swap_data = await jupiter_client.get_swap_transaction(
             quote_response=quote_response,
-            payer_pubkey=str(vault_authority_pda),  # Vault authority PDA (what vault expects)
-            slippage_bps=TEST_CONFIG['slippage_bps']
+            payer_pubkey=vault_authority_pda_str,
+            slippage_bps=300
         )
         
         if not swap_data:
-            logger.error("❌ Failed to get swap instruction from Jupiter V6")
+            logger.error("❌ Failed to get swap instruction from Jupiter")
             return None
             
-        print(f"  ✅ Jupiter V6 swap instruction prepared")
-        print(f"    - Program ID: {swap_data.get('program_id')}")
-        print(f"    - Accounts: {len(swap_data.get('accounts', []))}")
-        print(f"    - Instruction data: {len(swap_data.get('instruction_data', ''))} chars")
-        print(f"    - SDK generated: {swap_data.get('sdk_generated')}")
+        print(f"  ✅ Swap instruction prepared")
         
-        # Step 3: Execute the swap through vault using the new interface
-        print(f"  🚀 Executing swap through Calvin vault...")
+        # Execute the swap through vault
+        print(f"\n🚀 Executing swap through Calvin vault...")
         
-        # Use vault client's execute_trade method with the new Jupiter data format
         trade_result = await vault_client.execute_trade(
             jupiter_data=swap_data,
-            source_mint=input_mint,
-            destination_mint=output_mint,
-            amount_usdc=amount / 1_000_000  # Convert from lamports to USDC
+            source_mint=token_mint,
+            destination_mint=USDC_MINT
         )
         
         if not trade_result:
             logger.error(f"❌ Vault trade execution failed")
             return None
         
-        # trade_result is the transaction signature
-        transaction_signature = trade_result
+        print(f"\n🎉 Liquidation executed successfully!")
+        print(f"  - Transaction: {trade_result}")
+        print(f"  - Sold: {token_balance_human:.6f} {token_info['symbol']}")
+        print(f"  - Expected USDC: ${output_usdc:,.2f}")
         
-        print(f"  🎉 Swap executed successfully!")
-        print(f"    - Transaction signature: {transaction_signature}")
-        print(f"    - Expected output: {output_amount:,} lamports ({output_formatted:.6f} {output_symbol})")
-        print(f"    - Note: Use actual output amount from chain for precise calculations")
-        
-        # For now, use expected output amount - in production, query actual amounts from chain
         return {
-            'input_amount': input_amount,
-            'output_amount': output_amount,  # Expected output - would need chain query for actual
-            'input_formatted': input_formatted,
-            'output_formatted': output_formatted,
+            'transaction_signature': trade_result,
+            'token_symbol': token_info['symbol'],
+            'token_amount': token_balance_human,
+            'usdc_amount': output_usdc,
             'price_impact': price_impact,
-            'quote_data': quote_response,
-            'transaction_signature': transaction_signature,
-            'execution_time_ms': swap_data.get('generation_time_ms', 0),
-            'actual_slippage': 0  # Would need chain query to calculate
+            'token_mint': token_mint,
+            'execution_time_ms': int((datetime.utcnow() - start_time).total_seconds() * 1000)
         }
         
     except Exception as e:
-        logger.error(f"❌ Swap execution failed with exception: {e}")
+        logger.error(f"❌ Liquidation failed with exception: {e}")
         import traceback
         traceback.print_exc()
         return None
 
-async def test_vault_swap():
-    """Test the vault swap functionality with a real USDC → Fartcoin swap"""
+async def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(
+        description='Liquidate Calvin Vault tokens to USDC',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python test_vault_swap.py EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm    # Liquidate WIF
+  python test_vault_swap.py 7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr    # Liquidate POPCAT
+  python test_vault_swap.py DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263   # Liquidate BONK
+        """
+    )
+    parser.add_argument('token_mint', help='Token mint address to liquidate')
+    parser.add_argument('--network', choices=['mainnet', 'devnet'], default='mainnet',
+                       help='Network to use (default: mainnet)')
+    parser.add_argument('--skip-confirm', action='store_true',
+                       help='Skip confirmation prompt (use with caution!)')
     
-    print(f"🚀 Calvin Vault Real Swap Test - LIVE EXECUTION")
+    args = parser.parse_args()
+    
+    # Validate token mint address
+    try:
+        from solders.pubkey import Pubkey
+        Pubkey.from_string(args.token_mint)
+    except Exception:
+        print(f"❌ Invalid token mint address: {args.token_mint}")
+        sys.exit(1)
+    
+    print(f"🚀 Calvin Vault Token Liquidation Tool")
     print("=" * 60)
-    
-    print("🔥 WARNING: This will execute REAL transactions on mainnet!")
-    print("💰 Real USDC will be swapped and fees will be paid!")
-    print("⚠️  Using actual vault funds!")
+    print(f"🔥 WARNING: This will execute REAL transactions on {args.network}!")
+    print(f"💰 Real tokens will be sold for USDC!")
     print()
-    
-    print(f"📊 Test Parameters:")
-    print(f"  - Converting ALL {TEST_CONFIG['intermediate_token']} back to {TEST_CONFIG['input_token']}")
-    print(f"  - Slippage: {TEST_CONFIG['slippage_bps']/100}%")
-    print(f"  - Network: {TEST_CONFIG['network']}")
-    print()
-    
-    # Track swap performance
-    swap_stats = {
-        'start_time': datetime.utcnow(),
-        'initial_usdc': TEST_CONFIG['amount_usdc'],
-        'swap_results': None,
-        'total_price_impact': 0
-    }
     
     try:
-        # Step 1: Initialize components
-        print("🔧 Step 1: Initializing components...")
+        # Initialize components
+        print("🔧 Initializing components...")
         
-        # Initialize database manager
+        # Initialize database manager (optional)
+        db_manager = None
         try:
             db_manager = await get_db_manager()
             logger.info("✅ Database manager initialized")
         except Exception as e:
             logger.warning(f"⚠️ Database manager initialization failed: {e}")
-            logger.info("   Continuing without database logging...")
-            db_manager = None
+            logger.info("   Continuing without database...")
         
-        # Initialize vault client with required arguments
+        # Initialize vault client
         from solana.rpc.async_api import AsyncClient
         from solders.keypair import Keypair
-        from solders.pubkey import Pubkey
         import os
         
-        # Get RPC endpoint
         rpc_url = os.getenv('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
         connection = AsyncClient(rpc_url)
         
-        # Get vault program ID
         vault_program_id = os.getenv('CALVIN_VAULT_PROGRAM_ID')
         if not vault_program_id:
             logger.error("❌ CALVIN_VAULT_PROGRAM_ID not set")
             return False
         
-        # Load real vault authority for actual trades
         authority_private_key = os.getenv('CALVIN_AUTHORITY_PRIVATE_KEY')
         if not authority_private_key:
             logger.error("❌ CALVIN_AUTHORITY_PRIVATE_KEY not set")
             return False
             
-        # Handle both JSON array format and base58 string format
+        # Load authority keypair
         try:
             if authority_private_key.strip().startswith('['):
-                # JSON array format (Solana CLI format): [1,2,3,4,...]
                 import ast
                 private_key_bytes = ast.literal_eval(authority_private_key)
                 authority_keypair = Keypair.from_bytes(private_key_bytes)
             else:
-                # Base58 encoded string format
                 authority_keypair = Keypair.from_base58_string(authority_private_key)
             logger.info(f"✅ Using vault authority: {authority_keypair.pubkey()}")
         except Exception as e:
-            # If first attempt fails, try the other format as fallback
             try:
                 if authority_private_key.strip().startswith('['):
                     authority_keypair = Keypair.from_base58_string(authority_private_key)
@@ -282,7 +274,7 @@ async def test_vault_swap():
                     authority_keypair = Keypair.from_bytes(private_key_bytes)
                 logger.info(f"✅ Using vault authority: {authority_keypair.pubkey()}")
             except Exception as e2:
-                logger.error(f"❌ Failed to load keypair. Array error: {e}, Base58 error: {e2}")
+                logger.error(f"❌ Failed to load keypair: {e}, {e2}")
                 return False
         
         # Initialize vault client
@@ -299,230 +291,119 @@ async def test_vault_swap():
         await jupiter_client.initialize()
         logger.info("✅ Jupiter client initialized")
         
-        # Get vault state for debugging
-        vault_state = await vault_client.get_vault_state()
-        print(f"📊 Vault State Debug:")
-        print(f"  - Calvin Authority (expected): {vault_state.get('calvin_authority', 'NOT_SET')}")
-        print(f"  - Our Authority (actual): {vault_client.authority_keypair.pubkey()}")
-        print(f"  - Authorities match: {str(vault_client.authority_keypair.pubkey()) == vault_state.get('calvin_authority', '')}")
+        # Get token info
+        token_info = await get_token_info(db_manager, args.token_mint)
         
-        if str(vault_client.authority_keypair.pubkey()) != vault_state.get('calvin_authority', ''):
-            print("❌ AUTHORITY MISMATCH! This is likely the cause of the 'not enough signers' error")
-            print("   The vault expects a different calvin_authority than what we're providing")
-            return
-        
-        print("✅ Authority verification passed")
-        
-        # Step 2: Check vault state
-        print("\n📊 Step 2: Checking vault state...")
-        vault_state = await vault_client.get_vault_state()
-        
-        if not vault_state:
-            logger.error("❌ Could not fetch vault state")
-            return False
-            
-        total_nav = vault_state.get('total_nav_usdc', 0)
-        available_usdc = vault_state.get('usdc_balance', 0)
-        
-        print(f"  - Total NAV: ${total_nav:,.2f}")
-        print(f"  - Available USDC: ${available_usdc:,.2f}")
-        
-        logger.info(f"✅ Vault state retrieved successfully")
-        
-        # Step 3: Execute reverse swap - FARTCOIN → USDC (testing the complete system)
-        print(f"\n🔄 Step 3: Executing Reverse Swap - FARTCOIN → USDC (Testing Complete System)")
-        print("=" * 40)
-        
-        # Get all FARTCOIN balance to swap back to USDC
-        print(f"  - Swapping: ALL FARTCOIN → USDC")
-        
-        # Get FARTCOIN token account balance
-        from solders.pubkey import Pubkey
-        vault_authority_pda = vault_client._get_vault_authority_pda()
-        fartcoin_mint = Pubkey.from_string(TEST_CONFIG['tokens'][TEST_CONFIG['intermediate_token']])
-        
-        # Get the vault's FARTCOIN token account using proper ATA derivation
-        from spl.token.constants import TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID
-        
-        # Calculate associated token address manually using proper ATA derivation
-        # Note: TOKEN_PROGRAM_ID and ASSOCIATED_TOKEN_PROGRAM_ID are already Pubkey objects from spl.token.constants
-        fartcoin_account_address, _ = Pubkey.find_program_address(
-            [bytes(vault_authority_pda), bytes(TOKEN_PROGRAM_ID), bytes(fartcoin_mint)],
-            ASSOCIATED_TOKEN_PROGRAM_ID
-        )
-        
-        # Get current FARTCOIN balance
-        fartcoin_balance_response = await vault_client.client.get_token_account_balance(fartcoin_account_address)
-        fartcoin_amount_lamports = int(fartcoin_balance_response.value.amount)
-        
-        print(f"  - FARTCOIN balance: {fartcoin_amount_lamports:,} lamports")
-        
-        if fartcoin_amount_lamports == 0:
-            print("❌ No FARTCOIN to swap back to USDC")
-            return False
-        
-        # Swap FARTCOIN → USDC  
-        input_mint = TEST_CONFIG['tokens'][TEST_CONFIG['intermediate_token']]  # FARTCOIN
-        output_mint = TEST_CONFIG['tokens'][TEST_CONFIG['input_token']]        # USDC
-        
-        swap_results = await execute_vault_swap(
-            vault_client, jupiter_client, input_mint, output_mint, fartcoin_amount_lamports,
-            'FARTCOIN', 'USDC', 1
-        )
-        
-        if not swap_results:
-            logger.error("❌ Swap failed")
-            return False
-            
-        swap_stats['swap_results'] = swap_results
-        
-        # Validation for swap
-        if swap_results['price_impact'] > 2.0:
-            logger.warning(f"⚠️ High price impact: {swap_results['price_impact']:.4f}%")
-        
-        print(f"  ✅ Reverse swap executed successfully!")
-        print(f"    - Swapped: {swap_results['input_formatted']:.6f} FARTCOIN")
-        print(f"    - Received: ${swap_results['output_formatted']:.6f} USDC")
-        print(f"    - Price impact: {swap_results['price_impact']:.4f}%")
-        print(f"    - Transaction: {swap_results['transaction_signature']}")
-        
-        # Step 4: Performance analysis
-        print(f"\n📈 Step 4: Performance Analysis")
-        print("=" * 50)
-        
-        swap_stats['total_price_impact'] = swap_results['price_impact']
-        swap_stats['end_time'] = datetime.utcnow()
-        swap_stats['duration_seconds'] = (swap_stats['end_time'] - swap_stats['start_time']).total_seconds()
-        
-        print(f"📊 Reverse Swap Results:")
-        print(f"  - Input: {swap_results['input_formatted']:.6f} FARTCOIN")
-        print(f"  - Output: ${swap_results['output_formatted']:.6f} USDC")
-        print(f"  - Price impact: {swap_stats['total_price_impact']:.4f}%")
-        print(f"  - Execution time: {swap_stats['duration_seconds']:.1f} seconds")
-        print(f"  - Transaction signature: {swap_results['transaction_signature']}")
+        # Show what we're about to do
+        print(f"\n📋 Liquidation Summary:")
+        print(f"  - Token: {token_info['symbol']} ({token_info['name']})")
+        print(f"  - Mint: {args.token_mint}")
+        print(f"  - Action: Sell ALL tokens for USDC")
+        print(f"  - Network: {args.network}")
         print()
         
-        # Step 5: Record results in database
-        print(f"\n💾 Step 5: Recording test results...")
+        # Confirm unless skipped
+        if not args.skip_confirm:
+            response = input("🔥 Continue with liquidation? (yes/no): ")
+            if response.lower() != 'yes':
+                print("   Cancelled.")
+                return
         
-        if db_manager:
-            try:
-                await db_manager.record_health_check(
-                    component='vault_swap_test',
-                    status='healthy',
-                    details={
-                        'test_type': 'jupiter_vault_integration',
-                        'input_amount': swap_results['input_formatted'],
-                        'input_token': TEST_CONFIG['intermediate_token'],
-                        'output_usdc': swap_results['output_formatted'],
-                        'price_impact': swap_stats['total_price_impact'],
-                        'duration_seconds': swap_stats['duration_seconds'],
-                        'transaction_signature': swap_results['transaction_signature'],
-                        'slippage_bps': TEST_CONFIG['slippage_bps'],
-                        'timestamp': datetime.utcnow().isoformat()
-                    }
-                )
-                print(f"  ✅ Test results recorded in database")
-            except Exception as e:
-                logger.warning(f"  ⚠️ Failed to record in database: {e}")
-        else:
-            print(f"  📝 Database not available - results not recorded")
+        # Execute liquidation
+        result = await execute_liquidation(vault_client, jupiter_client, args.token_mint, token_info)
         
-        # Step 6: Validate results
-        print(f"\n✅ Step 6: Test Validation")
-        print("=" * 30)
-        
-        # Define acceptable thresholds
-        max_acceptable_price_impact = 3.0  # 3% max price impact
-        
-        validation_passed = True
-        issues = []
-        
-        if swap_stats['total_price_impact'] > max_acceptable_price_impact:
-            validation_passed = False
-            issues.append(f"High price impact: {swap_stats['total_price_impact']:.4f}% > {max_acceptable_price_impact}%")
+        if result:
+            # Record trade properly in database if available
+            if db_manager:
+                try:
+                    # Get token ID from database
+                    token_info_db = None
+                    for token in db_manager._token_cache.values():
+                        if token.address == result['token_mint']:
+                            token_info_db = token
+                            break
+                    
+                    if token_info_db:
+                        # Calculate price from the liquidation
+                        price_per_token = result['usdc_amount'] / result['token_amount'] if result['token_amount'] > 0 else 0
+                        
+                        # Create trade data matching the database schema
+                        from src.database.production_db import TradeData
+                        
+                        trade_data = TradeData(
+                            token_id=token_info_db.token_id,
+                            trade_type='sell',  # This is a liquidation (sell)
+                            price=price_per_token,
+                            quantity=result['token_amount'],
+                            value_usdc=result['usdc_amount'],
+                            fee_usdc=0.0,  # Could calculate from price impact
+                            tx_hash=result['transaction_signature'],
+                            execution_time=datetime.utcnow(),
+                            slippage_bps=300,  # We used 3% slippage
+                            dex_name='jupiter',
+                            processing_time_ms=result.get('execution_time_ms', 0),
+                            
+                            # Additional fields for vault trades
+                            signal_confidence=100.0,  # Manual liquidation
+                            model_version='manual_liquidation',
+                            signal_strength='MANUAL',
+                            predicted_change_pct=0.0,
+                            cycle_timestamp=datetime.utcnow()
+                        )
+                        
+                        # Record the trade
+                        trade_id = await db_manager.record_trade(trade_data)
+                        print(f"\n✅ Trade recorded in database with ID: {trade_id}")
+                        
+                        # Also record health check for monitoring
+                        await db_manager.record_health_check(
+                            component='vault_liquidation',
+                            status='healthy',
+                            details={
+                                'trade_id': trade_id,
+                                'token_mint': result['token_mint'],
+                                'token_symbol': result['token_symbol'],
+                                'token_amount': result['token_amount'],
+                                'usdc_amount': result['usdc_amount'],
+                                'price_impact': result['price_impact'],
+                                'transaction_signature': result['transaction_signature'],
+                                'timestamp': datetime.utcnow().isoformat()
+                            }
+                        )
+                    else:
+                        logger.warning(f"⚠️ Token not found in database cache, recording health check only")
+                        await db_manager.record_health_check(
+                            component='vault_liquidation',
+                            status='healthy',
+                            details={
+                                'token_mint': result['token_mint'],
+                                'token_symbol': result['token_symbol'],
+                                'token_amount': result['token_amount'],
+                                'usdc_amount': result['usdc_amount'],
+                                'price_impact': result['price_impact'],
+                                'transaction_signature': result['transaction_signature'],
+                                'timestamp': datetime.utcnow().isoformat()
+                            }
+                        )
+                        
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to record in database: {e}")
+                    import traceback
+                    traceback.print_exc()
             
-        if swap_results['output_amount'] == 0:
-            validation_passed = False
-            issues.append("Zero output amount in swap")
-        
-        # Step 7: Final Summary
-        print(f"\n📋 FINAL TEST SUMMARY")
-        print("=" * 60)
-        print(f"✅ Database connection: {'Working' if db_manager else 'Skipped'}")
-        print(f"✅ Vault client: Working") 
-        print(f"✅ Jupiter integration: Working")
-        print(f"✅ Swap execution: Working")
-        print(f"✅ Performance tracking: Working")
-        
-        if validation_passed:
-            print(f"\n🎉 SUCCESS: Vault swap functionality is working correctly!")
-            print(f"   📊 Performance Summary:")
-            print(f"   - Swap executed: {swap_results['input_formatted']:.6f} FARTCOIN → ${swap_results['output_formatted']:.2f} USDC")
-            print(f"   - Price impact: {swap_stats['total_price_impact']:.4f}%")
-            print(f"   - Execution time: {swap_stats['duration_seconds']:.1f}s")
-            print(f"   - Transaction: {swap_results['transaction_signature']}")
+            print(f"\n🎉 LIQUIDATION SUCCESSFUL!")
+            print(f"   - Sold: {result['token_amount']:.6f} {result['token_symbol']}")
+            print(f"   - Received: ${result['usdc_amount']:,.2f} USDC")
+            print(f"   - Transaction: {result['transaction_signature']}")
+            sys.exit(0)
         else:
-            print(f"\n⚠️ CONDITIONAL SUCCESS: System is working, but performance needs optimization")
-            print(f"   Issues found:")
-            for issue in issues:
-                print(f"   - {issue}")
-            print(f"   Consider: reducing trade size or adjusting slippage")
+            print(f"\n❌ Liquidation failed!")
+            sys.exit(1)
             
-        return validation_passed
-        
     except Exception as e:
-        logger.error(f"❌ Swap test failed: {e}")
+        logger.error(f"❌ Fatal error: {e}")
         import traceback
         traceback.print_exc()
-        
-        # Record the failure
-        if db_manager:
-            try:
-                await db_manager.record_health_check(
-                    component='vault_swap_test',
-                    status='error',
-                    details={
-                        'error': str(e),
-                        'test_type': 'jupiter_vault_integration',
-                        'timestamp': datetime.utcnow().isoformat()
-                    }
-                )
-            except:
-                pass  # Don't fail on logging failure
-            
-        return False
-
-async def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description='Test Calvin Vault real swap functionality')
-    parser.add_argument('--amount', type=float, default=10.0,
-                       help='Amount in USDC to swap (default: 10.0)')
-    parser.add_argument('--network', choices=['mainnet', 'devnet'], default='mainnet',
-                       help='Network to use (default: mainnet)')
-    
-    args = parser.parse_args()
-    
-    # Update config based on args
-    TEST_CONFIG['amount_usdc'] = args.amount
-    TEST_CONFIG['network'] = args.network
-    
-    print("🔥 WARNING: Real transaction mode!")
-    print("   This will execute actual swaps with real vault funds!")
-    print(f"   Trading ALL FARTCOIN back to USDC")
-    print(f"   Expected cost: Variable slippage and fees based on FARTCOIN balance")
-    response = input("   Continue with real execution? (yes/no): ")
-    if response.lower() != 'yes':
-        print("   Cancelled.")
-        return
-    
-    success = await test_vault_swap()
-    
-    if success:
-        print(f"\n🎉 Vault swap test completed successfully!")
-        sys.exit(0)
-    else:
-        print(f"\n❌ Vault swap test failed!")
         sys.exit(1)
 
 if __name__ == "__main__":

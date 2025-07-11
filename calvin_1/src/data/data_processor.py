@@ -2036,21 +2036,31 @@ class DataProcessor:
             feature_names = feature_cols.copy()
             logger.info(f"Returning {len(feature_names)} feature names: {feature_names[:10]}...")
         
-        # Fit scalers based on mode
+        # Fit scalers based on mode (but only if not already loaded)
+        scalers_already_loaded = hasattr(self, '_scalers_loaded') and self._scalers_loaded
+        
         if test_mode:
-            # In test mode: fit scalers on ALL data (no train/test split for scalers)
-            logger.info("Test mode: fitting scalers on entire dataset")
-            self.feature_scaler.fit(df[feature_cols].values)
-            self.price_scaler.fit(df['target'].values.reshape(-1, 1))
+            if scalers_already_loaded:
+                # In test mode with loaded scalers: skip fitting, use loaded scalers
+                logger.info("Test mode: using pre-loaded scalers (skipping fit)")
+            else:
+                # In test mode without loaded scalers: fit scalers on ALL data
+                logger.info("Test mode: fitting scalers on entire dataset")
+                self.feature_scaler.fit(df[feature_cols].values)
+                self.price_scaler.fit(df['target'].values.reshape(-1, 1))
         else:
-            # Normal training mode: fit scalers on training slice only
-            train_cutoff = int(len(df) * (1 - test_size))
-            self.feature_scaler.fit(
-                df.iloc[:train_cutoff][feature_cols].values
-            )
-            self.price_scaler.fit(
-                df.iloc[:train_cutoff]['target'].values.reshape(-1, 1)
-            )
+            if scalers_already_loaded:
+                # In training mode with loaded scalers: skip fitting, use loaded scalers
+                logger.info("Training mode: using pre-loaded scalers (skipping fit)")
+            else:
+                # Normal training mode: fit scalers on training slice only
+                train_cutoff = int(len(df) * (1 - test_size))
+                self.feature_scaler.fit(
+                    df.iloc[:train_cutoff][feature_cols].values
+                )
+                self.price_scaler.fit(
+                    df.iloc[:train_cutoff]['target'].values.reshape(-1, 1)
+                )
 
         features = self.feature_scaler.transform(df[feature_cols].values)
         targets  = self.price_scaler.transform(
@@ -2405,7 +2415,19 @@ class DataProcessor:
         df = self.add_volume_profile_features(df)
         
         # Add intermarket correlation features (BTC/ETH)
-        df = self.add_intermarket_correlation_features(df, symbol)
+        # Since this method is now async, we need to handle it in the sync context
+        try:
+            # Try to get the current event loop
+            loop = asyncio.get_running_loop()
+            # If we're in an async context, we can't use asyncio.run
+            # Create a task and run it
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, self.add_intermarket_correlation_features(df, symbol))
+                df = future.result()
+        except RuntimeError:
+            # No event loop running, we can use asyncio.run directly
+            df = asyncio.run(self.add_intermarket_correlation_features(df, symbol))
         
         # Include sentiment data if requested
         if include_sentiment:
@@ -3456,8 +3478,9 @@ class DataProcessor:
         logger.info(f"Added {len(vol_profile_cols) + 1} volume profile features")
         return result
     
-    def add_intermarket_correlation_features(self, df: pd.DataFrame, symbol: str = None, 
-                                            correlation_windows: list = [24, 48, 168]) -> pd.DataFrame:
+    async def add_intermarket_correlation_features(self, df: pd.DataFrame, symbol: str = None, 
+                                            correlation_windows: list = [24, 48, 168],
+                                            db_manager: Optional['ProductionDBManager'] = None) -> pd.DataFrame:
         """
         Fix #25: Add BTC and ETH correlation features for better market context
         
@@ -3492,21 +3515,26 @@ class DataProcessor:
             
             # Fetch BTC and ETH data
             async def fetch_market_data():
-                db_manager = await get_db_manager()
+                # Use the provided db_manager or get the singleton
+                if db_manager is None:
+                    from ..database.production_db import get_db_manager
+                    db_mgr = await get_db_manager()
+                else:
+                    db_mgr = db_manager
                 
                 # Get token IDs for BTC and ETH (these should be in your database)
                 # You'll need to adjust these based on your actual token IDs
-                btc_token_id = 59  # WBTC (Wrapped BTC on Solana)
-                eth_token_id = 60  # WETH (Wrapped Ether on Solana)
+                btc_token_id = 21  # WBTC (Wrapped BTC on Solana)
+                eth_token_id = 22  # WETH (Wrapped Ether on Solana)
                 
-                btc_data = await db_manager.get_ohlcv_data(
+                btc_data = await db_mgr.get_ohlcv_data(
                     token_id=btc_token_id,
                     resolution='1H',
                     start_time=start_time,
                     end_time=end_time
                 )
                 
-                eth_data = await db_manager.get_ohlcv_data(
+                eth_data = await db_mgr.get_ohlcv_data(
                     token_id=eth_token_id,
                     resolution='1H',
                     start_time=start_time,
@@ -3515,18 +3543,8 @@ class DataProcessor:
                 
                 return btc_data, eth_data
             
-            # Run async fetch - handle existing event loop
-            try:
-                # Check if we're already in an event loop
-                loop = asyncio.get_running_loop()
-                # If we're in an event loop, we need to run in a thread
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, fetch_market_data())
-                    btc_data, eth_data = future.result()
-            except RuntimeError:
-                # No event loop running, safe to use asyncio.run
-                btc_data, eth_data = asyncio.run(fetch_market_data())
+            # Since we're now in an async function, we can await directly
+            btc_data, eth_data = await fetch_market_data()
             
             if not btc_data or not eth_data:
                 logger.warning("Could not fetch BTC/ETH data for correlation features")
@@ -3888,7 +3906,7 @@ class DataProcessor:
             df = self.add_volume_profile_features(df)
             
             # Add intermarket correlation features (BTC/ETH)
-            df = self.add_intermarket_correlation_features(df, symbol)
+            df = await self.add_intermarket_correlation_features(df, symbol, db_manager=db_manager)
             
             # 4. Add social data if symbol provided
             if symbol:
@@ -3952,24 +3970,64 @@ class DataProcessor:
         
         scalers_dir = os.path.join(self.data_dir, "scalers")
         
-        # Load price scaler
-        price_scaler_path = os.path.join(scalers_dir, f"{symbol}_{model_version}_price_scaler.pkl")
-        if os.path.exists(price_scaler_path):
-            with open(price_scaler_path, 'rb') as f:
-                self.price_scaler = pickle.load(f)
-            logger.info(f"Loaded price scaler from {price_scaler_path}")
-        else:
-            logger.warning(f"Price scaler not found at {price_scaler_path}")
+        # Try different file naming patterns to handle the double symbol issue
+        # Pattern 1: {symbol}_{symbol}_lstm_improved_{version}_{timestamp}_*_scaler.pkl (most common)
+        # Pattern 2: {symbol}_{model_version}_*_scaler.pkl (original pattern)
+        
+        price_scaler_loaded = False
+        feature_scaler_loaded = False
+        
+        # Try to find price scaler with glob pattern
+        import glob
+        
+        # First try the double symbol pattern (most common in the directory)
+        price_patterns = [
+            # NEW: Direct semantic version pattern (most accurate)
+            os.path.join(scalers_dir, f"{symbol}_{symbol}_lstm_improved_{model_version}_*_price_scaler.pkl"),
+            # Existing patterns for backward compatibility
+            os.path.join(scalers_dir, f"{symbol}_{symbol}_lstm_improved_*_{model_version}_price_scaler.pkl"),
+            os.path.join(scalers_dir, f"{symbol}_lstm_improved_*_{model_version}_price_scaler.pkl"),
+            os.path.join(scalers_dir, f"{symbol}_{model_version}_price_scaler.pkl")
+        ]
+        
+        for pattern in price_patterns:
+            matches = glob.glob(pattern)
+            if matches:
+                # Use the most recent file if multiple matches
+                price_scaler_path = sorted(matches)[-1]
+                with open(price_scaler_path, 'rb') as f:
+                    self.price_scaler = pickle.load(f)
+                logger.info(f"Loaded price scaler from {price_scaler_path}")
+                price_scaler_loaded = True
+                break
+        
+        if not price_scaler_loaded:
+            logger.warning(f"Price scaler not found for {symbol} with model version {model_version}")
             return False
         
-        # Load feature scaler
-        feature_scaler_path = os.path.join(scalers_dir, f"{symbol}_{model_version}_feature_scaler.pkl")
-        if os.path.exists(feature_scaler_path):
-            with open(feature_scaler_path, 'rb') as f:
-                self.feature_scaler = pickle.load(f)
-            logger.info(f"Loaded feature scaler from {feature_scaler_path}")
-        else:
-            logger.warning(f"Feature scaler not found at {feature_scaler_path}")
+        # Try to find feature scaler with glob pattern
+        feature_patterns = [
+            # NEW: Direct semantic version pattern (most accurate)
+            os.path.join(scalers_dir, f"{symbol}_{symbol}_lstm_improved_{model_version}_*_feature_scaler.pkl"),
+            # Existing patterns for backward compatibility
+            os.path.join(scalers_dir, f"{symbol}_{symbol}_lstm_improved_*_{model_version}_feature_scaler.pkl"),
+            os.path.join(scalers_dir, f"{symbol}_lstm_improved_*_{model_version}_feature_scaler.pkl"),
+            os.path.join(scalers_dir, f"{symbol}_{model_version}_feature_scaler.pkl")
+        ]
+        
+        for pattern in feature_patterns:
+            matches = glob.glob(pattern)
+            if matches:
+                # Use the most recent file if multiple matches
+                feature_scaler_path = sorted(matches)[-1]
+                with open(feature_scaler_path, 'rb') as f:
+                    self.feature_scaler = pickle.load(f)
+                logger.info(f"Loaded feature scaler from {feature_scaler_path}")
+                feature_scaler_loaded = True
+                break
+        
+        if not feature_scaler_loaded:
+            logger.warning(f"Feature scaler not found for {symbol} with model version {model_version}")
             return False
         
         return True

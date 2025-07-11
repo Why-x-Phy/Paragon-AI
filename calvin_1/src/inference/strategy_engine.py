@@ -470,7 +470,8 @@ class SimpleStrategyEngine:
             data_processor = DataProcessor()
             
             # Try to load scalers for this specific model
-            model_version = metadata.version
+            # CRITICAL FIX: Use semantic version instead of date version for scaler loading
+            model_version = metadata.semantic_version or metadata.version  # Prefer semantic version, fallback to date version
             if data_processor.load_scalers(symbol, model_version):
                 logger.info(f"Loaded scalers for {symbol} model {model_version}")
                 data_processor._scalers_loaded = True

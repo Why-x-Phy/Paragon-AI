@@ -1120,7 +1120,10 @@ class HourlyInferenceScheduler:
             
             if not portfolio_signals:
                 self.logger.info("📊 No portfolio signals generated")
-                await self._record_vault_trading_cycle(None, [], "no_signals", cycle_start_time, None, timing_data)
+                # Get NAV even when no signals
+                portfolio_nav, available_cash_usdc = await self._get_available_cash_from_vault()
+                await self._record_vault_trading_cycle(None, [], "no_signals", cycle_start_time, None, timing_data, 
+                                                      portfolio_nav=portfolio_nav, available_cash_usdc=available_cash_usdc)
                 return
             
             # 3. Signal processing and risk analysis - WITH TIMING
@@ -1129,34 +1132,44 @@ class HourlyInferenceScheduler:
             # Calculate correlation risk
             correlation_risk = await self._calculate_correlation_risk(portfolio_signals)
             
-            # Get available cash from vault state
-            available_cash_usdc = await self._get_available_cash_from_vault()
+            # Get NAV and available cash from vault state
+            portfolio_nav, available_cash_usdc = await self._get_available_cash_from_vault()
             
             timing_data['signal_processing_duration_ms'] = int((datetime.utcnow() - timing_data['signal_processing_start']).total_seconds() * 1000)
             
             self.logger.info(f"📈 Portfolio signals generated: {len(portfolio_signals.buy_signals)} buy, {len(portfolio_signals.sell_signals)} sell")
             self.logger.info(f"🔍 Risk analysis: correlation_risk={correlation_risk:.1f}%, available_cash=${available_cash_usdc:,.2f}")
             
-            # 4. Execute vault trades (NEW FUNCTIONALITY) - WITH TIMING
+            # 4. Execute vault trades - FIXED: Handle both BUY and SELL signals
             trade_results = []
-            if portfolio_signals.buy_signals:
+            total_signals = len(portfolio_signals.buy_signals) + len(portfolio_signals.sell_signals)
+            
+            if total_signals > 0:
                 timing_data['trade_execution_start'] = datetime.utcnow()
-                self.logger.info("💰 Executing vault trades...")
+                self.logger.info(f"💰 Executing vault trades ({len(portfolio_signals.buy_signals)} buy, {len(portfolio_signals.sell_signals)} sell)...")
                 
                 try:
                     from ..vault.trade_executor import VaultTradeExecutor
+                    from ..vault.trade_executor_fix import create_thread_safe_executor
+                    
                     executor = VaultTradeExecutor()
                     await executor.initialize()
                     
-                    trade_results = await executor.execute_portfolio_trades(portfolio_signals)
+                    # Wrap with thread-safe executor to handle event loop conflicts
+                    safe_executor = create_thread_safe_executor(executor)
+                    
+                    trade_results = await safe_executor.execute_portfolio_trades(portfolio_signals)
                     timing_data['trade_execution_duration_ms'] = int((datetime.utcnow() - timing_data['trade_execution_start']).total_seconds() * 1000)
                     
                     self.logger.info(f"✅ Executed {len(trade_results)} vault trades (execution: {timing_data['trade_execution_duration_ms']}ms)")
                     if trade_results:
                         self.logger.info(f"🔗 Trade signatures: {trade_results[:3]}{'...' if len(trade_results) > 3 else ''}")
+                    
+                    # Clean up thread-safe executor
+                    await safe_executor.cleanup()
                         
                 except ImportError:
-                    self.logger.warning("⚠️ VaultTradeExecutor not available - running in data-only mode")
+                    self.logger.warning("⚠️ VaultTradeExecutor not available, skipping trade execution")
                     trade_results = []
                     timing_data['trade_execution_duration_ms'] = 0
                 except Exception as e:
@@ -1164,14 +1177,14 @@ class HourlyInferenceScheduler:
                     trade_results = []
                     timing_data['trade_execution_duration_ms'] = int((datetime.utcnow() - timing_data['trade_execution_start']).total_seconds() * 1000) if timing_data['trade_execution_start'] else 0
             else:
-                self.logger.info("📊 No buy signals to execute")
+                self.logger.info("📊 No buy or sell signals to execute")
                 timing_data['trade_execution_duration_ms'] = 0
             
             # 5. Record successful trading cycle in database with enhanced metrics
             try:
                 await self._record_vault_trading_cycle(
                     portfolio_signals, trade_results, "completed", cycle_start_time, None, timing_data, 
-                    correlation_risk, available_cash_usdc
+                    correlation_risk, portfolio_nav, available_cash_usdc
                 )
             except Exception as db_error:
                 self.logger.warning(f"⚠️ Failed to record trading cycle (non-critical): {db_error}")
@@ -1191,7 +1204,8 @@ class HourlyInferenceScheduler:
             
             # 🚨 DISABLED: Health check recording to prevent database connection spam
             # await self._record_health_check('trading_cycle', 'error', {'error': str(e)})
-            await self._record_vault_trading_cycle(None, [], "error", cycle_start_time, str(e), timing_data)
+            await self._record_vault_trading_cycle(None, [], "error", cycle_start_time, str(e), timing_data, 
+                                                  portfolio_nav=None, available_cash_usdc=None)
         finally:
             # Restore original database manager if we created a new one
             if created_new_manager:
@@ -1253,80 +1267,96 @@ class HourlyInferenceScheduler:
             self.logger.error(f"Failed to calculate correlation risk: {e}")
             return 50.0  # Default moderate risk if calculation fails
 
-    async def _get_available_cash_from_vault(self) -> float:
-        """
-        Get available cash (USDC) from vault state
-        
-        Returns:
-            Available cash in USDC
-        """
+    async def _get_available_cash_from_vault(self):
+        """Get available cash (USDC balance) and NAV from vault state"""
         try:
-            # Import vault client here to avoid circular imports
+            # Import vault client classes
             from ..vault.vault_client import VaultClient
-            from solana.rpc.async_api import AsyncClient
-            from solders.keypair import Keypair
+            
+            # Create vault client with proper authority
             import os
             import json
             
-            # Create and initialize vault client with proper parameters
+            # Get RPC URL and program ID from environment
             rpc_url = os.getenv('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
             vault_program_id = os.getenv('VAULT_PROGRAM_ID', 'tXMJu1KaBQU5DSk94QXMtigQpzxbK62WJVUs2Xmxz7z')
             
             # Load authority keypair
+            from ..config.config import config
             authority_key_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'onchain', 'calvin-ai-authority.json')
-            with open(authority_key_path, 'r') as f:
-                authority_key_data = json.load(f)
-            authority_keypair = Keypair.from_bytes(authority_key_data)
             
-            # Create connection and vault client
+            if os.path.exists(authority_key_path):
+                with open(authority_key_path, 'r') as f:
+                    authority_key_data = json.load(f)
+                from solders.keypair import Keypair
+                authority_keypair = Keypair.from_bytes(authority_key_data)
+            else:
+                self.logger.warning("Authority keypair not found, using dummy keypair for read-only access")
+                from solders.keypair import Keypair
+                authority_keypair = Keypair()
+            
+            # Create vault client
+            from solana.rpc.async_api import AsyncClient
             connection = AsyncClient(rpc_url)
             vault_client = VaultClient(
-                vault_program=vault_program_id,
+                wallet=None,  # Not needed for read operations
                 connection=connection,
+                vault_program=vault_program_id,
                 authority_keypair=authority_keypair
             )
+            
+            # Initialize vault client
             await vault_client.initialize()
             
             # Get vault state
             vault_state = await vault_client.get_vault_state()
             
-            # Extract available cash (total USDC in vault)
-            available_cash = vault_state.get('total_usdc', 0.0)
+            # Extract NAV and USDC balance separately
+            nav_usdc = vault_state.get('total_nav_usdc', 0.0)
+            usdc_balance = vault_state.get('usdc_balance', 0.0)
+            
+            # If NAV is 0, try alternative field names
+            if nav_usdc == 0:
+                nav_usdc = vault_state.get('total_value_locked_usdc', 0.0)
+            
+            # Convert from lamports if needed (USDC has 6 decimals)
+            if nav_usdc > 1e9:
+                nav_usdc = nav_usdc / 1e6
+            if usdc_balance > 1e9:
+                usdc_balance = usdc_balance / 1e6
             
             # Close vault client connection
             await vault_client.close()
             
-            self.logger.debug(f"Retrieved available cash from vault: ${available_cash:,.2f}")
-            return available_cash
+            self.logger.debug(f"Retrieved vault state - NAV: ${nav_usdc:,.2f}, USDC Balance: ${usdc_balance:,.2f}")
+            return nav_usdc, usdc_balance
             
         except Exception as e:
-            self.logger.error(f"Failed to get available cash from vault: {e}")
+            self.logger.error(f"Failed to get vault state: {e}")
             
-            # Fallback: try to get from database (last known portfolio value)
+            # Fallback: try to get from database
             try:
                 if self.db_manager:
                     latest_cycle = await self.db_manager.get_latest_portfolio_cycle()
-                    if latest_cycle and latest_cycle.get('available_cash_usdc'):
-                        fallback_cash = float(latest_cycle['available_cash_usdc'])
-                        self.logger.info(f"Using last known available cash from database: ${fallback_cash:,.2f}")
-                        return fallback_cash
-                    elif latest_cycle and latest_cycle.get('total_portfolio_value_usdc'):
-                        # Estimate available cash as 20% of total portfolio value
-                        estimated_cash = float(latest_cycle['total_portfolio_value_usdc']) * 0.2
-                        self.logger.warning(f"Estimating available cash as 20% of portfolio: ${estimated_cash:,.2f}")
-                        return estimated_cash
+                    if latest_cycle:
+                        nav = float(latest_cycle.get('available_cash_usdc', 100000.0))  # This was storing NAV
+                        # Estimate USDC as 20% of NAV for fallback
+                        usdc = nav * 0.2
+                        self.logger.info(f"Using last known values from database - NAV: ${nav:,.2f}, Est. USDC: ${usdc:,.2f}")
+                        return nav, usdc
             except Exception as db_error:
                 self.logger.error(f"Database fallback also failed: {db_error}")
             
             # Final fallback: use environment variable
             from ..config.config import config
-            fallback_cash = float(getattr(config, 'PORTFOLIO_VALUE_USDC', 100000.0)) * 0.2
-            self.logger.warning(f"Using environment fallback for available cash: ${fallback_cash:,.2f}")
-            return fallback_cash
+            fallback_nav = float(getattr(config, 'PORTFOLIO_VALUE_USDC', 100000.0))
+            fallback_usdc = fallback_nav * 0.2
+            self.logger.warning(f"Using environment fallback - NAV: ${fallback_nav:,.2f}, Est. USDC: ${fallback_usdc:,.2f}")
+            return fallback_nav, fallback_usdc
 
     async def _record_vault_trading_cycle(self, signals, results: List[str], status: str, 
                                         cycle_start: datetime, error: str = None, timing_data: Dict[str, Any] = None, 
-                                        correlation_risk: float = None, available_cash_usdc: float = None):
+                                        correlation_risk: float = None, portfolio_nav: float = None, available_cash_usdc: float = None):
         """
         Record trading cycle results in TimescaleDB using enhanced portfolio_cycles table
         
@@ -1338,7 +1368,8 @@ class HourlyInferenceScheduler:
             error: Error message if status is 'error'
             timing_data: Dictionary containing timing data for the cycle
             correlation_risk: Correlation risk for the cycle
-            available_cash_usdc: Available cash from vault state
+            portfolio_nav: Total portfolio NAV from vault state
+            available_cash_usdc: Available cash (USDC balance) from vault state
         """
         try:
             # Create PortfolioCycleData object for database recording
@@ -1348,13 +1379,13 @@ class HourlyInferenceScheduler:
             
             # Extract portfolio metrics from signals if available
             portfolio_risk_score = None
-            portfolio_value = None
+            portfolio_value = portfolio_nav  # Use the NAV from vault state
             diversification_score = None
             max_position_pct = None
             
             if signals:
                 portfolio_risk_score = getattr(signals, 'portfolio_risk_score', None)
-                portfolio_value = getattr(signals, 'portfolio_value', None)
+                # portfolio_value is now set from portfolio_nav parameter
                 
                 # Calculate diversification metrics from asset allocations
                 if hasattr(signals, 'asset_allocations') and signals.asset_allocations:
@@ -1609,7 +1640,8 @@ class HourlyInferenceScheduler:
                 self.logger.error("❌ OHLCV data fetch failed - aborting trading cycle")
                 await self._record_vault_trading_cycle(
                     signals=None, results=[], status='failed', 
-                    cycle_start=cycle_start, error='OHLCV data fetch failed'
+                    cycle_start=cycle_start, error='OHLCV data fetch failed',
+                    portfolio_nav=None, available_cash_usdc=None
                 )
                 return
             
@@ -1811,16 +1843,72 @@ class HourlyInferenceScheduler:
             self.logger.error(f"Trading cycle wrapper error: {e}")
 
     async def start_async(self):
-        """Async version of start_scheduler for integration"""
-        self.logger.info("🔄 Starting scheduler async...")
+        """Start the scheduler with async initialization"""
         try:
-            self.logger.info("🔄 About to call initialize()...")
+            # Initialize first
             await self.initialize()
-            self.logger.info("🔄 Initialization complete, starting scheduler...")
+            
+            # 🆕 Initialize vault client and position manager for position sync
+            self.logger.info("🔄 Initializing vault client and position manager...")
+            try:
+                from ..vault.vault_client import VaultClient
+                from ..trading.position_manager import PositionManager
+                from ..trading.position_sync import auto_sync_on_startup
+                from solana.rpc.async_api import AsyncClient
+                from solders.keypair import Keypair
+                import json
+                
+                # Get vault configuration
+                rpc_url = os.getenv('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
+                vault_program_id = os.getenv('VAULT_PROGRAM_ID', 'tXMJu1KaBQU5DSk94QXMtigQpzxbK62WJVUs2Xmxz7z')
+                
+                # Load authority keypair
+                authority_key_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'onchain', 'calvin-ai-authority.json')
+                if os.path.exists(authority_key_path):
+                    with open(authority_key_path, 'r') as f:
+                        authority_key_data = json.load(f)
+                    authority_keypair = Keypair.from_bytes(authority_key_data)
+                else:
+                    self.logger.warning("Authority keypair not found, skipping position sync")
+                    authority_keypair = None
+                
+                if authority_keypair:
+                    # Create connection and vault client
+                    connection = AsyncClient(rpc_url)
+                    vault_client = VaultClient(
+                        vault_program=vault_program_id,
+                        connection=connection,
+                        authority_keypair=authority_keypair
+                    )
+                    await vault_client.initialize()
+                    
+                    # Initialize position manager
+                    position_manager = PositionManager(
+                        db_manager=self.db_manager,
+                        realtime_storage=None
+                    )
+                    await position_manager.initialize()
+                    
+                    # Perform auto-sync on startup
+                    self.logger.info("🔄 Syncing vault positions to position manager...")
+                    await auto_sync_on_startup(vault_client, position_manager)
+                    self.logger.info("✅ Vault positions synced successfully")
+                    
+                    # Clean up
+                    await vault_client.close()
+                    await position_manager.close()
+                else:
+                    self.logger.warning("⚠️ Authority keypair not available, position sync skipped")
+                    
+            except Exception as e:
+                self.logger.warning(f"⚠️ Failed to sync vault positions on startup: {e}")
+                # Continue execution even if sync fails
+            
+            # Start the scheduler
             self.start_scheduler()
-            self.logger.info("✅ Scheduler start_async complete")
+            
         except Exception as e:
-            self.logger.error(f"❌ Scheduler start_async failed: {e}")
+            self.logger.error(f"Failed to start scheduler: {e}")
             raise
 
     async def stop_async(self):

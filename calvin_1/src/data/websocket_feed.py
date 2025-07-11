@@ -198,22 +198,52 @@ class BirdEyeWebSocketFeed:
 
     async def stop(self):
         """Stop the WebSocket connection"""
-        self.logger.info("Stopping BirdEye WebSocket price feed...")
+        self.logger.info(f"[{self.feed_name}] Stopping BirdEye WebSocket feed...")
         
-        # Cancel tasks
-        if self.processing_task:
+        # Set state to disconnected first to prevent reconnection attempts
+        self._set_connection_state(ConnectionState.DISCONNECTED)
+        
+        # Cancel tasks first
+        tasks_to_cancel = []
+        if self.processing_task and not self.processing_task.done():
+            tasks_to_cancel.append(self.processing_task)
             self.processing_task.cancel()
-        if self.heartbeat_task:
+            
+        if self.heartbeat_task and not self.heartbeat_task.done():
+            tasks_to_cancel.append(self.heartbeat_task)
             self.heartbeat_task.cancel()
         
-        # Close connection
-        if self.ws_connection and not self.ws_connection.closed:
-            await self.ws_connection.close()
+        # Wait for tasks to complete cancellation
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
         
-        if self.session and not self.session.closed:
-            await self.session.close()
+        # Close WebSocket connection
+        if self.ws_connection:
+            try:
+                if not self.ws_connection.closed:
+                    await self.ws_connection.close()
+                    self.logger.info(f"[{self.feed_name}] WebSocket connection closed")
+            except Exception as e:
+                self.logger.error(f"[{self.feed_name}] Error closing WebSocket: {e}")
         
-        self._set_connection_state(ConnectionState.DISCONNECTED)
+        # Close aiohttp session
+        if self.session:
+            try:
+                if not self.session.closed:
+                    await self.session.close()
+                    # Wait a bit for the session to fully close
+                    await asyncio.sleep(0.1)
+                    self.logger.info(f"[{self.feed_name}] HTTP session closed")
+            except Exception as e:
+                self.logger.error(f"[{self.feed_name}] Error closing session: {e}")
+        
+        # Clear references
+        self.ws_connection = None
+        self.session = None
+        self.processing_task = None
+        self.heartbeat_task = None
+        
+        self.logger.info(f"[{self.feed_name}] WebSocket feed stopped completely")
 
     async def subscribe_price(self, subscription: PriceSubscription) -> bool:
         """Subscribe to price updates"""
@@ -1375,16 +1405,33 @@ class DualWebSocketFeedManager:
 
     async def _database_writer_loop(self):
         """Background task to periodically write queued data to database"""
+        self.logger.info("📝 Database writer loop started")
+        loop_count = 0
+        
         while True:
             try:
                 await asyncio.sleep(self.batch_write_interval)  # Use the configurable interval
+                loop_count += 1
                 
-                # Write OHLCV data
-                if len(self.ohlcv_write_queue) >= self.min_batch_size:  # Write when we have enough items
+                # Log queue status every 10 loops (every 150 seconds with 15s interval)
+                if loop_count % 10 == 0:
+                    self.logger.info(f"📊 Database writer status - OHLCV queue: {len(self.ohlcv_write_queue)}/{self.min_batch_size}, "
+                                   f"Market events queue: {len(self.market_events_queue)}/{self.min_batch_size}")
+                
+                # Write OHLCV data - also write if we have ANY data after timeout
+                if len(self.ohlcv_write_queue) >= self.min_batch_size:
+                    self.logger.info(f"📝 Writing OHLCV batch (queue size: {len(self.ohlcv_write_queue)})")
+                    await self._write_ohlcv_batch()
+                elif len(self.ohlcv_write_queue) > 0 and loop_count % 4 == 0:  # Force write every minute (4 * 15s)
+                    self.logger.info(f"⏱️ Force writing OHLCV data after timeout (queue size: {len(self.ohlcv_write_queue)})")
                     await self._write_ohlcv_batch()
                 
-                # Write market events
-                if len(self.market_events_queue) >= self.min_batch_size:  # Write when we have enough items
+                # Write market events - also write if we have ANY data after timeout
+                if len(self.market_events_queue) >= self.min_batch_size:
+                    self.logger.info(f"📝 Writing market events batch (queue size: {len(self.market_events_queue)})")
+                    await self._write_market_events_batch()
+                elif len(self.market_events_queue) > 0 and loop_count % 4 == 0:  # Force write every minute
+                    self.logger.info(f"⏱️ Force writing market events after timeout (queue size: {len(self.market_events_queue)})")
                     await self._write_market_events_batch()
                     
             except Exception as e:
@@ -1449,7 +1496,7 @@ class DualWebSocketFeedManager:
                     """, insert_data)
                     
                     self.stats['database_writes_executed'] += 1
-                    self.logger.debug(f"📊 Wrote {len(insert_data)} OHLCV records to database")
+                    self.logger.info(f"📊 Wrote {len(insert_data)} OHLCV records to database")
                 
         except Exception as e:
             self.logger.error(f"❌ Failed to write OHLCV batch: {e}")
@@ -1511,7 +1558,7 @@ class DualWebSocketFeedManager:
                     await conn.executemany(query, insert_data)
                     
                     self.stats['database_writes_executed'] += 1
-                    self.logger.debug(f"💱 Wrote {len(insert_data)} market events to database")
+                    self.logger.info(f"💱 Wrote {len(insert_data)} market events to database")
                 
         except Exception as e:
             self.logger.error(f"❌ Failed to write market events batch: {e}")

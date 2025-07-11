@@ -60,7 +60,7 @@ class PortfolioConfig:
     min_cash_reserve_pct: float = 20.0  # Min cash reserve
     
     # Position sizing based on signal strength (percentage of portfolio value)
-    base_position_size_pct: float = 5.0  # Base position size for weak signals
+    base_position_size_pct: float = 3.0  # Base position size for weak signals
     strong_signal_multiplier: float = 1.5  # Additional % for strong signals
     moderate_signal_multiplier: float = 1.2  # Additional % for moderate signals
     weak_signal_multiplier: float = 0.8  # Additional % for weak signals
@@ -481,14 +481,25 @@ class PortfolioCoordinator:
                 valid_signals, portfolio_state, risk_assessment
             )
             
+            # Filter sell signals to only include tokens we actually hold
+            open_positions = portfolio_state.get('open_positions', {})
+            filtered_sell_signals = []
+            for signal in valid_signals:
+                if signal.signal_type == SignalType.SELL:
+                    if signal.symbol in open_positions:
+                        filtered_sell_signals.append(signal)
+                        logger.debug(f"✅ Including SELL signal for {signal.symbol} - we hold this position")
+                    else:
+                        logger.debug(f"🚫 Filtering out SELL signal for {signal.symbol} - no position held")
+            
             # 6. Create portfolio signal
             portfolio_signal = PortfolioSignal(
                 timestamp=datetime.now(),
                 total_cash_available=portfolio_state['cash_balance'],
                 portfolio_value=portfolio_state['portfolio_value'],
-                current_exposure_pct=portfolio_state['exposure_pct'],
+                current_exposure_pct=portfolio_state['exposure_percentage'],
                 buy_signals=[s for s in valid_signals if s.signal_type == SignalType.BUY],
-                sell_signals=[s for s in valid_signals if s.signal_type == SignalType.SELL],
+                sell_signals=filtered_sell_signals,  # Only sell signals for tokens we hold
                 asset_allocations=asset_allocations,
                 cash_allocation_pct=self._calculate_target_cash_allocation(asset_allocations),
                 portfolio_risk_score=risk_assessment['portfolio_risk'],
@@ -526,27 +537,51 @@ class PortfolioCoordinator:
             # Get current positions from position manager
             open_positions = self.position_manager.get_active_positions()
             
-            # Calculate position metrics
-            total_position_value = sum(pos.current_value for pos in open_positions.values())
+            # Calculate position metrics by getting current prices
+            total_position_value = 0.0
+            open_positions_by_symbol = {}
+            
+            for pos_id, position in open_positions.items():
+                # Get current price for the position
+                current_price = await self.db_manager.get_latest_price(position.token_id)
+                if current_price:
+                    position_value = position.entry_quantity * current_price
+                    total_position_value += position_value
+                else:
+                    # If no current price, use entry value as fallback
+                    position_value = position.entry_value_usdc
+                    total_position_value += position_value
+                
+                # Get token info to map by symbol
+                token_info = self.db_manager.get_token_by_id(position.token_id)
+                if token_info:
+                    open_positions_by_symbol[token_info.symbol] = {
+                        'position': position,
+                        'current_value': position_value,
+                        'current_price': current_price or position.entry_price
+                    }
+            
             position_count = len(open_positions)
             
             # Calculate exposure
             cash_balance = portfolio_value - total_position_value
-            exposure_pct = (total_position_value / portfolio_value) * 100 if portfolio_value > 0 else 0
+            exposure_pct = (total_position_value / portfolio_value * 100) if portfolio_value > 0 else 0
+            
+            # Get P&L summary
+            pnl_summary = await self.position_manager.get_portfolio_pnl()
             
             return {
                 'portfolio_value': portfolio_value,
                 'cash_balance': cash_balance,
+                'available_buying_power': max(0, cash_balance * 0.95),  # Keep 5% reserve
                 'total_position_value': total_position_value,
                 'position_count': position_count,
-                'exposure_pct': exposure_pct,
-                'available_buying_power': cash_balance * (self.config.max_portfolio_exposure_pct / 100),
-                'open_positions': {symbol: {
-                    'size': pos.size,
-                    'entry_price': pos.average_price,
-                    'current_value': pos.current_value,
-                    'unrealized_pnl': pos.unrealized_pnl
-                } for symbol, pos in open_positions.items()}
+                'exposure_percentage': exposure_pct,
+                'open_positions': open_positions_by_symbol,  # Now mapped by symbol
+                'daily_pnl': pnl_summary.get('daily_realized_pnl', 0),
+                'total_pnl': pnl_summary.get('total_realized_pnl', 0),
+                'unrealized_pnl': pnl_summary.get('total_unrealized_pnl', 0),
+                'timestamp': datetime.utcnow()
             }
             
         except Exception as e:
@@ -621,7 +656,7 @@ class PortfolioCoordinator:
             correlation_risk = self._estimate_correlation_risk(signals)
             
             # Calculate portfolio risk score
-            exposure_risk = portfolio_state['exposure_pct'] / self.config.max_portfolio_exposure_pct
+            exposure_risk = portfolio_state['exposure_percentage'] / self.config.max_portfolio_exposure_pct
             signal_count_risk = len(signals) / self.config.max_concurrent_positions
             
             portfolio_risk = np.mean([concentration_risk, correlation_risk, exposure_risk, signal_count_risk])
@@ -722,6 +757,9 @@ class PortfolioCoordinator:
             portfolio_value = portfolio_state['portfolio_value']
             available_cash = portfolio_state['available_buying_power']
             
+            # Get current open positions to avoid duplicates
+            open_positions = portfolio_state.get('open_positions', {})
+            
             # Filter to actionable signals
             buy_signals = [s for s in signals if s.signal_type == SignalType.BUY]
             
@@ -731,10 +769,18 @@ class PortfolioCoordinator:
             
             logger.debug(f"Calculating allocations for {len(buy_signals)} buy signals")
             logger.debug(f"Portfolio value: ${portfolio_value:,.2f}, Available cash: ${available_cash:,.2f}")
+            logger.debug(f"Currently holding {len(open_positions)} positions: {list(open_positions.keys())}")
             
             # Calculate position sizes based on signal strength
             for signal in buy_signals:
                 try:
+                    # 🆕 CHECK IF WE ALREADY HOLD THIS POSITION
+                    if signal.symbol in open_positions:
+                        existing_position = open_positions[signal.symbol]
+                        logger.info(f"🚫 Already holding {signal.symbol}: {existing_position['size']:.6f} tokens @ ${existing_position['entry_price']:.6f} = ${existing_position['current_value']:.2f}")
+                        logger.info(f"   Skipping buy signal to prevent duplicate position")
+                        continue
+                    
                     # Get token info
                     token_info = await self.db_manager.get_token_by_symbol(signal.symbol)
                     if not token_info:
@@ -1157,7 +1203,7 @@ class PortfolioCoordinator:
                 'timestamp': datetime.now().isoformat(),
                 'portfolio_value': portfolio_state['portfolio_value'],
                 'cash_balance': portfolio_state['cash_balance'],
-                'exposure_pct': portfolio_state['exposure_pct'],
+                'exposure_pct': portfolio_state['exposure_percentage'],
                 'position_count': portfolio_state['position_count'],
                 'tracked_symbols': len(self.tracked_symbols),
                 'avg_risk_score': avg_risk_score,

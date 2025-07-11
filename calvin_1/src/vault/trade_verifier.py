@@ -67,7 +67,7 @@ class TradeVerificationService:
     
     def __init__(self):
         # Solana connection
-        self.rpc_url = config.get('SOLANA_RPC_URL', 'https://api.devnet.solana.com')
+        self.rpc_url = config.get('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
         self.client = None
         
         # Program IDs for verification

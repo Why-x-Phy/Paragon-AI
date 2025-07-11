@@ -9,7 +9,8 @@ import {
   TransactionMessage,
   VersionedTransaction,
   SystemProgram,
-  SYSVAR_RENT_PUBKEY 
+  SYSVAR_RENT_PUBKEY,
+  ComputeBudgetProgram
 } from '@solana/web3.js';
 import { 
   TOKEN_PROGRAM_ID,
@@ -1001,7 +1002,7 @@ export class VaultClient {
         if (!vault) {
           throw new Error('Vault account not found');
         }
-        console.log('�� Vault state loaded');
+        console.log('✅ Vault state loaded');
       } catch (error) {
         console.error('❌ Failed to fetch vault account:', error);
         throw new Error(`Vault account not found or not initialized: ${error.message}`);
@@ -1023,6 +1024,39 @@ export class VaultClient {
       console.log('📍 Treasury USDC Account:', treasuryUsdcAccount.toBase58());
       console.log('📍 User Shares Account:', userSharesAccount.toBase58());
 
+      // Load deposit ALT directly from chain
+      let depositAlt = null;
+      let depositAltAccount = null;
+      try {
+        // The ALT address we created
+        const altAddress = new PublicKey('BeRMCAr83956NxtmQiKbpPC4QAvATzzmur4idRzuy1yZ');
+        
+        // Fetch the ALT account to verify it exists and get its data
+        const altAccountInfo = await this.connection.getAccountInfo(altAddress);
+        if (altAccountInfo) {
+          // Parse the ALT account data to get the addresses
+          // ALT accounts have a specific format - we need to deserialize it
+          const altData = altAccountInfo.data;
+          
+          // Create ALT account object for Pyth SDK
+          depositAltAccount = {
+            key: altAddress,
+            state: {
+              // The ALT state includes the addresses it contains
+              // For now, we'll just use the address and let Pyth SDK handle the rest
+              addresses: []
+            }
+          };
+          
+          depositAlt = altAddress;
+          console.log('✅ Deposit ALT loaded from chain:', altAddress.toString());
+        } else {
+          console.log('⚠️ Deposit ALT not found on chain');
+        }
+      } catch (error) {
+        console.log('ℹ️ Could not fetch deposit ALT:', error.message);
+      }
+
       // Get oracle data for vault NAV calculation
       console.log('🔍 Preparing Pyth oracle data for vault transaction...');
       await this.getOracleAccountsForDeposit(vaultAuthorityPDA);
@@ -1036,10 +1070,290 @@ export class VaultClient {
         this._tokenData = [];
       }
 
-      if (this._priceUpdates.length === 0) {
+      // Build instructions array
+      const instructions = [];
+      
+      // Add compute budget instructions
+      instructions.push(
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 1400000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 })
+      );
+
+      // Create Pyth price update instructions if needed
+      if (this._priceUpdates.length > 0) {
+        console.log('🏗️ Creating Pyth price update instructions...');
+        
+        // Post price updates following official documentation pattern
+        // IMPORTANT: We need to ensure price update accounts aren't closed before deposit
+        const transactionBuilder = this.pythSolanaReceiver.newTransactionBuilder({
+          closeUpdateAccounts: false, // Keep accounts open for deposit instruction
+        });
+
+        // Add price updates to the transaction builder
+        await transactionBuilder.addPostPriceUpdates(this._priceUpdates);
+        
+        // Build the deposit instruction to add to the builder
+        await transactionBuilder.addPriceConsumerInstructions(
+          async (getPriceUpdateAccount) => {
+            // Build oracle remaining accounts using the price update accounts
+            const oracleRemainingAccounts = [];
+            
+            for (let i = 0; i < this._tokenData.length; i++) {
+              const token = this._tokenData[i];
+              const feedId = this._priceFeeds[i];
+              const priceUpdateAccount = getPriceUpdateAccount(feedId);
+              
+              // Add oracle group: [token_account, price_oracle, mint]
+              oracleRemainingAccounts.push(
+                { pubkey: token.tokenAccount, isWritable: false, isSigner: false },
+                { pubkey: priceUpdateAccount, isWritable: false, isSigner: false },
+                { pubkey: token.mint, isWritable: false, isSigner: false }
+              );
+            }
+            
+            // Get staking accounts for remaining accounts
+            const [stakeConfigPDA] = getStakeConfigPDA();
+            const [userStakePDA] = getUserStakePDA(this.wallet.publicKey);
+            
+            // Build the deposit instruction
+            const depositInstruction = await this.vaultProgram.methods
+              .deposit(amountBN)
+              .accounts({
+                user: this.wallet.publicKey,
+                vault: vaultPDA,
+                userPosition: userPositionPDA,
+                userUsdcToken: userUsdcAccount,
+                vaultUsdcToken: vaultUsdcAccount,
+                treasuryUsdcToken: treasuryUsdcAccount,
+                sharesMint: vault.sharesMint,
+                userSharesToken: userSharesAccount,
+                vaultAuthority: vaultAuthorityPDA,
+                stakingProgram: this.stakingProgram.programId,
+                systemProgram: SystemProgram.programId,
+                tokenProgram: TOKEN_PROGRAM_ID,
+                associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+                rent: SYSVAR_RENT_PUBKEY,
+              })
+              .remainingAccounts([
+                // Staking accounts (required for tier verification)
+                { pubkey: stakeConfigPDA, isWritable: false, isSigner: false },
+                { pubkey: userStakePDA, isWritable: false, isSigner: false },
+                // Oracle accounts
+                ...oracleRemainingAccounts
+              ])
+              .instruction();
+            
+            // Return instruction for Pyth to include
+            return [{ instruction: depositInstruction, signers: [] }];
+          }
+        );
+        
+        // Build versioned transactions with ALT support
+        let versionedTransactions;
+        try {
+          versionedTransactions = await transactionBuilder.buildVersionedTransactions({
+            computeUnitPriceMicroLamports: 50000,
+            computeUnitLimit: 1400000,
+            // Pass the ALT address directly - Pyth SDK will fetch and use it
+            addressLookupTableAddresses: depositAlt ? [depositAlt] : [],
+          });
+        } catch (buildError) {
+          console.error('❌ Failed to build versioned transactions:', buildError);
+          // If ALT fails, try without it
+          console.log('🔄 Retrying without ALT...');
+          versionedTransactions = await transactionBuilder.buildVersionedTransactions({
+            computeUnitPriceMicroLamports: 50000,
+            computeUnitLimit: 1400000,
+            addressLookupTableAddresses: [],
+          });
+        }
+        
+        console.log(`📊 Built ${versionedTransactions.length} versioned transactions`);
+        
+        // Check if deposit instruction was included
+        let depositInstructionFound = false;
+        for (let i = 0; i < versionedTransactions.length; i++) {
+          const tx = versionedTransactions[i];
+          if (tx && tx.tx && tx.tx.message) {
+            const message = tx.tx.message;
+            const staticAccountKeys = message.staticAccountKeys || [];
+            
+            // Check if vault program is in this transaction
+            for (const key of staticAccountKeys) {
+              if (key.toString() === this.vaultProgram.programId.toString()) {
+                depositInstructionFound = true;
+                console.log(`✅ Deposit instruction found in transaction ${i + 1}`);
+                break;
+              }
+            }
+          }
+        }
+        
+        if (!depositInstructionFound) {
+          console.warn('⚠️ Deposit instruction not found in any Pyth transaction!');
+          console.log('🔧 Attempting to manually add deposit instruction...');
+          
+          // Get the last transaction and try to add our deposit instruction to it
+          const lastTx = versionedTransactions[versionedTransactions.length - 1];
+          if (lastTx && lastTx.tx) {
+            try {
+              // This is a workaround - we'll send the deposit in a separate transaction
+              // after all the Pyth transactions complete
+              console.log('📝 Will send deposit instruction separately after Pyth transactions');
+            } catch (e) {
+              console.error('Failed to modify transaction:', e);
+            }
+          }
+        }
+        
+        // Send the Pyth transactions first
+        const pythSignatures = await this.pythSolanaReceiver.provider.sendAll(
+          versionedTransactions,
+          { skipPreflight: true }
+        );
+        
+        console.log('✅ Pyth transactions sent!', pythSignatures.length, 'signatures');
+        
+        // If deposit wasn't included, send it separately
+        if (!depositInstructionFound) {
+          console.log('📤 Sending separate deposit transaction...');
+          
+          // Wait a moment for Pyth transactions to confirm
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          // Build oracle remaining accounts using the price update accounts that were just created
+          const oracleRemainingAccounts = [];
+          
+          for (let i = 0; i < this._tokenData.length; i++) {
+            const token = this._tokenData[i];
+            const feedId = this._priceFeeds[i];
+            
+            // Derive the price update account address that Pyth just created
+            const [priceUpdateAccount] = PublicKey.findProgramAddressSync(
+              [
+                Buffer.from("PythPriceUpdateV2"),
+                Buffer.from(feedId, 'hex')
+              ],
+              this.pythSolanaReceiver.receiver.programId
+            );
+            
+            // Add oracle group: [token_account, price_oracle, mint]
+            oracleRemainingAccounts.push(
+              { pubkey: token.tokenAccount, isWritable: false, isSigner: false },
+              { pubkey: priceUpdateAccount, isWritable: false, isSigner: false },
+              { pubkey: token.mint, isWritable: false, isSigner: false }
+            );
+          }
+          
+          // Get staking accounts
+          const [stakeConfigPDA] = getStakeConfigPDA();
+          const [userStakePDA] = getUserStakePDA(this.wallet.publicKey);
+          
+          // Build the deposit instruction
+          const depositInstruction = await this.vaultProgram.methods
+            .deposit(amountBN)
+            .accounts({
+              user: this.wallet.publicKey,
+              vault: vaultPDA,
+              userPosition: userPositionPDA,
+              userUsdcToken: userUsdcAccount,
+              vaultUsdcToken: vaultUsdcAccount,
+              treasuryUsdcToken: treasuryUsdcAccount,
+              sharesMint: vault.sharesMint,
+              userSharesToken: userSharesAccount,
+              vaultAuthority: vaultAuthorityPDA,
+              stakingProgram: this.stakingProgram.programId,
+              systemProgram: SystemProgram.programId,
+              tokenProgram: TOKEN_PROGRAM_ID,
+              associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+              rent: SYSVAR_RENT_PUBKEY,
+            })
+            .remainingAccounts([
+              { pubkey: stakeConfigPDA, isWritable: false, isSigner: false },
+              { pubkey: userStakePDA, isWritable: false, isSigner: false },
+              ...oracleRemainingAccounts
+            ])
+            .instruction();
+          
+          // Send deposit with ALT
+          if (depositAlt) {
+            try {
+              const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+              
+              // Fetch the ALT account data properly using the web3.js method
+              const lookupTableAccount = await this.connection
+                .getAddressLookupTable(depositAlt)
+                .then((res) => res.value);
+              
+              if (!lookupTableAccount) {
+                throw new Error('ALT account not found on chain');
+              }
+              
+              console.log('📋 ALT loaded with', lookupTableAccount.state.addresses.length, 'addresses');
+              
+              const messageV0 = new TransactionMessage({
+                payerKey: this.wallet.publicKey,
+                recentBlockhash: blockhash,
+                instructions: [
+                  ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 }),
+                  ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }),
+                  depositInstruction
+                ],
+              }).compileToV0Message([lookupTableAccount]);
+              
+              const transaction = new VersionedTransaction(messageV0);
+              
+              const depositSig = await this.wallet.sendTransaction(transaction, this.connection, {
+                skipPreflight: false,
+                maxRetries: 3,
+                preflightCommitment: 'processed',
+              });
+              
+              console.log('📝 Deposit transaction signature:', depositSig);
+              
+              await this.connection.confirmTransaction({
+                signature: depositSig,
+                blockhash,
+                lastValidBlockHeight
+              }, 'confirmed');
+              
+              console.log('✅ Deposit transaction confirmed!');
+              return depositSig;
+            } catch (altError) {
+              console.error('❌ Failed to send with ALT:', altError);
+              console.log('🔄 Falling back to legacy transaction...');
+              // Fallback without ALT
+              const tx = new Transaction();
+              tx.add(
+                ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 }),
+                ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }),
+                depositInstruction
+              );
+              return await this.sendTransaction(tx);
+            }
+          } else {
+            // Fallback without ALT
+            const tx = new Transaction();
+            tx.add(
+              ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 }),
+              ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }),
+              depositInstruction
+            );
+            return await this.sendTransaction(tx);
+          }
+        }
+        
+        return pythSignatures[0];
+
+      } else {
+        // No price updates needed - simple deposit
         console.log('💡 No price updates needed - using simple transaction');
         
-        // Build simple transaction without Pyth price updates
+        // Get staking accounts
+        const [stakeConfigPDA] = getStakeConfigPDA();
+        const [userStakePDA] = getUserStakePDA(this.wallet.publicKey);
+        
+        // Build the deposit instruction
         const depositInstruction = await this.vaultProgram.methods
           .deposit(amountBN)
           .accounts({
@@ -1060,137 +1374,87 @@ export class VaultClient {
           })
           .remainingAccounts([
             // Staking accounts (required for tier verification)
-            {
-              pubkey: getStakeConfigPDA()[0],
-              isWritable: false,
-              isSigner: false,
-            },
-            {
-              pubkey: getUserStakePDA(this.wallet.publicKey)[0],
-              isWritable: false,
-              isSigner: false,
-            },
+            { pubkey: stakeConfigPDA, isWritable: false, isSigner: false },
+            { pubkey: userStakePDA, isWritable: false, isSigner: false },
           ])
           .instruction();
-
-        const tx = new Transaction();
-        tx.add(depositInstruction);
         
-        console.log('📤 Sending simple deposit transaction...');
-        return await this.sendTransaction(tx);
-      } else {
-        console.log('🏗️ Building Pyth transaction with price updates...');
-        
-        // Post price updates following official documentation pattern
-        // Set closeUpdateAccounts: true if you want to delete the price update account at
-        // the end of the transaction to reclaim rent.
-        const transactionBuilder = this.pythSolanaReceiver.newTransactionBuilder({
-          closeUpdateAccounts: false,
-        });
-
-        // Add price updates to the transaction builder
-        await transactionBuilder.addPostPriceUpdates(this._priceUpdates);
-        console.log(`✅ Added ${this._priceUpdates.length} price updates`);
-
-        // Use this function to add your application-specific instructions to the builder
-        await transactionBuilder.addPriceConsumerInstructions(
-          async (getPriceUpdateAccount) => {
-            // Generate instructions here that use the price updates posted above.
-            // getPriceUpdateAccount(<price feed id>) will give you the account for each price update.
+        if (depositAlt) {
+          console.log('🚀 Using versioned transaction with deposit ALT...');
+          
+          try {
+            // Create versioned transaction with ALT
+            const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
             
-            // Build oracle accounts using the getPriceUpdateAccount callback
-            const oracleAccounts = [];
-
-            for (let i = 0; i < this._tokenData.length; i++) {
-              const token = this._tokenData[i];
-              const feedId = this._priceFeeds[i];
-              const priceUpdateAccount = getPriceUpdateAccount(feedId);
-
-              // Add the oracle account group: [token_account, pyth_price_update_v2, mint_account]
-              oracleAccounts.push(
-                {
-                  pubkey: token.tokenAccount,
-                  isWritable: false,
-                  isSigner: false,
-                },
-                {
-                  pubkey: priceUpdateAccount,
-                  isWritable: false,
-                  isSigner: false,
-                },
-                {
-                  pubkey: token.mint,
-                  isWritable: false,
-                  isSigner: false,
-                }
-              );
+            // Fetch the ALT account properly
+            const lookupTableAccount = await this.connection
+              .getAddressLookupTable(depositAlt)
+              .then((res) => res.value);
+            
+            if (!lookupTableAccount) {
+              throw new Error('ALT account not found on chain');
             }
-
-            // Build remaining accounts
-            const remainingAccounts = [
-              // Staking accounts
-              {
-                pubkey: getStakeConfigPDA()[0],
-                isWritable: false,
-                isSigner: false,
-              },
-              {
-                pubkey: getUserStakePDA(this.wallet.publicKey)[0],
-                isWritable: false,
-                isSigner: false,
-              },
-              // Oracle accounts
-              ...oracleAccounts
-            ];
-
-            // Build the vault deposit instruction
-            const depositInstruction = await this.vaultProgram.methods
-              .deposit(amountBN)
-              .accounts({
-                user: this.wallet.publicKey,
-                vault: vaultPDA,
-                userPosition: userPositionPDA,
-                userUsdcToken: userUsdcAccount,
-                vaultUsdcToken: vaultUsdcAccount,
-                treasuryUsdcToken: treasuryUsdcAccount,
-                sharesMint: vault.sharesMint,
-                userSharesToken: userSharesAccount,
-                vaultAuthority: vaultAuthorityPDA,
-                stakingProgram: this.stakingProgram.programId,
-                systemProgram: SystemProgram.programId,
-                tokenProgram: TOKEN_PROGRAM_ID,
-                associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-                rent: SYSVAR_RENT_PUBKEY,
-              })
-              .remainingAccounts(remainingAccounts)
-              .instruction();
-
-            return [{ instruction: depositInstruction, signers: [] }];
+            
+            console.log('📋 ALT loaded with', lookupTableAccount.state.addresses.length, 'addresses');
+            
+            const messageV0 = new TransactionMessage({
+              payerKey: this.wallet.publicKey,
+              recentBlockhash: blockhash,
+              instructions: [
+                ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 }),
+                ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }),
+                depositInstruction
+              ],
+            }).compileToV0Message([lookupTableAccount]);
+            
+            const transaction = new VersionedTransaction(messageV0);
+            
+            // Send versioned transaction
+            const signature = await this.wallet.sendTransaction(transaction, this.connection, {
+              skipPreflight: false,
+              maxRetries: 3,
+              preflightCommitment: 'processed',
+            });
+            
+            console.log('📝 Transaction signature:', signature);
+            
+            // Wait for confirmation
+            const confirmation = await this.connection.confirmTransaction({
+              signature,
+              blockhash,
+              lastValidBlockHeight
+            }, 'confirmed');
+            
+            if (confirmation.value.err) {
+              throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+            }
+            
+            console.log('✅ Deposit transaction confirmed!');
+            return signature;
+          } catch (altError) {
+            console.error('❌ Failed with ALT:', altError);
+            console.log('🔄 Falling back to legacy transaction...');
+            // Fall through to legacy transaction below
           }
-        );
-
-        // Send the instructions in the builder in 1 or more transactions.
-        // The builder will pack the instructions into transactions automatically.
-        console.log('📤 Building and sending Pyth transaction...');
+        }
         
-        const versionedTransactions = await transactionBuilder.buildVersionedTransactions({
-          computeUnitPriceMicroLamports: 50000,
-        });
-
-        const signatures = await this.pythSolanaReceiver.provider.sendAll(
-          versionedTransactions,
-          { skipPreflight: true }
+        // Fallback to legacy transaction (used when no ALT or ALT fails)
+        const transaction = new Transaction();
+        transaction.add(
+          ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 }),
+          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }),
+          depositInstruction
         );
-
-        console.log('✅ Pyth transaction completed!');
-        return signatures[0];
+        
+        return await this.sendTransaction(transaction);
       }
+
     } catch (error) {
       console.error('❌ Error depositing USDC:', error);
       
       // Enhanced error handling for common issues
       if (error.message && error.message.includes('Transaction version')) {
-        throw new Error('Your wallet does not support the required transaction format. Please try updating your wallet or using a different wallet like Phantom or Solflare.');
+        throw new Error('Your wallet does not support versioned transactions. Please try updating your wallet or using a different wallet like Phantom or Solflare.');
       }
       
       throw error;

@@ -14,7 +14,7 @@ Phase 3.3 Implementation:
 """
 
 import asyncio
-from typing import Dict, List, Optional, Set, Tuple, Callable
+from typing import Dict, List, Optional, Set, Tuple, Callable, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from enum import Enum
@@ -22,6 +22,7 @@ import time
 
 from ..data.websocket_feed import BirdEyeWebSocketFeed, ConnectionConfig, PriceSubscription, PriceUpdate, ConnectionState
 from ..trading.position_manager import PositionManager
+from ..trading.position_sync import auto_sync_on_startup
 from ..database.production_db import PositionData
 from .vault_client import VaultClient
 from ..config.config import config
@@ -103,9 +104,15 @@ class PositionMonitor:
         if len(self.price_history) > 1:
             prices = [p for _, p in self.price_history]
             returns = [(prices[i] / prices[i-1] - 1) for i in range(1, len(prices))]
-            if returns:
+            if returns and len(returns) > 1:  # Need at least 2 returns for stdev
                 import statistics
                 self.volatility_24h = statistics.stdev(returns) * 100  # Convert to percentage
+            else:
+                # Not enough data for volatility calculation
+                self.volatility_24h = 0.0
+        else:
+            # Not enough price history
+            self.volatility_24h = 0.0
 
 
 class EmergencyStopLossMonitor:
@@ -187,10 +194,14 @@ class EmergencyStopLossMonitor:
             # Initialize position manager
             await self.position_manager.initialize()
             
+            # 🆕 Sync vault holdings to position manager on startup
+            logger.info("🔄 Syncing vault holdings to position manager...")
+            await auto_sync_on_startup(self.vault_client, self.position_manager)
+            
             # 🆕 RECOVER EMERGENCY STATE FROM DATABASE
             await self._recover_emergency_state()
             
-            logger.info("✅ Emergency Monitor initialized with state recovery")
+            logger.info("✅ Emergency Monitor initialized with state recovery and position sync")
             
         except Exception as e:
             logger.error(f"Failed to initialize Emergency Monitor: {e}")
@@ -672,21 +683,22 @@ class EmergencyStopLossMonitor:
             event.action_taken = f"portfolio_exit_error: {str(e)}"
             await self._record_emergency_event(event)
 
-    async def _setup_position_monitors(self, vault_positions: Dict[str, PositionData]):
+    async def _setup_position_monitors(self, vault_positions: Dict[str, Any]):
         """Setup position monitors for vault positions"""
         self.position_monitors.clear()
         
         for symbol, position in vault_positions.items():
+            # Position objects from position_sync have these attributes
             monitor = PositionMonitor(
                 symbol=symbol,
-                current_price=position.current_price,
-                entry_price=position.average_price,
-                position_size=position.size,
+                current_price=position.current_price if hasattr(position, 'current_price') else position.average_price,
+                entry_price=position.average_price if hasattr(position, 'average_price') else position.entry_price,
+                position_size=position.size if hasattr(position, 'size') else position.entry_quantity,
                 last_update=datetime.utcnow()
             )
             
             self.position_monitors[symbol] = monitor
-            logger.debug(f"📊 Setup monitor for {symbol}: ${position.size:.2f} @ ${position.average_price:.6f}")
+            logger.debug(f"📊 Setup monitor for {symbol}: {monitor.position_size:.6f} @ ${monitor.entry_price:.6f}")
         
         self.stats['positions_monitored'] = len(self.position_monitors)
         logger.info(f"📊 Setup {len(self.position_monitors)} position monitors")
@@ -704,110 +716,54 @@ class EmergencyStopLossMonitor:
         logger.info(f"📡 Emergency monitor ready to receive price updates for {len(self.subscribed_tokens)} tokens")
 
     async def _get_vault_positions(self) -> Dict[str, PositionData]:
-        """Get current vault positions from position manager"""
+        """Get current vault positions from position manager (synced with vault)"""
         try:
-            positions = {}
+            # First ensure position manager is synced with vault
+            from ..trading.position_sync import sync_vault_to_positions
+            await sync_vault_to_positions(self.vault_client, self.position_manager, force_sync=False)
             
-            # Get vault state to check if we have any token positions
-            vault_state = None
-            try:
-                vault_state = await self.vault_client.get_vault_state()
-            except Exception as vault_error:
-                logger.warning(f"Failed to get vault state: {vault_error}")
-                # Continue with empty vault state for graceful degradation
-                vault_state = {'paused': True, 'initialized': False}
+            # Get positions from position manager
+            active_positions = self.position_manager.get_active_positions()
             
-            if not vault_state or vault_state.get('paused', True) or not vault_state.get('initialized', False):
-                logger.debug("Vault is paused, not initialized, or unavailable - no positions to monitor")
-                return positions
+            if not active_positions:
+                logger.warning("No active positions found in position manager")
+                return {}
             
-            # Ensure database manager is available with connection retry
-            if not self.db_manager:
-                try:
-                    from ..database.production_db import get_db_manager
-                    self.db_manager = await get_db_manager()
-                except Exception as db_init_error:
-                    logger.error(f"Failed to initialize database manager: {db_init_error}")
-                    return positions
+            # Convert to format expected by emergency monitor
+            vault_positions = {}
             
-            # Get active positions from position manager
-            if hasattr(self.position_manager, 'get_active_positions'):
-                try:
-                    open_positions = self.position_manager.get_active_positions()
-                    
-                    for position_id, position_data in open_positions.items():
-                        # Get token symbol from database with error handling
-                        if hasattr(position_data, 'token_id'):
-                            try:
-                                token_info = await self.db_manager.get_token_by_id(position_data.token_id)
-                                if token_info:
-                                    symbol = token_info.get('symbol', f'TOKEN_{position_data.token_id}')
-                                    
-                                    # Create Position object for emergency monitoring
-                                    from ..trading.position_manager import Position
-                                    position = Position(
-                                        symbol=symbol,
-                                        size=getattr(position_data, 'size', 0.0),
-                                        average_price=getattr(position_data, 'average_price', 0.0),
-                                        current_price=getattr(position_data, 'current_price', 0.0),
-                                        unrealized_pnl=getattr(position_data, 'unrealized_pnl_usdc', 0.0),
-                                        entry_time=getattr(position_data, 'entry_time', datetime.utcnow())
-                                    )
-                                    
-                                    positions[symbol] = position
-                                    logger.debug(f"📊 Found vault position: {symbol} - ${position.size:.2f} @ ${position.average_price:.6f}")
-                            except Exception as token_error:
-                                logger.warning(f"Failed to get token info for position {position_id}: {token_error}")
-                                continue
-                except Exception as position_error:
-                    logger.warning(f"Failed to get active positions from position manager: {position_error}")
-            
-            # Alternative: Query vault client directly for token balances
-            if not positions and hasattr(self.vault_client, 'get_vault_token_balances'):
-                try:
-                    token_balances = await self.vault_client.get_vault_token_balances()
-                    
-                    for token_address, balance_info in token_balances.items():
-                        if balance_info.get('balance', 0) > 0:
-                            # Get token info from database with error handling
-                            try:
-                                token_info = await self.db_manager.get_token_by_address(token_address)
-                                if token_info:
-                                    symbol = token_info.get('symbol', token_address[:8])
-                                    
-                                    # Get current price with fallback
-                                    current_price = 0.0
-                                    try:
-                                        current_price = await self.db_manager.get_latest_price(token_info['token_id'])
-                                        current_price = current_price or 0.0
-                                    except Exception as price_error:
-                                        logger.debug(f"Could not get current price for {symbol}: {price_error}")
-                                    
-                                    # Create position from vault balance
-                                    from ..trading.position_manager import Position
-                                    position = Position(
-                                        symbol=symbol,
-                                        size=balance_info['balance'],
-                                        average_price=balance_info.get('average_price', current_price),
-                                        current_price=current_price,
-                                        unrealized_pnl=0.0,  # Will be calculated
-                                        entry_time=datetime.utcnow()
-                                    )
-                                    
-                                    positions[symbol] = position
-                                    logger.debug(f"📊 Found vault token balance: {symbol} - {balance_info['balance']:.6f} tokens")
-                            except Exception as token_error:
-                                logger.warning(f"Failed to get token info for address {token_address}: {token_error}")
-                                continue
-                                
-                except Exception as balance_error:
-                    logger.debug(f"Could not get vault token balances: {balance_error}")
-            
-            logger.info(f"📊 Retrieved {len(positions)} vault positions for emergency monitoring")
-            return positions
+            for pos_id, pos_data in active_positions.items():
+                # PositionData objects have token_id, not symbol
+                # Get symbol from token info
+                token_info = self.db_manager.get_token_by_id(pos_data.token_id)
+                if not token_info:
+                    logger.warning(f"Token info not found for token_id {pos_data.token_id}")
+                    continue
+                
+                symbol = token_info.symbol
+                
+                # Create a simple position object for monitoring
+                # The emergency monitor expects positions keyed by symbol
+                from ..trading.position_sync import Position
+                position = Position(
+                    id=str(pos_id),
+                    symbol=symbol,
+                    size=pos_data.entry_quantity,
+                    average_price=pos_data.entry_price,
+                    current_price=pos_data.entry_price,  # Will be updated by price feeds
+                    unrealized_pnl=0.0,  # Will be calculated
+                    entry_time=pos_data.entry_time
+                )
+                
+                vault_positions[symbol] = position
+                
+            logger.info(f"📊 Retrieved {len(vault_positions)} positions from position manager")
+            return vault_positions
             
         except Exception as e:
             logger.error(f"❌ Failed to get vault positions: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return {}
 
     async def _calculate_portfolio_pnl(self) -> float:
@@ -935,7 +891,7 @@ class EmergencyStopLossMonitor:
             # Record in system health for monitoring
             await self.db_manager.record_health_check(
                 'emergency_portfolio_monitoring',
-                'updated',
+                'healthy',  # Changed from 'updated' to 'healthy'
                 monitoring_data
             )
             
@@ -1047,3 +1003,29 @@ class EmergencyStopLossMonitor:
             
         except Exception as e:
             logger.error(f"❌ Error stopping emergency monitoring: {e}") 
+
+    def _calculate_volatility(self, prices: List[float]) -> float:
+        """Calculate price volatility (standard deviation of returns)"""
+        if len(prices) < 2:
+            # Need at least 2 prices to calculate returns
+            return 0.0
+            
+        # Calculate returns
+        returns = []
+        for i in range(1, len(prices)):
+            if prices[i-1] > 0:  # Avoid division by zero
+                ret = (prices[i] - prices[i-1]) / prices[i-1]
+                returns.append(ret)
+        
+        if not returns:
+            return 0.0
+            
+        # Calculate standard deviation of returns
+        mean_return = sum(returns) / len(returns)
+        variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
+        volatility = variance ** 0.5
+        
+        # Annualize (assuming 24 hours of data)
+        annualized_volatility = volatility * (365 ** 0.5)
+        
+        return annualized_volatility 

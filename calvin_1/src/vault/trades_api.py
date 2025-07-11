@@ -43,35 +43,43 @@ class SimpleTradesAPI:
                     t.tx_hash,
                     tok.symbol,
                     t.price as entry_price,
+                    t.quantity,
                     
-                    -- Calculate P&L by comparing with current/exit price
+                    -- Get the most recent price from any resolution
+                    COALESCE(
+                        (SELECT close 
+                         FROM ohlcv 
+                         WHERE token_id = t.token_id 
+                         ORDER BY time DESC 
+                         LIMIT 1), 
+                        t.price
+                    ) as current_price,
+                    
+                    -- Calculate P&L based on trade type
                     CASE 
                         WHEN t.trade_type = 'buy' THEN
-                            -- For buys, profit = (current_price - entry_price) * quantity - fees
-                            COALESCE(
-                                (SELECT (latest.close - t.price) * t.quantity - t.fee_usdc
-                                 FROM ohlcv latest 
-                                 WHERE latest.token_id = t.token_id 
-                                 AND latest.resolution = '1m'
-                                 ORDER BY latest.time DESC LIMIT 1), 
-                                0
-                            )
+                            -- For buys: unrealized P&L = (current_price - entry_price) * quantity - fees
+                            (COALESCE(
+                                (SELECT close FROM ohlcv WHERE token_id = t.token_id ORDER BY time DESC LIMIT 1), 
+                                t.price
+                            ) - t.price) * t.quantity - t.fee_usdc
                         WHEN t.trade_type = 'sell' THEN
-                            -- For sells, profit = trade_value - fees (already realized)
-                            t.value_usdc - t.fee_usdc
+                            -- For sells: realized P&L = value - cost_basis - fees
+                            -- This is simplified - ideally we'd track the original buy price
+                            t.value_usdc - (t.quantity * t.price) - t.fee_usdc
                         ELSE 0
                     END as pnl_usdc,
                     
                     -- Mark as profitable if P&L > 0
                     CASE 
-                        WHEN t.trade_type = 'sell' THEN (t.value_usdc - t.fee_usdc) > 0
-                        ELSE (
-                            SELECT (latest.close - t.price) * t.quantity > t.fee_usdc
-                            FROM ohlcv latest 
-                            WHERE latest.token_id = t.token_id 
-                            AND latest.resolution = '1m'
-                            ORDER BY latest.time DESC LIMIT 1
-                        )
+                        WHEN t.trade_type = 'buy' THEN 
+                            (COALESCE(
+                                (SELECT close FROM ohlcv WHERE token_id = t.token_id ORDER BY time DESC LIMIT 1), 
+                                t.price
+                            ) - t.price) * t.quantity > t.fee_usdc
+                        WHEN t.trade_type = 'sell' THEN 
+                            t.value_usdc > (t.quantity * t.price + t.fee_usdc)
+                        ELSE false
                     END as is_profitable,
                     
                     ROW_NUMBER() OVER (ORDER BY t.execution_time DESC) as trade_rank

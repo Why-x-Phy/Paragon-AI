@@ -171,6 +171,125 @@ class VaultClient:
             self.client = None
             logger.info("Vault Client closed")
 
+    async def get_token_balance(self, token_mint: str) -> float:
+        """
+        Get the vault's token balance for a specific token
+        
+        Args:
+            token_mint: Token mint address
+            
+        Returns:
+            Token balance in token units (not smallest units)
+        """
+        try:
+            if not self.client:
+                await self.initialize()
+            
+            # Get vault authority PDA
+            vault_authority_pda = self._get_vault_authority_pda()
+            
+            # Get the vault's token account for this mint
+            vault_token_account = self._get_vault_token_account(token_mint, vault_authority_pda)
+            
+            # Query the token account balance
+            response = await self.client.get_token_account_balance(vault_token_account)
+            
+            if response.value is None:
+                logger.debug(f"Token account {vault_token_account} not found or has no balance")
+                return 0.0
+            
+            # Get balance in smallest units
+            balance_smallest_units = int(response.value.amount)
+            
+            # Convert to token units using decimals
+            # Get token decimals from cache
+            token_decimals = 6  # Default to 6 decimals
+            if hasattr(self, 'db_manager') and self.db_manager:
+                try:
+                    for token in self.db_manager._token_cache.values():
+                        if token.address == token_mint:
+                            token_decimals = token.decimals
+                            break
+                except:
+                    pass  # Use default if cache access fails
+            
+            # Convert to token units
+            token_balance = balance_smallest_units / (10 ** token_decimals)
+            
+            logger.debug(f"Vault balance for {token_mint}: {token_balance} tokens ({balance_smallest_units} smallest units)")
+            return token_balance
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to get vault token balance for {token_mint}: {e}")
+            return 0.0
+
+    async def get_all_vault_balances(self) -> Dict[str, float]:
+        """
+        Get all non-zero token balances in the vault
+        
+        Returns:
+            Dictionary mapping token mint addresses to balances
+        """
+        try:
+            if not self.client:
+                await self.initialize()
+            
+            # Get vault authority PDA
+            vault_authority_pda = self._get_vault_authority_pda()
+            
+            # Get all token accounts owned by vault authority
+            response = await self.client.get_token_accounts_by_owner(
+                vault_authority_pda,
+                TokenAccountOpts(program_id=Pubkey.from_string(TOKEN_PROGRAM_ID))
+            )
+            
+            balances = {}
+            
+            for account_info in response.value:
+                try:
+                    # Parse token account data
+                    account_data = account_info.account.data
+                    if len(account_data) < 64:  # Token account should be 165 bytes
+                        continue
+                    
+                    # Get mint address (first 32 bytes after 8 byte discriminator)
+                    mint_bytes = account_data[0:32]
+                    mint_address = str(Pubkey(mint_bytes))
+                    
+                    # Get amount (bytes 64-72, little endian u64)
+                    amount_bytes = account_data[64:72]
+                    amount = int.from_bytes(amount_bytes, 'little')
+                    
+                    if amount > 0:
+                        # Get token decimals from cache
+                        token_decimals = 6  # Default
+                        if hasattr(self, 'db_manager') and self.db_manager:
+                            try:
+                                for token in self.db_manager._token_cache.values():
+                                    if token.address == mint_address:
+                                        token_decimals = token.decimals
+                                        break
+                            except:
+                                pass
+                        
+                        # Convert to token units
+                        token_balance = amount / (10 ** token_decimals)
+                        balances[mint_address] = token_balance
+                        
+                except Exception as e:
+                    logger.debug(f"Failed to parse token account: {e}")
+                    continue
+            
+            logger.info(f"📊 Vault has {len(balances)} tokens with non-zero balances")
+            for mint, balance in balances.items():
+                logger.info(f"  {mint[:8]}...{mint[-8:]}: {balance}")
+            
+            return balances
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to get all vault balances: {e}")
+            return {}
+
     async def execute_trade(self, token_in_mint=None, token_out_mint=None, amount_in=None, slippage_bps=100, 
                           jupiter_data=None, source_mint=None, destination_mint=None, amount_usdc=None):
         """
@@ -201,9 +320,20 @@ class VaultClient:
             jupiter_accounts = jupiter_data.get('accounts', []) if isinstance(jupiter_data, dict) else []
             logger.debug(f"📋 Extracted {len(jupiter_accounts)} Jupiter accounts from swap data")
             
+            # Extract amount from jupiter_data if amount_usdc is not provided (for SELL trades)
+            if amount_usdc is not None:
+                amount = int(amount_usdc * 1e6)
+            else:
+                # For SELL trades, extract the amount from the Jupiter quote data
+                if 'inAmount' in jupiter_data:
+                    amount = int(jupiter_data['inAmount'])
+                    logger.debug(f"📊 Extracted amount from Jupiter data for SELL: {amount}")
+                else:
+                    raise ValueError("No amount provided and could not extract from Jupiter data")
+            
             # Use manual transaction construction without ALT optimization
             transaction = await self._create_vault_trade_transaction(
-                source_mint, destination_mint, int(amount_usdc * 1e6), jupiter_data, jupiter_accounts
+                source_mint, destination_mint, amount, jupiter_data, jupiter_accounts
             )
             
             if not transaction:
@@ -346,7 +476,7 @@ class VaultClient:
                         logger.warning(f"⚠️ No oracle account created for {token_mint}")
                     
                 except Exception as e:
-                    logger.warning(f"⚠️ Failed to add oracle group for {token_mint}: {e}")
+                    logger.warning(f"⚠️ Failed to add oracle group for {token_mint[:8]}...: {e}")
             
             # Add Jupiter accounts after oracle accounts - DON'T LIMIT THEM
             for acc in jupiter_accounts:  # Use ALL Jupiter accounts
@@ -1939,7 +2069,7 @@ class VaultClient:
 
     def __del__(self):
         """Cleanup on destruction"""
-        if self.client:
+        if hasattr(self, 'client') and self.client:
             logger.warning("⚠️ VaultClient not properly closed")
 
     async def _calculate_vault_nav(self, vault_authority_pda: Pubkey) -> float:
@@ -2035,13 +2165,12 @@ class VaultClient:
 
     async def _get_realtime_price_for_token(self, token_mint: str) -> Optional[float]:
         """
-        Get token price from real-time WebSocket feeds (Redis cache)
+        Get token price from real-time WebSocket feeds (Redis cache) with API fallback
         
         Uses live BirdEye WebSocket price data for maximum accuracy:
-        1. Real-time WebSocket price updates
-        2. Redis cache with sub-second latency  
-        3. In-memory fallback from DualWebSocketFeedManager
-        4. Database fallback for non-tracked tokens
+        1. Real-time WebSocket price updates (Redis cache)
+        2. Direct API call to BirdEye/Pyth/Jupiter
+        3. Database fallback for non-tracked tokens
         """
         try:
             # Import the existing database manager
@@ -2051,7 +2180,8 @@ class VaultClient:
             db_manager = await get_db_manager()
             
             # Convert mint address to token_id using existing token cache
-            token_info = await db_manager.get_token_by_address(token_mint)
+            # Note: get_token_by_address is synchronous, not async
+            token_info = db_manager.get_token_by_address(token_mint)
             if not token_info:
                 logger.warning(f"⚠️ Token not found in database: {token_mint}")
                 return None
@@ -2066,14 +2196,89 @@ class VaultClient:
                     price_usd = float(cached_price)
                     logger.debug(f"📡 Real-time WebSocket price for {token_mint[:8]}...: ${price_usd:.6f}")
                     return price_usd
+            except RuntimeError as e:
+                # Handle event loop conflicts when called from scheduler threads
+                if "attached to a different loop" in str(e):
+                    logger.debug(f"Redis lookup skipped due to event loop conflict (running in scheduler thread)")
+                else:
+                    logger.debug(f"Redis lookup failed: {e}")
             except Exception as e:
                 logger.debug(f"Redis lookup failed: {e}")
             
-            # PRIORITY 2: Fallback to latest database price (hourly data)
+            # PRIORITY 2: Direct API call fallback when WebSocket/Redis fails
+            try:
+                logger.debug(f"🔄 Fetching fresh price via API for {token_mint[:8]}...")
+                
+                # Try Pyth API first
+                from ..pyth.oracle_handler import TOKEN_ORACLE_HEX_MAPPING
+                pyth_feed_id = TOKEN_ORACLE_HEX_MAPPING.get(token_mint)
+                
+                if pyth_feed_id:
+                    # Use Pyth HTTP API for latest price
+                    import aiohttp
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            f"https://hermes.pyth.network/api/latest_price_feeds?ids[]={pyth_feed_id}&parsed=true",
+                            timeout=aiohttp.ClientTimeout(total=5)
+                        ) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                if data and len(data) > 0 and 'price' in data[0]:
+                                    price_data = data[0]['price']
+                                    price_usd = float(price_data['price']) * (10 ** int(price_data['expo']))
+                                    
+                                    # Validate price
+                                    if price_usd > 0:
+                                        logger.debug(f"📈 Fresh Pyth API price for {token_mint[:8]}...: ${price_usd:.6f}")
+                                        
+                                        # Cache the fresh price in Redis for next time
+                                        try:
+                                            await db_manager.redis_client.setex(cache_key, 30, str(price_usd))
+                                        except RuntimeError as e:
+                                            if "attached to a different loop" in str(e):
+                                                pass  # Skip caching in scheduler threads
+                                            else:
+                                                pass  # Don't fail if cache update fails
+                                        except:
+                                            pass  # Don't fail if cache update fails
+                                        
+                                        return price_usd
+                
+                # If Pyth fails or not available, try Jupiter price API
+                logger.debug(f"🔄 Trying Jupiter price API for {token_mint[:8]}...")
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"https://price.jup.ag/v6/price?ids={token_mint}",
+                        timeout=aiohttp.ClientTimeout(total=5)
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if 'data' in data and token_mint in data['data']:
+                                price_usd = float(data['data'][token_mint]['price'])
+                                if price_usd > 0:
+                                    logger.debug(f"📈 Fresh Jupiter API price for {token_mint[:8]}...: ${price_usd:.6f}")
+                                    
+                                    # Cache the fresh price
+                                    try:
+                                        await db_manager.redis_client.setex(cache_key, 30, str(price_usd))
+                                    except RuntimeError as e:
+                                        if "attached to a different loop" in str(e):
+                                            pass  # Skip caching in scheduler threads
+                                        else:
+                                            pass
+                                    except:
+                                        pass
+                                    
+                                    return price_usd
+                
+            except Exception as api_error:
+                logger.debug(f"API price fetch failed: {api_error}")
+            
+            # PRIORITY 3: Fallback to latest database price (hourly data)
             price_usd = await db_manager.get_latest_price(token_info.token_id)
             
             if price_usd is not None:
-                logger.debug(f"📈 Fallback price for {token_mint[:8]}...: ${price_usd:.6f}")
+                logger.debug(f"📊 Database fallback price for {token_mint[:8]}...: ${price_usd:.6f}")
                 return price_usd
             else:
                 logger.warning(f"⚠️ No price data available for {token_mint}")

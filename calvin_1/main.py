@@ -59,6 +59,7 @@ class CalvinVaultSystem:
         self.scheduler = None
         self.websocket_manager = None
         self.emergency_monitor = None
+        self.realtime_storage = None  # DISABLED: WebSocket feeds handle their own DB writes
         self.running = False
         
         logger.info("Calvin Vault System initializing...")
@@ -70,6 +71,12 @@ class CalvinVaultSystem:
             db_manager = await get_db_manager()
             await db_manager.health_check()
             logger.info("✅ Database connection established")
+            
+            # DISABLED: RealtimeDataStorage - WebSocket feeds handle their own database writes
+            # from src.data.realtime_storage import RealtimeDataStorage
+            # self.realtime_storage = RealtimeDataStorage(db_manager)
+            # await self.realtime_storage.initialize()
+            # logger.info("✅ RealtimeDataStorage initialized for WebSocket data persistence")
             
             # Initialize WebSocket Feed Manager (but don't start connections yet)
             from src.data.websocket_feed import WebSocketFeedManager

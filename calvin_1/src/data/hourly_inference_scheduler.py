@@ -1299,9 +1299,8 @@ class HourlyInferenceScheduler:
             from solana.rpc.async_api import AsyncClient
             connection = AsyncClient(rpc_url)
             vault_client = VaultClient(
-                wallet=None,  # Not needed for read operations
-                connection=connection,
                 vault_program=vault_program_id,
+                connection=connection,
                 authority_keypair=authority_keypair
             )
             
@@ -1845,64 +1844,11 @@ class HourlyInferenceScheduler:
     async def start_async(self):
         """Start the scheduler with async initialization"""
         try:
-            # Initialize first
-            await self.initialize()
+            # NOTE: initialize() is already called in main.py before start_async()
+            # Don't call it again to avoid duplicate initialization
             
-            # 🆕 Initialize vault client and position manager for position sync
-            self.logger.info("🔄 Initializing vault client and position manager...")
-            try:
-                from ..vault.vault_client import VaultClient
-                from ..trading.position_manager import PositionManager
-                from ..trading.position_sync import auto_sync_on_startup
-                from solana.rpc.async_api import AsyncClient
-                from solders.keypair import Keypair
-                import json
-                
-                # Get vault configuration
-                rpc_url = os.getenv('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
-                vault_program_id = os.getenv('VAULT_PROGRAM_ID', 'tXMJu1KaBQU5DSk94QXMtigQpzxbK62WJVUs2Xmxz7z')
-                
-                # Load authority keypair
-                authority_key_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'onchain', 'calvin-ai-authority.json')
-                if os.path.exists(authority_key_path):
-                    with open(authority_key_path, 'r') as f:
-                        authority_key_data = json.load(f)
-                    authority_keypair = Keypair.from_bytes(authority_key_data)
-                else:
-                    self.logger.warning("Authority keypair not found, skipping position sync")
-                    authority_keypair = None
-                
-                if authority_keypair:
-                    # Create connection and vault client
-                    connection = AsyncClient(rpc_url)
-                    vault_client = VaultClient(
-                        vault_program=vault_program_id,
-                        connection=connection,
-                        authority_keypair=authority_keypair
-                    )
-                    await vault_client.initialize()
-                    
-                    # Initialize position manager
-                    position_manager = PositionManager(
-                        db_manager=self.db_manager,
-                        realtime_storage=None
-                    )
-                    await position_manager.initialize()
-                    
-                    # Perform auto-sync on startup
-                    self.logger.info("🔄 Syncing vault positions to position manager...")
-                    await auto_sync_on_startup(vault_client, position_manager)
-                    self.logger.info("✅ Vault positions synced successfully")
-                    
-                    # Clean up
-                    await vault_client.close()
-                    await position_manager.close()
-                else:
-                    self.logger.warning("⚠️ Authority keypair not available, position sync skipped")
-                    
-            except Exception as e:
-                self.logger.warning(f"⚠️ Failed to sync vault positions on startup: {e}")
-                # Continue execution even if sync fails
+            # NOTE: Position sync is already done during main system initialization
+            # The scheduler doesn't need its own position sync
             
             # Start the scheduler
             self.start_scheduler()

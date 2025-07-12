@@ -158,6 +158,7 @@ async def sync_vault_to_positions(
 ) -> Dict[str, Position]:
     """
     Sync vault holdings to position manager.
+    VAULT STATE IS THE SINGLE SOURCE OF TRUTH.
     
     Args:
         vault_client: Initialized vault client
@@ -167,15 +168,11 @@ async def sync_vault_to_positions(
     Returns:
         Dictionary of synced positions
     """
-    logger.info("🔄 Starting vault → position manager sync...")
+    logger.info("🔄 Starting vault → position manager sync (vault is source of truth)...")
     
     try:
-        # Get current vault holdings
+        # Get current vault holdings - THIS IS THE TRUTH
         vault_holdings = await get_vault_holdings(vault_client)
-        
-        if not vault_holdings:
-            logger.warning("No vault holdings found to sync")
-            return {}
         
         # Get existing positions from position manager
         existing_positions = position_manager.get_active_positions()
@@ -183,6 +180,10 @@ async def sync_vault_to_positions(
         synced_positions = {}
         db_manager = await get_db_manager()
         
+        # Track which tokens we've seen in the vault
+        vault_token_ids = set()
+        
+        # STEP 1: Update/Create positions based on vault holdings
         for holding in vault_holdings:
             # Get token info
             token_info = db_manager.get_token_by_address(holding.token_address)
@@ -190,93 +191,130 @@ async def sync_vault_to_positions(
                 logger.warning(f"Token not found in database: {holding.token_address}")
                 continue
             
+            vault_token_ids.add(token_info.token_id)
+            
             # Check if position already exists for this token
-            existing_pos_id = None
-            existing_pos_data = None
-            
-            # Look through existing positions by token_id
             token_positions = position_manager.get_positions_by_token(token_info.token_id)
-            if token_positions and not force_sync:
-                logger.info(f"Position already exists for {holding.symbol}, skipping sync")
-                # Create a Position object from the existing PositionData
-                pos_data = token_positions[0]  # Take the first open position
-                position = Position(
-                    id=str(pos_data.position_id),
-                    symbol=holding.symbol,
-                    size=pos_data.entry_quantity,
-                    average_price=pos_data.entry_price,
-                    current_price=holding.current_price,
-                    unrealized_pnl=(holding.current_price - pos_data.entry_price) * pos_data.entry_quantity,
-                    entry_time=pos_data.entry_time
-                )
-                synced_positions[holding.symbol] = position
-                continue
             
-            # Create or update position
-            logger.info(f"Creating position for {holding.symbol}: {holding.quantity:.6f} tokens")
-            
-            # Query for average buy price
-            query = """
-            SELECT 
-                AVG(price) as avg_price,
-                MIN(execution_time) as first_trade_time
-            FROM trades t
-            JOIN tokens tok ON t.token_id = tok.token_id
-            WHERE tok.symbol = $1
-            AND t.trade_type = 'buy'
-            """
-            
-            async with db_manager.pg_pool.acquire() as conn:
-                result = await conn.fetchrow(query, holding.symbol)
-            
-            avg_price = float(result['avg_price']) if result and result['avg_price'] else holding.current_price
-            entry_time = result['first_trade_time'] if result and result['first_trade_time'] else datetime.utcnow()
-            
-            # Create position in position manager using its API
-            from .position_manager import PositionType
-            
-            try:
-                # Open a new position through position manager
-                position_id = await position_manager.open_position(
-                    token_id=token_info.token_id,
-                    position_type=PositionType.LONG,
-                    entry_price=avg_price,
-                    quantity=holding.quantity,
-                    stop_loss_pct=15.0,  # 15% stop loss
-                    model_confidence=85.0,
-                    model_version='vault_sync'
-                )
+            if token_positions:
+                # ALWAYS UPDATE to match vault state
+                existing_pos = token_positions[0]  # Take the first open position
+                logger.info(f"Updating position for {holding.symbol}: {existing_pos.entry_quantity:.6f} → {holding.quantity:.6f} tokens")
+                
+                # If quantity changed significantly, update the position
+                if abs(existing_pos.entry_quantity - holding.quantity) > 0.000001:
+                    # Update position quantity in database
+                    await db_manager.update_position(
+                        existing_pos.position_id,
+                        {'entry_quantity': holding.quantity}
+                    )
+                    
+                    # Update in position manager's local cache
+                    existing_pos.entry_quantity = holding.quantity
                 
                 # Create Position object for return
                 position = Position(
-                    id=str(position_id),
+                    id=str(existing_pos.position_id),
                     symbol=holding.symbol,
-                    size=holding.quantity,
-                    average_price=avg_price,
+                    size=holding.quantity,  # Use vault quantity
+                    average_price=existing_pos.entry_price,
                     current_price=holding.current_price,
-                    unrealized_pnl=(holding.current_price - avg_price) * holding.quantity,
-                    entry_time=entry_time
-                )
-                
-                synced_positions[holding.symbol] = position
-                logger.info(f"Created position {position_id} for {holding.symbol}")
-                
-            except Exception as e:
-                logger.warning(f"Failed to create position for {holding.symbol}: {e}")
-                # Still track it in our return dict even if DB creation failed
-                position = Position(
-                    symbol=holding.symbol,
-                    size=holding.quantity,
-                    average_price=avg_price,
-                    current_price=holding.current_price,
-                    unrealized_pnl=(holding.current_price - avg_price) * holding.quantity,
-                    entry_time=entry_time
+                    unrealized_pnl=(holding.current_price - existing_pos.entry_price) * holding.quantity,
+                    entry_time=existing_pos.entry_time
                 )
                 synced_positions[holding.symbol] = position
+                
+            else:
+                # Create new position
+                logger.info(f"Creating position for {holding.symbol}: {holding.quantity:.6f} tokens")
+                
+                # Query for average buy price
+                query = """
+                SELECT 
+                    AVG(price) as avg_price,
+                    MIN(execution_time) as first_trade_time
+                FROM trades t
+                JOIN tokens tok ON t.token_id = tok.token_id
+                WHERE tok.symbol = $1
+                AND t.trade_type = 'buy'
+                """
+                
+                async with db_manager.pg_pool.acquire() as conn:
+                    result = await conn.fetchrow(query, holding.symbol)
+                
+                avg_price = float(result['avg_price']) if result and result['avg_price'] else holding.current_price
+                entry_time = result['first_trade_time'] if result and result['first_trade_time'] else datetime.utcnow()
+                
+                # Create position in position manager using its API
+                from .position_manager import PositionType
+                
+                try:
+                    # Open a new position through position manager
+                    position_id = await position_manager.open_position(
+                        token_id=token_info.token_id,
+                        position_type=PositionType.LONG,
+                        entry_price=avg_price,
+                        quantity=holding.quantity,
+                        stop_loss_pct=15.0,  # 15% stop loss
+                        model_confidence=85.0,
+                        model_version='vault_sync'
+                    )
+                    
+                    # Create Position object for return
+                    position = Position(
+                        id=str(position_id),
+                        symbol=holding.symbol,
+                        size=holding.quantity,
+                        average_price=avg_price,
+                        current_price=holding.current_price,
+                        unrealized_pnl=(holding.current_price - avg_price) * holding.quantity,
+                        entry_time=entry_time
+                    )
+                    
+                    synced_positions[holding.symbol] = position
+                    logger.info(f"Created position {position_id} for {holding.symbol}")
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to create position for {holding.symbol}: {e}")
+                    # Still track it in our return dict even if DB creation failed
+                    position = Position(
+                        symbol=holding.symbol,
+                        size=holding.quantity,
+                        average_price=avg_price,
+                        current_price=holding.current_price,
+                        unrealized_pnl=(holding.current_price - avg_price) * holding.quantity,
+                        entry_time=entry_time
+                    )
+                    synced_positions[holding.symbol] = position
+        
+        # STEP 2: Close positions that no longer exist in vault
+        for position_id, position_data in existing_positions.items():
+            if position_data.token_id not in vault_token_ids:
+                # This position doesn't exist in the vault anymore - close it
+                token_info = db_manager.get_token_by_id(position_data.token_id)
+                symbol = token_info.symbol if token_info else f"token_{position_data.token_id}"
+                
+                logger.info(f"Closing position for {symbol} - no longer in vault")
+                
+                # Get current price for closing
+                current_price = await db_manager.get_latest_price(position_data.token_id)
+                if not current_price:
+                    current_price = position_data.entry_price  # Fallback
+                
+                try:
+                    # Close the position
+                    await position_manager.close_position(
+                        position_id=position_id,
+                        exit_price=current_price,
+                        reason="vault_sync_removal"
+                    )
+                    logger.info(f"Closed position {position_id} for {symbol}")
+                except Exception as e:
+                    logger.error(f"Failed to close position {position_id}: {e}")
         
         # Log summary
         total_value = sum(p.size * p.current_price for p in synced_positions.values())
-        logger.info(f"✅ Sync complete: {len(synced_positions)} positions, total value: ${total_value:,.2f}")
+        logger.info(f"✅ Sync complete: {len(synced_positions)} positions from vault, total value: ${total_value:,.2f}")
         
         return synced_positions
         

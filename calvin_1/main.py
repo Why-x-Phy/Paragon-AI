@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pathlib import Path
 import pandas as pd
+import time # Added for _start_emergency_monitoring
 
 # Add current directory to path for consistent src imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -89,27 +90,35 @@ class CalvinVaultSystem:
             await self.scheduler.initialize()
             logger.info("✅ Inference scheduler initialized")
             
-            # Initialize emergency monitoring
+            # Initialize emergency monitoring (without WebSocket)
             from src.vault.emergency_monitor import EmergencyStopLossMonitor
             self.emergency_monitor = EmergencyStopLossMonitor()
             await self.emergency_monitor.initialize()
+            # Note: WebSocket price updates will be relayed from main manager
+            logger.warning("⚠️ Emergency monitor running without WebSocket feeds (price monitoring disabled)")
             
-            # 🚨 CRITICAL FIX: Connect emergency monitor to WebSocket feeds
-            # The emergency monitor needs access to the WebSocket feed for price monitoring
-            if hasattr(self.websocket_manager, 'price_feed') and self.websocket_manager.price_feed:
-                self.emergency_monitor.websocket_feed = self.websocket_manager.price_feed
-                logger.info("✅ Emergency monitor connected to WebSocket price feed")
-            else:
-                logger.warning("⚠️ Emergency monitor running without WebSocket feeds (price monitoring disabled)")
-            
-            # Connect emergency monitor to websocket price feeds
-            self.websocket_manager.add_price_handler(self._relay_price_to_emergency_monitor)
             logger.info("✅ Emergency monitoring initialized")
             
-            # Validate environment configuration
+            # Sync vault positions to position manager ONCE during system initialization
+            if self.emergency_monitor and self.emergency_monitor.vault_client and self.emergency_monitor.position_manager:
+                try:
+                    from src.trading.position_sync import auto_sync_on_startup
+                    logger.info("🔄 Syncing vault positions to position manager...")
+                    await auto_sync_on_startup(
+                        self.emergency_monitor.vault_client, 
+                        self.emergency_monitor.position_manager
+                    )
+                    logger.info("✅ Vault positions synced to position manager")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to sync vault positions: {e}")
+                    # Continue even if sync fails
+            else:
+                logger.info("⚠️ Position sync skipped (no emergency monitor available)")
+            
+            # Validate configuration
             self._validate_configuration()
             
-            # 🆕 VALIDATE SYSTEM STATE RECOVERY
+            # Validate state recovery
             await self._validate_state_recovery()
             
             logger.info("✅ Calvin Vault System initialization complete with state recovery")
@@ -200,7 +209,26 @@ class CalvinVaultSystem:
         """Start emergency monitoring in background"""
         try:
             if self.emergency_monitor:
-                # Emergency monitor will use websocket feeds from the manager
+                # Wait for WebSocket manager to be initialized
+                max_wait = 30  # seconds
+                start_time = time.time()
+                
+                while not self.websocket_manager and (time.time() - start_time) < max_wait:
+                    logger.info("⏳ Waiting for WebSocket manager to initialize...")
+                    await asyncio.sleep(1)
+                
+                if self.websocket_manager:
+                    # Create wrapper to adapt the signature
+                    async def price_handler_wrapper(symbol: str, price_update):
+                        await self.emergency_monitor._on_price_update(price_update)
+                    
+                    # Register the handler
+                    self.websocket_manager.add_price_handler(price_handler_wrapper)
+                    logger.info("✅ Emergency monitor price handler registered with WebSocket feed")
+                else:
+                    logger.error("❌ WebSocket manager not available after 30s - emergency monitor will not receive price updates")
+                
+                # Start monitoring
                 await self.emergency_monitor.start_monitoring()
         except Exception as e:
             logger.error(f"❌ Emergency monitoring startup failed: {e}")

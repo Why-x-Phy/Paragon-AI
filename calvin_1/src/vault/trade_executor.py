@@ -395,7 +395,8 @@ class VaultTradeExecutor:
                     tx_sig = await self.vault_client.execute_trade(
                         jupiter_data=jupiter_data,
                         source_mint=token_mint,  # Token we're selling
-                        destination_mint="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
+                        destination_mint="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                        amount_in=position_size  # Pass the amount of tokens to sell
                     )
                 else:
                     # Simulate vault execution for sell

@@ -194,9 +194,11 @@ class EmergencyStopLossMonitor:
             # Initialize position manager
             await self.position_manager.initialize()
             
-            # 🆕 Sync vault holdings to position manager on startup
-            logger.info("🔄 Syncing vault holdings to position manager...")
-            await auto_sync_on_startup(self.vault_client, self.position_manager)
+            # NOTE: Position sync is already done in main system startup
+            # Don't sync again to avoid duplicate syncs
+            # await auto_sync_on_startup(self.vault_client, self.position_manager)
+            
+            logger.info(f"Position manager initialized with {len(self.position_manager.active_positions)} open positions")
             
             # 🆕 RECOVER EMERGENCY STATE FROM DATABASE
             await self._recover_emergency_state()
@@ -718,9 +720,9 @@ class EmergencyStopLossMonitor:
     async def _get_vault_positions(self) -> Dict[str, PositionData]:
         """Get current vault positions from position manager (synced with vault)"""
         try:
-            # First ensure position manager is synced with vault
-            from ..trading.position_sync import sync_vault_to_positions
-            await sync_vault_to_positions(self.vault_client, self.position_manager, force_sync=False)
+            # NOTE: Position sync is already done during system startup
+            # Don't sync again - just use the existing position manager state
+            # await sync_vault_to_positions(self.vault_client, self.position_manager, force_sync=False)
             
             # Get positions from position manager
             active_positions = self.position_manager.get_active_positions()

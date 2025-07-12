@@ -320,14 +320,19 @@ class VaultClient:
             jupiter_accounts = jupiter_data.get('accounts', []) if isinstance(jupiter_data, dict) else []
             logger.debug(f"📋 Extracted {len(jupiter_accounts)} Jupiter accounts from swap data")
             
-            # Extract amount from jupiter_data if amount_usdc is not provided (for SELL trades)
+            # Extract amount from parameters or jupiter_data
             if amount_usdc is not None:
+                # BUY trades: amount in USDC
                 amount = int(amount_usdc * 1e6)
+            elif amount_in is not None:
+                # SELL trades: amount in tokens (already in lamports)
+                amount = int(amount_in)
+                logger.debug(f"📊 Using provided amount for SELL: {amount}")
             else:
-                # For SELL trades, extract the amount from the Jupiter quote data
+                # Fallback: try to extract from Jupiter quote data
                 if 'inAmount' in jupiter_data:
                     amount = int(jupiter_data['inAmount'])
-                    logger.debug(f"📊 Extracted amount from Jupiter data for SELL: {amount}")
+                    logger.debug(f"📊 Extracted amount from Jupiter data: {amount}")
                 else:
                     raise ValueError("No amount provided and could not extract from Jupiter data")
             

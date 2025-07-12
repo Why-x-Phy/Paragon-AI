@@ -9,7 +9,7 @@ Usage:
     python test_vault_swap.py <token_mint_address> [--network mainnet]
     
 Example:
-    python test_vault_swap.py EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm  # Sell all WIF
+    python test_vault_swap.py 2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv  # Sell all WIF
 
 WARNING: This script will execute real transactions with real vault funds.
 """
@@ -162,7 +162,8 @@ async def execute_liquidation(vault_client, jupiter_client, token_mint: str, tok
         trade_result = await vault_client.execute_trade(
             jupiter_data=swap_data,
             source_mint=token_mint,
-            destination_mint=USDC_MINT
+            destination_mint=USDC_MINT,
+            amount_in=token_amount_lamports  # Pass the amount we're selling
         )
         
         if not trade_result:
@@ -346,7 +347,7 @@ Examples:
                             # Additional fields for vault trades
                             signal_confidence=100.0,  # Manual liquidation
                             model_version='manual_liquidation',
-                            signal_strength='MANUAL',
+                            signal_strength='STRONG',  # Manual decisions are considered strong signals
                             predicted_change_pct=0.0,
                             cycle_timestamp=datetime.utcnow()
                         )

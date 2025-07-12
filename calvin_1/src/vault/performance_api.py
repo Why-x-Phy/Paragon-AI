@@ -159,10 +159,10 @@ class SimplePerformanceAPI:
         """Get historical portfolio value"""
         try:
             query = """
-                SELECT available_cash_usdc
+                SELECT total_portfolio_value_usdc
                 FROM portfolio_cycles 
                 WHERE cycle_timestamp <= NOW() - INTERVAL '%s hours'
-                AND available_cash_usdc IS NOT NULL
+                AND total_portfolio_value_usdc IS NOT NULL
                 ORDER BY cycle_timestamp DESC
                 LIMIT 1
             """
@@ -226,10 +226,10 @@ class SimplePerformanceAPI:
             
             # Get average portfolio value for the period (as base)
             query = """
-                SELECT AVG(available_cash_usdc) as avg_value
+                SELECT AVG(total_portfolio_value_usdc) as avg_value
                 FROM portfolio_cycles 
                 WHERE cycle_timestamp >= NOW() - INTERVAL '%s hours'
-                AND available_cash_usdc IS NOT NULL
+                AND total_portfolio_value_usdc IS NOT NULL
             """
             
             async with self.db_manager.pg_pool.acquire() as conn:
@@ -259,7 +259,7 @@ class SimplePerformanceAPI:
                 query = """
                     SELECT MIN(cycle_timestamp) as earliest
                     FROM portfolio_cycles 
-                    WHERE available_cash_usdc IS NOT NULL
+                    WHERE total_portfolio_value_usdc IS NOT NULL
                 """
                 async with self.db_manager.pg_pool.acquire() as conn:
                     earliest_data = await conn.fetchval(query)
@@ -279,9 +279,9 @@ class SimplePerformanceAPI:
             
             # If no valid historical data, try to get earliest available
             query = """
-                SELECT available_cash_usdc
+                SELECT total_portfolio_value_usdc
                 FROM portfolio_cycles 
-                WHERE available_cash_usdc IS NOT NULL
+                WHERE total_portfolio_value_usdc IS NOT NULL
                 ORDER BY cycle_timestamp ASC
                 LIMIT 1
             """
@@ -310,7 +310,7 @@ class SimplePerformanceAPI:
             query = """
                 SELECT MIN(cycle_timestamp) as earliest
                 FROM portfolio_cycles 
-                WHERE available_cash_usdc IS NOT NULL
+                WHERE total_portfolio_value_usdc IS NOT NULL
             """
             
             async with self.db_manager.pg_pool.acquire() as conn:
@@ -333,10 +333,10 @@ class SimplePerformanceAPI:
         """Get current total portfolio value"""
         try:
             query = """
-                SELECT COALESCE(AVG(available_cash_usdc), 0) as current_value
+                SELECT COALESCE(AVG(total_portfolio_value_usdc), 0) as current_value
                 FROM portfolio_cycles 
                 WHERE cycle_timestamp >= NOW() - INTERVAL '1 hour'
-                AND available_cash_usdc IS NOT NULL
+                AND total_portfolio_value_usdc IS NOT NULL
             """
             
             async with self.db_manager.pg_pool.acquire() as conn:
@@ -403,9 +403,9 @@ class SimplePerformanceAPI:
                 logger.warning("Vault client not initialized, falling back to database")
                 # Try to get the most recent available_cash_usdc as proxy for NAV
                 query = """
-                    SELECT available_cash_usdc
+                    SELECT total_portfolio_value_usdc
                     FROM portfolio_cycles 
-                    WHERE available_cash_usdc IS NOT NULL
+                    WHERE total_portfolio_value_usdc IS NOT NULL
                     ORDER BY cycle_timestamp DESC
                     LIMIT 1
                 """
@@ -432,9 +432,9 @@ class SimplePerformanceAPI:
             # If still 0, use available_cash_usdc from latest portfolio cycle
             if nav_usdc == 0:
                 query = """
-                    SELECT available_cash_usdc
+                    SELECT total_portfolio_value_usdc
                     FROM portfolio_cycles 
-                    WHERE available_cash_usdc IS NOT NULL
+                    WHERE total_portfolio_value_usdc IS NOT NULL
                     ORDER BY cycle_timestamp DESC
                     LIMIT 1
                 """
@@ -442,7 +442,7 @@ class SimplePerformanceAPI:
                     latest_cash = await conn.fetchval(query)
                     if latest_cash:
                         nav_usdc = float(latest_cash)
-                        logger.info(f"Using available_cash_usdc as NAV proxy: ${nav_usdc:,.2f}")
+                        logger.info(f"Using total_portfolio_value_usdc as NAV proxy: ${nav_usdc:,.2f}")
             
             # Cache the value
             self._vault_nav_cache[cache_key] = (datetime.utcnow(), nav_usdc)
@@ -489,7 +489,7 @@ class SimplePerformanceAPI:
                 query = """
                     SELECT MIN(cycle_timestamp) as earliest
                     FROM portfolio_cycles 
-                    WHERE available_cash_usdc IS NOT NULL
+                    WHERE total_portfolio_value_usdc IS NOT NULL
                 """
                 
                 earliest_data = await conn.fetchval(query)
@@ -502,9 +502,9 @@ class SimplePerformanceAPI:
                         logger.debug(f"Not enough data for {hours_back}h return (only have {hours_of_data:.1f}h), using earliest available data")
                         # Get the earliest value we have
                         query = """
-                            SELECT available_cash_usdc
+                            SELECT total_portfolio_value_usdc
                             FROM portfolio_cycles 
-                            WHERE available_cash_usdc IS NOT NULL
+                            WHERE total_portfolio_value_usdc IS NOT NULL
                             ORDER BY cycle_timestamp ASC
                             LIMIT 1
                         """
@@ -534,10 +534,10 @@ class SimplePerformanceAPI:
                 else:
                     # Fallback: Use available_cash_usdc from portfolio_cycles
                     query = """
-                        SELECT available_cash_usdc
+                        SELECT total_portfolio_value_usdc
                         FROM portfolio_cycles 
                         WHERE cycle_timestamp <= NOW() - INTERVAL '%s hours'
-                        AND available_cash_usdc IS NOT NULL
+                        AND total_portfolio_value_usdc IS NOT NULL
                         ORDER BY cycle_timestamp DESC
                         LIMIT 1
                     """
@@ -566,7 +566,7 @@ class SimplePerformanceAPI:
             query = """
                 SELECT MIN(cycle_timestamp) as earliest
                 FROM portfolio_cycles 
-                WHERE available_cash_usdc IS NOT NULL
+                WHERE total_portfolio_value_usdc IS NOT NULL
             """
             
             async with self.db_manager.pg_pool.acquire() as conn:

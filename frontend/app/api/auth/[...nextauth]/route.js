@@ -39,12 +39,16 @@ const handler = NextAuth({
 
           const data = await response.json()
           console.log('📋 User roles:', data.roles);
-          console.log('🎯 Required role:', process.env.REQUIRED_ROLE_ID);
           
-          const hasRequiredRole = data.roles.includes(process.env.REQUIRED_ROLE_ID)
+          // Support multiple required roles (comma-separated)
+          const requiredRoles = (process.env.REQUIRED_ROLE_IDS || process.env.REQUIRED_ROLE_ID || '').split(',').filter(Boolean)
+          console.log('🎯 Required roles:', requiredRoles);
+          
+          // Check if user has ANY of the required roles
+          const hasRequiredRole = requiredRoles.some(roleId => data.roles.includes(roleId.trim()))
           
           if (!hasRequiredRole) {
-            console.log('❌ User does not have required role:', process.env.REQUIRED_ROLE_ID)
+            console.log('❌ User does not have any of the required roles:', requiredRoles)
             return false
           }
 

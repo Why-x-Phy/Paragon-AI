@@ -396,6 +396,13 @@ class MLModel:
         )
         
         # Load the best model from checkpoints
+        from src.model.profit_functions import (
+            profit_loss, directional_loss, combined_profit_mse_loss, 
+            direction_accuracy, simple_directional_loss, direction_focused_loss,
+            balanced_directional_loss, magnitude_constrained_loss, 
+            variance_encouraging_loss, anti_collapse_loss, robust_directional_loss
+        )
+        
         self.model = load_model(
             checkpoint_path,
             custom_objects={
@@ -404,7 +411,13 @@ class MLModel:
                 'combined_profit_mse_loss': combined_profit_mse_loss,
                 'direction_accuracy': direction_accuracy,
                 'custom_direction_accuracy': direction_accuracy,  # Alias for compatibility
-                'simple_directional_loss': simple_directional_loss
+                'simple_directional_loss': simple_directional_loss,
+                'direction_focused_loss': direction_focused_loss,
+                'balanced_directional_loss': balanced_directional_loss,
+                'magnitude_constrained_loss': magnitude_constrained_loss,
+                'variance_encouraging_loss': variance_encouraging_loss,
+                'anti_collapse_loss': anti_collapse_loss,
+                'robust_directional_loss': robust_directional_loss
             }
         )
         
@@ -417,17 +430,17 @@ class MLModel:
         dir_acc = 0
         total_comparisons = 0
         
-        # Need at least 2 points to calculate direction
-        for i in range(1, len(y_val)):
-            # Calculate actual price change direction from previous point
-            actual_change = y_val[i] - y_val[i-1]
-            predicted_change = y_pred_val[i] - y_val[i-1]  # Predict change from previous actual price
+        # Calculate direction accuracy for percentage change predictions
+        for i in range(len(y_val)):
+            # y_val[i] and y_pred_val[i] are already percentage changes
+            actual_change = y_val[i]        # This IS the percentage change
+            predicted_change = y_pred_val[i] # This IS the percentage change
             
             # Skip if actual change is essentially zero (no clear direction)
             if abs(actual_change) < 1e-6:
                 continue
                 
-            # Check if signs of changes match (both up or both down)
+            # Check if signs of percentage changes match (both up or both down)
             if np.sign(actual_change) == np.sign(predicted_change):
                 dir_acc += 1
             total_comparisons += 1
@@ -480,21 +493,22 @@ class MLModel:
         mae = mean_absolute_error(y_test, y_pred)
         r2 = r2_score(y_test, y_pred)
         
-        # Calculate directional accuracy manually - FIXED VERSION
+        # Calculate directional accuracy manually - TRULY CORRECT VERSION
+        # Since our model predicts percentage changes (not absolute prices),
+        # we should compare the signs of the percentage changes directly
         correct_direction = 0
         total_comparisons = 0
         
-        # Need at least 2 points to calculate direction
-        for i in range(1, len(y_test)):
-            # Calculate actual price change direction from previous point
-            actual_change = y_test[i] - y_test[i-1]
-            predicted_change = y_pred[i] - y_test[i-1]  # Predict change from previous actual price
+        for i in range(len(y_test)):
+            # y_test[i] and y_pred[i] are already percentage changes
+            actual_change = y_test[i]    # This IS the percentage change
+            predicted_change = y_pred[i] # This IS the percentage change
             
             # Skip if actual change is essentially zero (no clear direction)
             if abs(actual_change) < 1e-6:
                 continue
                 
-            # Check if signs of changes match (both up or both down)
+            # Check if signs of percentage changes match (both up or both down)
             if np.sign(actual_change) == np.sign(predicted_change):
                 correct_direction += 1
             total_comparisons += 1
@@ -721,7 +735,9 @@ class MLModel:
         from src.model.profit_functions import (
             profit_loss, directional_loss, combined_profit_mse_loss, 
             cumulative_return_metric, win_rate_metric, sharpe_ratio_metric,
-            direction_accuracy, simple_directional_loss, direction_focused_loss
+            direction_accuracy, simple_directional_loss, direction_focused_loss,
+            balanced_directional_loss, magnitude_constrained_loss, 
+            variance_encouraging_loss, anti_collapse_loss, robust_directional_loss
         )
         
         custom_objects = {
@@ -733,7 +749,12 @@ class MLModel:
             'sharpe_ratio_metric': sharpe_ratio_metric,
             'direction_accuracy': direction_accuracy,
             'simple_directional_loss': simple_directional_loss,
-            'direction_focused_loss': direction_focused_loss
+            'direction_focused_loss': direction_focused_loss,
+            'balanced_directional_loss': balanced_directional_loss,
+            'magnitude_constrained_loss': magnitude_constrained_loss,
+            'variance_encouraging_loss': variance_encouraging_loss,
+            'anti_collapse_loss': anti_collapse_loss,
+            'robust_directional_loss': robust_directional_loss
         }
         
         # Load the model with custom objects
@@ -1423,9 +1444,10 @@ class MLModel:
         correct_dir = 0
         total_dir = 0
         
-        for i in range(1, len(y_true)):
-            actual_dir = y_true[i] - y_true[i-1]
-            pred_dir = y_pred[i] - y_true[i-1]
+        for i in range(len(y_true)):
+            # y_true[i] and y_pred[i] are already percentage changes
+            actual_dir = y_true[i]  # This IS the percentage change
+            pred_dir = y_pred[i]    # This IS the percentage change
             
             # Only count non-zero changes
             if np.abs(actual_dir) > 1e-6:

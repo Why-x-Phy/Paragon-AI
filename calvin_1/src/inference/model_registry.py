@@ -99,7 +99,7 @@ class LSTMModelRegistry:
             redis_client: Redis client for caching (will create if None)
         """
         # Use existing configuration system
-        self.models_dir = Path(models_dir or config.MODEL_BASE_PATH or "./calvin_1/models")
+        self.models_dir = Path(models_dir or config.MODEL_BASE_PATH or "./models")
         self.registry_path = Path(config.MODEL_REGISTRY_PATH or f"{self.models_dir}/registry")
         
         # Create directories if they don't exist

@@ -754,7 +754,7 @@ async def train_model(args: Dict[str, Any]) -> None:
         symbol, 
         resolution, 
         days, 
-        save_data=True,
+        save_data=False,
         include_sentiment=True  # Skip sentiment data for now
     )
     

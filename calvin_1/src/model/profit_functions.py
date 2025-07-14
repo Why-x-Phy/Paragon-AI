@@ -655,6 +655,90 @@ def backtest_trades(prices, predictions, transaction_cost_pct=0.001):
         'trades': trades
     }
 
+def variance_encouraging_loss(y_true, y_pred):
+    """
+    Loss function that encourages prediction variance to prevent collapse to constant values.
+    
+    This loss:
+    1. Rewards correct direction predictions
+    2. Encourages prediction diversity (penalizes constant predictions)
+    3. Catches large moves in both directions
+    4. Prevents mean-collapse by penalizing predictions too close to the batch mean
+    
+    Args:
+        y_true: True price changes
+        y_pred: Predicted price changes
+        
+    Returns:
+        Combined loss value
+    """
+    import tensorflow as tf
+    
+    # Cast to float32
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
+    # 1. Direction component with softer penalty for small errors
+    true_sign = tf.sign(y_true)
+    pred_sign = tf.sign(y_pred)
+    
+    # Use soft directional loss - less penalty for small magnitude errors
+    # Weight by the magnitude of the true change (important changes matter more)
+    weights = tf.abs(y_true) / (tf.reduce_mean(tf.abs(y_true)) + 1e-7)
+    weights = tf.clip_by_value(weights, 0.5, 2.0)  # Limit weight range
+    
+    direction_correct = tf.cast(tf.equal(true_sign, pred_sign), tf.float32)
+    weighted_direction_loss = 1.0 - tf.reduce_mean(direction_correct * weights)
+    
+    # 2. Variance encouragement - penalize predictions with too low variance
+    pred_variance = tf.nn.moments(y_pred, axes=[0])[1]  # Variance of predictions
+    target_variance = tf.nn.moments(y_true, axes=[0])[1]  # Variance of targets
+    
+    # Penalize if prediction variance is too low (less than 50% of target variance)
+    variance_ratio = pred_variance / (target_variance + 1e-7)
+    variance_penalty = tf.maximum(0.0, 0.5 - variance_ratio) * 2.0  # Scale up penalty
+    
+    # 3. Anti-collapse penalty - penalize predictions too close to batch mean
+    pred_mean = tf.reduce_mean(y_pred)
+    distances_from_mean = tf.abs(y_pred - pred_mean)
+    mean_distance = tf.reduce_mean(distances_from_mean)
+    
+    # Penalize if predictions cluster too close to their mean
+    collapse_penalty = tf.maximum(0.0, 0.001 - mean_distance) * 100.0  # Strong penalty
+    
+    # 4. Large move detection (both up and down)
+    large_threshold = 0.02  # 2% moves
+    
+    # Large moves
+    large_moves = tf.cast(tf.abs(y_true) > large_threshold, tf.float32)
+    large_move_correct = large_moves * tf.cast(
+        tf.equal(true_sign, pred_sign), tf.float32
+    )
+    
+    # Only calculate if we have large moves
+    num_large_moves = tf.reduce_sum(large_moves)
+    large_move_accuracy = tf.cond(
+        num_large_moves > 0,
+        lambda: tf.reduce_sum(large_move_correct) / num_large_moves,
+        lambda: tf.constant(1.0, dtype=tf.float32)
+    )
+    large_move_loss = 1.0 - large_move_accuracy
+    
+    # 5. Magnitude component (MSE) with less weight
+    magnitude_loss = tf.reduce_mean(tf.square(y_true - y_pred))
+    
+    # Combine all components
+    total_loss = (
+        0.35 * weighted_direction_loss +    # Direction (reduced from 0.5)
+        0.25 * large_move_loss +           # Large moves (reduced from 0.35) 
+        0.10 * magnitude_loss +            # Magnitude (reduced from 0.15)
+        0.20 * variance_penalty +          # Variance encouragement (NEW)
+        0.10 * collapse_penalty            # Anti-collapse (NEW)
+    )
+    
+    return total_loss
+
+
 def simple_directional_loss(y_true, y_pred):
     """
     Simple loss function that optimizes for our trading strategy.
@@ -686,36 +770,49 @@ def simple_directional_loss(y_true, y_pred):
     # Use mean squared error between predictions and targets
     magnitude_loss = tf.reduce_mean(tf.square(y_true - y_pred))
     
-    # 3. Special case - heavily penalize missing large downward moves
-    # Identify large downward moves (true change < -2% for more sensitivity)
-    large_down_moves = tf.cast(y_true < -0.03, tf.float32)  # Fix #23: Changed from -0.03 to -0.02
-    # Check if we correctly predicted the direction for these moves
+    # 3. Special case - heavily penalize missing large moves (both up and down)
+    # This ensures the model learns to catch significant opportunities in both directions
+    
+    # Large downward moves (for stop-losses)
+    large_down_moves = tf.cast(y_true < -0.03, tf.float32)  # -3% threshold
     correct_down_preds = large_down_moves * tf.cast(y_pred < 0, tf.float32)
-    # Only apply if we have large down moves
     has_large_downs = tf.reduce_sum(large_down_moves)
     down_move_accuracy = tf.cond(
         has_large_downs > 0,
         lambda: tf.reduce_sum(correct_down_preds) / has_large_downs,
-        lambda: tf.constant(1.0, dtype=tf.float32)  # No down moves, so "perfect" score
+        lambda: tf.constant(1.0, dtype=tf.float32)
     )
-    down_move_loss = 1.0 - down_move_accuracy
+    
+    # Large upward moves (for capturing profits)
+    large_up_moves = tf.cast(y_true > 0.03, tf.float32)  # +3% threshold
+    correct_up_preds = large_up_moves * tf.cast(y_pred > 0, tf.float32)
+    has_large_ups = tf.reduce_sum(large_up_moves)
+    up_move_accuracy = tf.cond(
+        has_large_ups > 0,
+        lambda: tf.reduce_sum(correct_up_preds) / has_large_ups,
+        lambda: tf.constant(1.0, dtype=tf.float32)
+    )
+    
+    # Combined large move loss (average of up and down accuracy)
+    large_move_loss = 1.0 - (down_move_accuracy + up_move_accuracy) / 2.0
     
     # Combine losses with appropriate weights
-    # Direction is most important (60%), followed by catching down moves (30%), 
-    # then general magnitude (10%)
-    combined_loss = 0.6 * direction_loss + 0.3 * down_move_loss + 0.1 * magnitude_loss
+    # Direction is most important (50%), followed by catching large moves (35%), 
+    # then general magnitude (15%)
+    combined_loss = 0.5 * direction_loss + 0.35 * large_move_loss + 0.15 * magnitude_loss
     
     return combined_loss
 
 
 def direction_focused_loss(y_true, y_pred):
     """
-    Fix #23: Custom loss that heavily prioritizes direction accuracy
+    Direction-focused loss with gentle bias correction
     
     This loss function:
     1. Heavily penalizes wrong direction predictions
     2. Lightly penalizes magnitude errors when direction is correct
-    3. Designed to push direction accuracy above 80%
+    3. Adds gentle bias correction to prevent extreme one-sided predictions
+    4. Designed to push direction accuracy above 80% while maintaining balance
     
     Args:
         y_true: True price changes (normalized)
@@ -744,11 +841,115 @@ def direction_focused_loss(y_true, y_pred):
     # Apply weights to squared error
     weighted_loss = squared_error * direction_weight
     
+    # GENTLE BIAS CORRECTION: Only penalize extreme bias
+    # Calculate prediction bias (how much the model favors positive vs negative)
+    pred_bias = tf.reduce_mean(y_pred)
+    
+    # Only penalize if bias is very strong (>0.5 in either direction)
+    # Use quadratic penalty instead of exponential to be gentler
+    bias_threshold = 0.5
+    bias_penalty = tf.where(
+        tf.abs(pred_bias) > bias_threshold,
+        0.01 * tf.square(pred_bias),  # Gentle quadratic penalty
+        0.0  # No penalty for reasonable bias
+    )
+    
     # Add small penalty for predicting near zero (to prevent collapse)
     zero_penalty = 0.01 * tf.exp(-10.0 * tf.abs(y_pred))
     
+    # Combine losses with gentle bias correction
+    total_loss = tf.reduce_mean(weighted_loss + zero_penalty) + bias_penalty
+    
+    return total_loss
+
+
+def balanced_directional_loss(y_true, y_pred):
+    """
+    Pure directional loss function focused on eliminating bias
+    
+    Key design:
+    1. Only cares about direction (buy/sell signal)
+    2. Eliminates systematic bias toward positive or negative predictions
+    3. Ignores magnitude completely - direction is all that matters for trading
+    
+    Args:
+        y_true: True price changes (normalized)
+        y_pred: Predicted price changes (normalized)
+        
+    Returns:
+        Loss focused purely on unbiased directional accuracy
+    """
+    import tensorflow as tf
+    
+    # Cast to float32
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
+    # 1. Directional accuracy (MAIN component)
+    true_sign = tf.sign(y_true)
+    pred_sign = tf.sign(y_pred)
+    
+    # Directional agreement (1 if same direction, 0 if opposite)
+    directional_agreement = tf.cast(tf.equal(true_sign, pred_sign), tf.float32)
+    directional_accuracy = tf.reduce_mean(directional_agreement)
+    directional_loss = 1.0 - directional_accuracy
+    
+    # 2. Bias elimination (SECONDARY component)
+    # Penalize systematic bias toward positive or negative predictions
+    pred_mean = tf.reduce_mean(y_pred)
+    bias_penalty = tf.square(pred_mean)
+    
+    # 3. Sign distribution balance
+    # Encourage roughly equal positive and negative predictions
+    positive_ratio = tf.reduce_mean(tf.cast(y_pred > 0, tf.float32))
+    # Ideal ratio is 0.5 (50% positive, 50% negative)
+    balance_penalty = tf.square(positive_ratio - 0.5)
+    
+    # Combine components (pure directional focus)
+    total_loss = (
+        0.7 * directional_loss +   # PRIMARY: get the direction right
+        0.2 * bias_penalty +       # SECONDARY: eliminate mean bias
+        0.1 * balance_penalty      # TERTIARY: balance positive/negative predictions
+    )
+    
+    return total_loss
+
+
+def magnitude_constrained_loss(y_true, y_pred, max_change=0.15):
+    """
+    Loss function with explicit magnitude constraints to prevent extreme predictions
+    
+    Args:
+        y_true: True price changes
+        y_pred: Predicted price changes  
+        max_change: Maximum allowed prediction magnitude (default 15%)
+        
+    Returns:
+        Loss with magnitude constraints
+    """
+    import tensorflow as tf
+    
+    # Cast to float32
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
+    # Clip predictions to reasonable range
+    y_pred_clipped = tf.clip_by_value(y_pred, -max_change, max_change)
+    
+    # Calculate directional accuracy on clipped predictions
+    true_sign = tf.sign(y_true)
+    pred_sign = tf.sign(y_pred_clipped)
+    direction_correct = tf.cast(tf.equal(true_sign, pred_sign), tf.float32)
+    direction_loss = 1.0 - tf.reduce_mean(direction_correct)
+    
+    # Calculate magnitude loss on clipped predictions
+    magnitude_loss = tf.reduce_mean(tf.square(y_true - y_pred_clipped))
+    
+    # Add penalty for extreme predictions (before clipping)
+    extreme_penalty = tf.reduce_mean(tf.maximum(0.0, tf.abs(y_pred) - max_change))
+    
     # Combine losses
-    total_loss = tf.reduce_mean(weighted_loss + zero_penalty)
+    total_loss = 0.6 * direction_loss + 0.3 * magnitude_loss + 0.1 * extreme_penalty
     
     return total_loss
 
@@ -1225,3 +1426,160 @@ def plot_backtest_with_signals(
         import traceback
         traceback.print_exc()
         return None 
+
+def anti_collapse_loss(y_true, y_pred):
+    """
+    Loss function that prevents model collapse to constant predictions.
+    
+    Based on research showing that LSTMs often get stuck predicting constants,
+    this loss function:
+    1. Includes standard prediction error
+    2. Penalizes low variance in predictions 
+    3. Rewards predictions that vary appropriately with the data
+    4. Adds a small amount of noise to prevent getting stuck
+    
+    Args:
+        y_true: True price changes
+        y_pred: Predicted price changes
+        
+    Returns:
+        Combined loss value
+    """
+    import tensorflow as tf
+    
+    # Cast to float32
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
+    # 1. Standard MSE component
+    mse_loss = tf.reduce_mean(tf.square(y_true - y_pred))
+    
+    # 2. Variance preservation component
+    # Calculate variance of predictions in the batch
+    pred_mean = tf.reduce_mean(y_pred)
+    pred_variance = tf.reduce_mean(tf.square(y_pred - pred_mean))
+    
+    # Calculate target variance (what we want the predictions to have)
+    true_mean = tf.reduce_mean(y_true) 
+    true_variance = tf.reduce_mean(tf.square(y_true - true_mean))
+    
+    # Penalize when prediction variance is too low
+    # Use a soft penalty that increases as variance approaches zero
+    min_variance = 0.0001  # Minimum acceptable variance
+    variance_penalty = tf.nn.relu(min_variance - pred_variance) * 100.0
+    
+    # 3. Enhanced distribution matching component with bias correction
+    # Encourage the prediction distribution to match the true distribution
+    # This helps prevent all predictions being positive or negative
+    distribution_loss = tf.abs(pred_mean - true_mean) * 10.0
+    
+    # 3b. Explicit bias correction - penalize extreme positive/negative bias
+    # Count proportion of positive/negative predictions vs actual
+    pred_positive_ratio = tf.reduce_mean(tf.cast(y_pred > 0, tf.float32))
+    true_positive_ratio = tf.reduce_mean(tf.cast(y_true > 0, tf.float32))
+    
+    # Gently penalize when prediction bias differs from actual data
+    # Reduced from 20.0 to 5.0 to be less aggressive
+    bias_penalty = tf.square(pred_positive_ratio - true_positive_ratio) * 5.0
+    
+    # Light penalty for extreme bias (>90% positive or <10% positive predictions)
+    # Reduced from 50.0 to 10.0 and changed threshold from 95% to 90%
+    extreme_bias_penalty = tf.nn.relu(pred_positive_ratio - 0.90) * 10.0 + \
+                          tf.nn.relu(0.10 - pred_positive_ratio) * 10.0
+    
+    # 4. Correlation component - predictions should correlate with truth
+    # Calculate correlation coefficient
+    pred_centered = y_pred - pred_mean
+    true_centered = y_true - true_mean
+    
+    correlation = tf.reduce_sum(pred_centered * true_centered) / (
+        tf.sqrt(tf.reduce_sum(tf.square(pred_centered)) + 1e-8) * 
+        tf.sqrt(tf.reduce_sum(tf.square(true_centered)) + 1e-8)
+    )
+    
+    # We want high correlation (close to 1 or -1), so minimize (1 - abs(correlation))
+    correlation_loss = 1.0 - tf.abs(correlation)
+    
+    # 5. Add small random noise to loss to help escape local minima
+    # This is based on "Adding Gradient Noise Improves Learning" research
+    noise = tf.random.normal(shape=[], mean=0.0, stddev=0.001)
+    
+    # Combine all components with weights
+    total_loss = (
+        mse_loss * 1.0 +           # Main prediction error
+        variance_penalty * 0.5 +    # Prevent collapse to constant
+        distribution_loss * 0.2 +   # Match distribution shape
+        bias_penalty * 0.3 +        # Penalize prediction bias
+        extreme_bias_penalty * 0.1 + # Heavily penalize extreme bias
+        correlation_loss * 0.3 +    # Ensure predictions track reality
+        noise                       # Small noise to escape local minima
+    )
+    
+    # Log components for debugging (only during training)
+    tf.summary.scalar('mse_loss', mse_loss)
+    tf.summary.scalar('variance_penalty', variance_penalty) 
+    tf.summary.scalar('pred_variance', pred_variance)
+    tf.summary.scalar('distribution_loss', distribution_loss)
+    tf.summary.scalar('bias_penalty', bias_penalty)
+    tf.summary.scalar('extreme_bias_penalty', extreme_bias_penalty)
+    tf.summary.scalar('pred_positive_ratio', pred_positive_ratio)
+    tf.summary.scalar('true_positive_ratio', true_positive_ratio)
+    tf.summary.scalar('correlation_loss', correlation_loss)
+    
+    return total_loss
+
+
+def robust_directional_loss(y_true, y_pred):
+    """
+    A robust loss function that prevents collapse while maintaining good directional accuracy.
+    
+    This combines the best aspects of directional loss with anti-collapse mechanisms.
+    """
+    import tensorflow as tf
+    
+    # Cast to float32
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
+    # 1. Directional accuracy component (from simple_directional_loss)
+    true_sign = tf.sign(y_true)
+    pred_sign = tf.sign(y_pred)
+    
+    # Softer penalty for small errors near zero
+    direction_accuracy = tf.reduce_mean(
+        tf.cast(tf.equal(true_sign, pred_sign), tf.float32)
+    )
+    direction_loss = 1.0 - direction_accuracy
+    
+    # 2. Magnitude component with variance preservation
+    magnitude_loss = tf.reduce_mean(tf.abs(y_true - y_pred))
+    
+    # 3. Prevent collapse - ensure predictions have reasonable variance
+    pred_variance = tf.reduce_mean(tf.square(y_pred - tf.reduce_mean(y_pred)))
+    true_variance = tf.reduce_mean(tf.square(y_true - tf.reduce_mean(y_true)))
+    
+    # Adaptive variance target - we want at least 50% of true variance
+    target_variance = tf.maximum(true_variance * 0.5, 0.0001)
+    variance_penalty = tf.nn.relu(target_variance - pred_variance) * 10.0
+    
+    # 4. Large move detection (both up and down)
+    large_moves = tf.cast(tf.abs(y_true) > 0.03, tf.float32)
+    large_move_errors = large_moves * tf.cast(
+        tf.not_equal(true_sign, pred_sign), tf.float32
+    )
+    large_move_penalty = tf.reduce_mean(large_move_errors) * 2.0
+    
+    # 5. Ensure balanced predictions (not all positive or all negative)
+    pred_mean = tf.reduce_mean(y_pred)
+    balance_penalty = tf.square(pred_mean) * 5.0  # Penalize deviation from zero mean
+    
+    # Combine with adaptive weights
+    total_loss = (
+        direction_loss * 0.4 +
+        magnitude_loss * 0.2 +
+        variance_penalty * 0.2 +
+        large_move_penalty * 0.1 +
+        balance_penalty * 0.1
+    )
+    
+    return total_loss 

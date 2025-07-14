@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Union, Any, Tuple
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler
 from sklearn.model_selection import train_test_split
 import time
 import concurrent.futures
@@ -36,7 +36,9 @@ class DataProcessor:
         os.makedirs(self.data_dir, exist_ok=True)
         
         # Scalers for normalization
-        self.price_scaler = MinMaxScaler()
+        # Use symmetric MinMaxScaler for percentage changes to scale to [-1, 1]
+        # This preserves sign and bounds the output (good for crypto volatility)
+        self.price_scaler = MinMaxScaler(feature_range=(-1, 1))
         self.feature_scaler = StandardScaler()
         
         # Store last known prices for predictions
@@ -633,8 +635,8 @@ class DataProcessor:
             
             # Find significant swing highs and lows
             try:
-                # FIXED: Changed center=True to center=False to avoid look-ahead bias
-                # Now only looks at past data when identifying swing points
+                # FIXED: Only look at past data to avoid look-ahead bias
+                # Check if current point is a local extreme compared to PAST values only
                 df['swing_high'] = df['high'].rolling(window=window, center=False).apply(
                     lambda x: x.iloc[-1] == x.max() if len(x) == window else False, raw=False
                 ).astype(bool)
@@ -1844,11 +1846,16 @@ class DataProcessor:
 
         # CRITICAL: Remove price columns from social data to avoid conflicts with OHLCV data
         # The model should only use OHLCV prices, not LunarCrush prices
-        social_price_columns = ['close_price', 'open_price', 'high_price', 'low_price', 'volume_24h']
-        sentiment_df_filtered = sentiment_df.drop(columns=[col for col in social_price_columns if col in sentiment_df.columns])
+        # Also remove any 'close' column to prevent duplicates
+        social_price_columns = ['close', 'close_price', 'open', 'open_price', 'high', 'high_price', 
+                               'low', 'low_price', 'volume', 'volume_24h']
+        columns_to_remove = [col for col in social_price_columns if col in sentiment_df.columns]
         
-        if len([col for col in social_price_columns if col in sentiment_df.columns]) > 0:
-            logger.info(f"Removed social data price columns to avoid conflicts with OHLCV data: {[col for col in social_price_columns if col in sentiment_df.columns]}")
+        if columns_to_remove:
+            sentiment_df_filtered = sentiment_df.drop(columns=columns_to_remove)
+            logger.info(f"Removed social data price columns to avoid conflicts with OHLCV data: {columns_to_remove}")
+        else:
+            sentiment_df_filtered = sentiment_df
         
         # Make sure sentiment_df has a timestamp column or index
         if not isinstance(sentiment_df_filtered.index, pd.DatetimeIndex):
@@ -2063,6 +2070,9 @@ class DataProcessor:
                 )
 
         features = self.feature_scaler.transform(df[feature_cols].values)
+        
+        # Don't scale percentage changes - they're already normalized
+        # Using StandardScaler instead of MinMaxScaler to preserve sign
         targets  = self.price_scaler.transform(
             df['target'].values.reshape(-1, 1)
         ).flatten()
@@ -2271,9 +2281,11 @@ class DataProcessor:
                     # FIXED: Use safer log calculations to prevent warnings
                     
                     # Ensure minimum values to prevent log(0) warnings
-                    safe_col = result[col].clip(lower=1e-10)  # Much smaller minimum
-                    safe_col_1d = result[col].shift(1).clip(lower=1e-10)
-                    safe_col_3d = result[col].shift(3).clip(lower=1e-10)
+                    # Use a more reasonable minimum based on the data scale
+                    min_value = max(1e-10, result[col].mean() * 1e-6) if result[col].mean() > 0 else 1e-10
+                    safe_col = result[col].clip(lower=min_value)
+                    safe_col_1d = result[col].shift(1).clip(lower=min_value)
+                    safe_col_3d = result[col].shift(3).clip(lower=min_value)
                     
                     # Use np.log1p for better numerical stability near zero
                     # log1p(x) = log(1 + x) which is more stable for small x
@@ -2478,21 +2490,30 @@ class DataProcessor:
         # Create a copy to avoid modifying the original
         result = df.copy()
         
-        # FIXED: Only use backward-looking shifts to avoid look-ahead bias
-        # Create only backward shifts for comparison
-        shifts = list(range(1, window+1))
+        # FIXED: Only use backward-looking comparisons to avoid look-ahead bias
+        # A swing high is when current high is greater than all previous highs in window
+        # A swing low is when current low is less than all previous lows in window
         
         # Initialize swing point columns
-        result['swing_high'] = True
-        result['swing_low'] = True
+        result['swing_high'] = False
+        result['swing_low'] = False
         
-        # For each shift, check if the current point is higher/lower than past bars only
-        for shift in shifts:
-            # Current high must be higher than all past bars in the window
-            result['swing_high'] &= (result['high'] > result['high'].shift(shift))
+        # For each point, check if it's a swing point compared to past data only
+        for i in range(window, len(result)):
+            # Check if current high is greater than all highs in the past window
+            is_swing_high = True
+            is_swing_low = True
             
-            # Current low must be lower than all past bars in the window
-            result['swing_low'] &= (result['low'] < result['low'].shift(shift))
+            for j in range(1, window + 1):
+                if i - j >= 0:
+                    # Compare with past values only
+                    if result.iloc[i]['high'] <= result.iloc[i - j]['high']:
+                        is_swing_high = False
+                    if result.iloc[i]['low'] >= result.iloc[i - j]['low']:
+                        is_swing_low = False
+            
+            result.iloc[i, result.columns.get_loc('swing_high')] = is_swing_high
+            result.iloc[i, result.columns.get_loc('swing_low')] = is_swing_low
         
         # Fill NaN values (from shifting) with False
         result['swing_high'] = result['swing_high'].fillna(False)
@@ -2501,6 +2522,9 @@ class DataProcessor:
         # Add swing point strength based on price distance
         result['swing_high_strength'] = 0.0
         result['swing_low_strength'] = 0.0
+        
+        # Define the shifts to look at (same as the window used for swing detection)
+        shifts = range(1, window + 1)
         
         # Calculate how much higher/lower compared to surrounding bars
         for idx in result.index[result['swing_high']]:
@@ -3097,7 +3121,7 @@ class DataProcessor:
         
         # Create nearest S/R zone feature
         result['nearest_zone_distance_pct'] = 100.0
-        result['nearest_zone_type'] = 'none'  # 'support', 'resistance', or 'none'
+        result['nearest_zone_type'] = 0  # 0='none', -1='support', 1='resistance' - use numeric from start
         
         for idx in range(window, len(result)):
             # Check resistance distances
@@ -3105,30 +3129,23 @@ class DataProcessor:
                 distance = result.iloc[idx][f'resistance_{i}_distance_pct']
                 if not pd.isna(distance) and abs(distance) < abs(result.iloc[idx]['nearest_zone_distance_pct']):
                     result.iloc[idx, result.columns.get_loc('nearest_zone_distance_pct')] = distance
-                    result.iloc[idx, result.columns.get_loc('nearest_zone_type')] = 'resistance'
+                    result.iloc[idx, result.columns.get_loc('nearest_zone_type')] = 1  # 1 for resistance
             
             # Check support distances
             for i in range(1, max_levels + 1):
                 distance = result.iloc[idx][f'support_{i}_distance_pct']
                 if not pd.isna(distance) and abs(distance) < abs(result.iloc[idx]['nearest_zone_distance_pct']):
                     result.iloc[idx, result.columns.get_loc('nearest_zone_distance_pct')] = distance
-                    result.iloc[idx, result.columns.get_loc('nearest_zone_type')] = 'support'
+                    result.iloc[idx, result.columns.get_loc('nearest_zone_type')] = -1  # -1 for support
         
         # Create indicator variables for when price is near key levels
-        result['at_resistance'] = (result['nearest_zone_type'] == 'resistance') & \
+        result['at_resistance'] = (result['nearest_zone_type'] == 1) & \
                                  (abs(result['nearest_zone_distance_pct']) < 0.5)
-        result['at_support'] = (result['nearest_zone_type'] == 'support') & \
+        result['at_support'] = (result['nearest_zone_type'] == -1) & \
                               (abs(result['nearest_zone_distance_pct']) < 0.5)
         
-        # Encode nearest_zone_type as numeric for ML models
-        result['zone_type_numeric'] = 0  # Default: no zone
-        result.loc[result['nearest_zone_type'] == 'support', 'zone_type_numeric'] = -1
-        result.loc[result['nearest_zone_type'] == 'resistance', 'zone_type_numeric'] = 1
-        
-        # Replace the string categorical column with a numeric version
-        # This ensures consistent encoding and prevents string conversion issues later
-        zone_type_map = {'none': 0, 'support': -1, 'resistance': 1}
-        result['nearest_zone_type'] = result['nearest_zone_type'].map(zone_type_map)
+        # Note: nearest_zone_type is already numeric (0=none, -1=support, 1=resistance)
+        # No need for additional encoding
         
         logger.info(f"Added support and resistance zone features with {max_levels} levels tracked")
         return result
@@ -3209,27 +3226,22 @@ class DataProcessor:
             )
             
             # Define regimes based on ADX thresholds
-            # ADX > 25: Trending, ADX < 20: Ranging, Between: Mixed
+            # ADX > 25: Trending (2), ADX < 20: Ranging (0), Between: Mixed (1)
             result[f'adx_regime_{window}'] = np.where(
-                result[f'adx_{window}'] > 25, 'trending',
-                np.where(result[f'adx_{window}'] < 20, 'ranging', 'mixed')
+                result[f'adx_{window}'] > 25, 2,  # trending
+                np.where(result[f'adx_{window}'] < 20, 0, 1)  # ranging=0, mixed=1
             )
             
             # Combine trend direction and strength
+            # strong_uptrend=2, weak_uptrend=1, ranging=0, weak_downtrend=-1, strong_downtrend=-2
             result[f'regime_{window}'] = np.where(
-                result[f'adx_regime_{window}'] == 'trending',
-                np.where(result[f'trend_direction_{window}'] == 1, 'strong_uptrend', 'strong_downtrend'),
-                np.where(result[f'adx_regime_{window}'] == 'ranging', 'ranging', 
-                        np.where(result[f'trend_direction_{window}'] == 1, 'weak_uptrend', 'weak_downtrend'))
+                result[f'adx_regime_{window}'] == 2,  # trending
+                np.where(result[f'trend_direction_{window}'] == 1, 2, -2),  # strong up/down
+                np.where(result[f'adx_regime_{window}'] == 0, 0,  # ranging
+                        np.where(result[f'trend_direction_{window}'] == 1, 1, -1))  # weak up/down
             )
             
-            # Encode regimes numerically for machine learning
-            result[f'regime_numeric_{window}'] = np.where(
-                result[f'regime_{window}'] == 'strong_uptrend', 2,
-                np.where(result[f'regime_{window}'] == 'weak_uptrend', 1,
-                        np.where(result[f'regime_{window}'] == 'ranging', 0,
-                                np.where(result[f'regime_{window}'] == 'weak_downtrend', -1, -2)))
-            )
+            # Note: regime_{window} is already numeric, no need for additional encoding
         
         # Calculate volatility regimes
         # Calculate rolling volatility
@@ -3240,54 +3252,20 @@ class DataProcessor:
         vol_std = result['volatility'].rolling(window=volatility_window*2).std()
         result['volatility_zscore'] = (result['volatility'] - vol_mean) / vol_std
         
-        # Define volatility regimes
+        # Define volatility regimes numerically from the start
+        # 1=high_volatility, 0=normal_volatility, -1=low_volatility
         result['volatility_regime'] = np.where(
-            result['volatility_zscore'] > 1.0, 'high_volatility',
-            np.where(result['volatility_zscore'] < -1.0, 'low_volatility', 'normal_volatility')
-        )
-        
-        # Encode volatility regimes numerically
-        result['volatility_regime_numeric'] = np.where(
-            result['volatility_regime'] == 'high_volatility', 1,
-            np.where(result['volatility_regime'] == 'low_volatility', -1, 0)
+            result['volatility_zscore'] > 1.0, 1,  # high volatility
+            np.where(result['volatility_zscore'] < -1.0, -1, 0)  # low=-1, normal=0
         )
         
         # Handle NaN values
         regime_cols = [col for col in result.columns if any(x in col for x in 
                       ['regime', 'adx_', 'trend_', 'volatility', 'dx_', 'plus_di_', 'minus_di_'])]
         
+        # All regime columns are now numeric, so just forward fill and default to 0
         for col in regime_cols:
-            if result[col].dtype == 'object':
-                # For categorical columns, fill with most common value or 'unknown'
-                most_common = result[col].mode().iloc[0] if not result[col].isna().all() else 'unknown'
-                result[col] = result[col].fillna(most_common)
-            else:
-                # For numeric columns, forward fill only
-                result[col] = result[col].fillna(method='ffill').fillna(0)
-        
-        # Convert string categorical columns to numeric values to prevent conversion issues
-        # Define mapping dictionaries for each categorical column
-        adx_regime_map = {'ranging': 0, 'mixed': 1, 'trending': 2, 'unknown': 0}
-        regime_map = {
-            'ranging': 0, 
-            'weak_uptrend': 1, 
-            'strong_uptrend': 2, 
-            'weak_downtrend': -1, 
-            'strong_downtrend': -2,
-            'unknown': 0  # Default value for any unknown categories
-        }
-        volatility_regime_map = {'low_volatility': -1, 'normal_volatility': 0, 'high_volatility': 1, 'unknown': 0}
-        
-        # Apply mappings to convert string categoricals to numeric
-        for window in windows:
-            if f'adx_regime_{window}' in result.columns and result[f'adx_regime_{window}'].dtype == 'object':
-                result[f'adx_regime_{window}'] = result[f'adx_regime_{window}'].map(adx_regime_map).fillna(0)
-            
-            if f'regime_{window}' in result.columns and result[f'regime_{window}'].dtype == 'object':
-                result[f'regime_{window}'] = result[f'regime_{window}'].map(regime_map).fillna(0)
-        
-        if 'volatility_regime' in result.columns and result['volatility_regime'].dtype == 'object':
-            result['volatility_regime'] = result['volatility_regime'].map(volatility_regime_map).fillna(0)
+            result[col] = result[col].fillna(method='ffill').fillna(0)
         
         # Clean up temporary columns
         temp_cols = ['tr', 'plus_dm', 'minus_dm', 'log_return']
@@ -3522,10 +3500,28 @@ class DataProcessor:
                 else:
                     db_mgr = db_manager
                 
-                # Get token IDs for BTC and ETH (these should be in your database)
-                # You'll need to adjust these based on your actual token IDs
-                btc_token_id = 21  # WBTC (Wrapped BTC on Solana)
-                eth_token_id = 22  # WETH (Wrapped Ether on Solana)
+                # Get token IDs for BTC and ETH dynamically from database
+                btc_token = await db_mgr.get_token_by_symbol('WBTC')
+                eth_token = await db_mgr.get_token_by_symbol('WETH')
+                
+                if not btc_token or not eth_token:
+                    logger.warning("Could not find WBTC/WETH tokens in database for correlation features")
+                    # Add placeholder columns
+                    for window in correlation_windows:
+                        result[f'btc_correlation_{window}h'] = 0.5
+                        result[f'eth_correlation_{window}h'] = 0.5
+                        result[f'btc_relative_strength_{window}h'] = 0.0
+                        result[f'eth_relative_strength_{window}h'] = 0.0
+                    
+                    result['btc_eth_spread'] = 0.0
+                    result['market_regime_correlation'] = 0.5
+                    result['beta_to_btc'] = 1.0
+                    result['beta_to_eth'] = 1.0
+                    result['btc_eth_dominance'] = 0.0
+                    return result
+                
+                btc_token_id = btc_token['token_id']
+                eth_token_id = eth_token['token_id']
                 
                 btc_data = await db_mgr.get_ohlcv_data(
                     token_id=btc_token_id,
@@ -3581,50 +3577,73 @@ class DataProcessor:
             # Calculate returns for current asset
             result['returns'] = result['close'].pct_change()
             
-            # Align data by timestamp
+            # Align data by timestamp - ensure all dataframes have the same index
             result_indexed = result.set_index('timestamp')
+            
+            # Debug: Check timestamp alignment
+            logger.debug(f"Main dataframe timestamps: {len(result_indexed)} records, range: {result_indexed.index.min()} to {result_indexed.index.max()}")
+            logger.debug(f"BTC dataframe timestamps: {len(btc_df)} records, range: {btc_df.index.min()} to {btc_df.index.max()}")
+            logger.debug(f"ETH dataframe timestamps: {len(eth_df)} records, range: {eth_df.index.min()} to {eth_df.index.max()}")
+            
+            # Check overlap
+            btc_overlap = btc_df.index.intersection(result_indexed.index)
+            eth_overlap = eth_df.index.intersection(result_indexed.index)
+            logger.debug(f"Timestamp overlap - BTC: {len(btc_overlap)}/{len(result_indexed)}, ETH: {len(eth_overlap)}/{len(result_indexed)}")
+            
+            # Reindex BTC and ETH data to match the main dataframe's timestamp index
+            btc_df_indexed = btc_df.reindex(result_indexed.index)
+            eth_df_indexed = eth_df.reindex(result_indexed.index)
+            
+            # Check how many values we got after reindexing
+            btc_non_null = btc_df_indexed['close'].notna().sum()
+            eth_non_null = eth_df_indexed['close'].notna().sum()
+            logger.debug(f"After reindexing - BTC non-null: {btc_non_null}/{len(result_indexed)}, ETH non-null: {eth_non_null}/{len(result_indexed)}")
+            
+            # Forward fill any missing values in BTC/ETH data (no backfill to avoid data leakage)
+            btc_df_indexed = btc_df_indexed.fillna(method='ffill')
+            eth_df_indexed = eth_df_indexed.fillna(method='ffill')
             
             # Calculate correlation features for each window
             for window in correlation_windows:
                 # Rolling correlation with BTC
-                btc_corr = result_indexed['returns'].rolling(window).corr(btc_df['returns'])
+                btc_corr = result_indexed['returns'].rolling(window).corr(btc_df_indexed['returns'])
                 result[f'btc_correlation_{window}h'] = btc_corr.values
                 
                 # Rolling correlation with ETH
-                eth_corr = result_indexed['returns'].rolling(window).corr(eth_df['returns'])
+                eth_corr = result_indexed['returns'].rolling(window).corr(eth_df_indexed['returns'])
                 result[f'eth_correlation_{window}h'] = eth_corr.values
                 
                 # Relative strength vs BTC (cumulative return difference)
                 asset_cum_return = result_indexed['returns'].rolling(window).sum()
-                btc_cum_return = btc_df['returns'].rolling(window).sum()
+                btc_cum_return = btc_df_indexed['returns'].rolling(window).sum()
                 btc_relative = (asset_cum_return - btc_cum_return).values
                 result[f'btc_relative_strength_{window}h'] = btc_relative
                 
                 # Relative strength vs ETH
-                eth_cum_return = eth_df['returns'].rolling(window).sum()
+                eth_cum_return = eth_df_indexed['returns'].rolling(window).sum()
                 eth_relative = (asset_cum_return - eth_cum_return).values
                 result[f'eth_relative_strength_{window}h'] = eth_relative
             
             # BTC-ETH spread (market regime indicator)
-            btc_eth_spread = (btc_df['returns'].rolling(24).mean() - 
-                             eth_df['returns'].rolling(24).mean()).values
+            btc_eth_spread = (btc_df_indexed['returns'].rolling(24).mean() - 
+                             eth_df_indexed['returns'].rolling(24).mean()).values
             result['btc_eth_spread'] = btc_eth_spread
             
             # Market regime based on BTC-ETH correlation
             # High correlation = risk-on, Low correlation = rotation
-            btc_eth_corr = btc_df['returns'].rolling(48).corr(eth_df['returns'])
+            btc_eth_corr = btc_df_indexed['returns'].rolling(48).corr(eth_df_indexed['returns'])
             result['market_regime_correlation'] = btc_eth_corr.values
             
             # Beta to BTC (market sensitivity)
             # Calculate rolling beta using 168h window
-            btc_variance = btc_df['returns'].rolling(168).var()
-            covariance = result_indexed['returns'].rolling(168).cov(btc_df['returns'])
+            btc_variance = btc_df_indexed['returns'].rolling(168).var()
+            covariance = result_indexed['returns'].rolling(168).cov(btc_df_indexed['returns'])
             beta_btc = (covariance / btc_variance).values
             result['beta_to_btc'] = beta_btc
             
             # Beta to ETH
-            eth_variance = eth_df['returns'].rolling(168).var()
-            covariance_eth = result_indexed['returns'].rolling(168).cov(eth_df['returns'])
+            eth_variance = eth_df_indexed['returns'].rolling(168).var()
+            covariance_eth = result_indexed['returns'].rolling(168).cov(eth_df_indexed['returns'])
             beta_eth = (covariance_eth / eth_variance).values
             result['beta_to_eth'] = beta_eth
             

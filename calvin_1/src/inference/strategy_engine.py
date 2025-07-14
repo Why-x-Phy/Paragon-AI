@@ -632,7 +632,7 @@ class SimpleStrategyEngine:
         """Apply simple magnitude-based strategy logic"""
         try:
             # Calculate predicted percentage change
-            predicted_change_pct = (predicted_price - current_price) / current_price
+            predicted_change_pct = (predicted_price - current_price) / current_price * 100
             
             # Get strategy parameters
             buy_threshold = strategy_params.get('buy_threshold', self.config.default_buy_threshold)

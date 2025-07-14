@@ -73,7 +73,7 @@ def train_improved_model(
     days: int = 30,
     resolution: str = "1H",
     epochs: int = 30,
-    optimization_target: str = "simple_directional"
+    optimization_target: str = "anti_collapse"  # Use anti-collapse loss to fix constant predictions
 ):
     """Train an improved model with anti-collapse features"""
     
@@ -136,7 +136,7 @@ def train_improved_model(
     # Build model with improved settings
     ml_model.build_model(
         input_shape=(X_train.shape[1], X_train.shape[2]),
-        use_bidirectional=True
+        use_bidirectional=False  # Changed to unidirectional LSTM
     )
     
     # Generate model name
@@ -162,22 +162,44 @@ def train_improved_model(
     metrics = ml_model.evaluate(X_test, y_test, include_backtest=False)
     
     print(f"\n✅ Training Complete!")
-    print(f"   Final validation loss: {min(history.history['val_loss']):.4f}")
-    print(f"   Best epoch: {np.argmin(history.history['val_loss']) + 1}")
+    print(f"   Final validation loss: {min(history['val_loss']):.4f}")
+    print(f"   Best epoch: {np.argmin(history['val_loss']) + 1}")
     
-    # Test predictions to ensure no collapse
-    print(f"\n🔍 Checking for collapse...")
-    test_predictions = ml_model.predict(X_test[:50])  # Test on 50 samples
+    # Test predictions to ensure no collapse and check for bias
+    print(f"\n🔍 Checking for collapse and bias...")
+    test_predictions = ml_model.predict(X_test[:100])  # Test on 100 samples
+    
+    # Check for collapse
     unique_preds = len(set([f"{x:.6f}" for x in test_predictions.flatten()]))
     pred_std = test_predictions.std()
+    pred_mean = test_predictions.mean()
+    pred_min = test_predictions.min()
+    pred_max = test_predictions.max()
     
-    print(f"   Unique predictions: {unique_preds}/50")
+    # Check for extreme values
+    extreme_predictions = np.sum(np.abs(test_predictions) > 0.25)  # More than 25% change
+    negative_predictions = np.sum(test_predictions < 0)
+    positive_predictions = np.sum(test_predictions > 0)
+    negative_bias_pct = (negative_predictions / len(test_predictions.flatten())) * 100
+    
+    print(f"   Unique predictions: {unique_preds}/100")
     print(f"   Prediction std dev: {pred_std:.6f}")
+    print(f"   Prediction mean: {pred_mean:.6f}")
+    print(f"   Prediction range: [{pred_min:.6f}, {pred_max:.6f}]")
+    print(f"   Extreme predictions (>25%): {extreme_predictions}")
+    print(f"   Negative bias: {negative_bias_pct:.1f}% negative predictions")
     
+    # Warnings
     if unique_preds < 5 or pred_std < 0.0001:
         print("   ⚠️  WARNING: Model may have collapsed!")
+    elif extreme_predictions > 10:
+        print("   ⚠️  WARNING: Model predicting extreme values!")
+    elif negative_bias_pct > 70:
+        print("   ⚠️  WARNING: Strong negative bias detected!")
+    elif negative_bias_pct < 30:
+        print("   ⚠️  WARNING: Strong positive bias detected!")
     else:
-        print("   ✅ Model shows healthy variation")
+        print("   ✅ Model shows healthy variation and balanced predictions")
     
     # Save scalers for production
     data_processor.save_scalers(symbol, model_name)
@@ -199,9 +221,9 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=30,
                         help='Maximum training epochs')
     parser.add_argument('--optimization-target', type=str, 
-                        default='simple_directional',
-                        choices=['mse', 'simple_directional', 'profit', 'direction', 'direction_focused'],
-                        help='Loss function to use')
+                        default='anti_collapse',
+                        choices=['mse', 'simple_directional', 'profit', 'direction', 'direction_focused', 'balanced_directional', 'magnitude_constrained', 'variance_encouraging', 'anti_collapse', 'robust_directional'],
+                        help='Loss function to use (anti_collapse recommended for fixing constant predictions)')
     
     args = parser.parse_args()
     

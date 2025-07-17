@@ -56,20 +56,39 @@ class AdaptationMethod(Enum):
 
 @dataclass
 class StrategyParameters:
-    """Adaptive strategy parameters for a token"""
+    """Adaptive strategy parameters for a token (supports both LSTM and regime-aware LightGBM models)"""
     symbol: str
+    model_type: str = "lstm"  # "lstm" or "regime_aware_lgb"
+    
+    # Standard thresholds (for LSTM models and normal volatility)
     buy_threshold: float = 0.01     # 1.0% default - balanced for crypto hourly moves
     sell_threshold: float = 0.015   # 1.5% default - balanced for crypto hourly moves
     confidence_threshold: float = 0.10  # Minimal threshold - strategy thresholds are primary
     position_size_pct: float = 10.0     # Position size as % of portfolio
     
-    # Adaptation ranges (REVISED for crypto hourly predictions)
+    # Regime-aware thresholds (for LightGBM models)
+    high_vol_buy_threshold: float = 0.02    # 2.0% for high volatility periods
+    high_vol_sell_threshold: float = 0.03   # 3.0% for high volatility periods
+    low_vol_buy_threshold: float = 0.0075    # 0.75% for low volatility periods
+    low_vol_sell_threshold: float = 0.0115    # 1.15% for low volatility periods
+    
+    # Adaptation ranges for standard thresholds
     min_buy_threshold: float = 0.002   # 0.2% minimum - catch small moves
     max_buy_threshold: float = 0.03    # 3.0% maximum - crypto can move fast
     min_sell_threshold: float = 0.003   # 0.3% minimum - quick exits
     max_sell_threshold: float = 0.04    # 4.0% maximum - let winners run in crypto
     min_confidence: float = 0.05  # Very low minimum
     max_confidence: float = 0.20  # Low maximum - strategy thresholds are primary
+    
+    # Adaptation ranges for regime-aware thresholds
+    min_high_vol_buy: float = 0.01      # 1.0% minimum for high vol
+    max_high_vol_buy: float = 0.05      # 5.0% maximum for high vol
+    min_high_vol_sell: float = 0.015    # 1.5% minimum for high vol
+    max_high_vol_sell: float = 0.06     # 6.0% maximum for high vol
+    min_low_vol_buy: float = 0.002      # 0.2% minimum for low vol
+    max_low_vol_buy: float = 0.02       # 2.0% maximum for low vol
+    min_low_vol_sell: float = 0.005     # 0.5% minimum for low vol
+    max_low_vol_sell: float = 0.03      # 3.0% maximum for low vol
     
     # Performance tracking
     total_signals: int = 0
@@ -243,8 +262,12 @@ class AdaptiveStrategyEngine:
                         cached_params['last_updated'] = datetime.fromisoformat(cached_params['last_updated'])
                     self.strategy_parameters[normalized_symbol] = StrategyParameters(**cached_params)
                 else:
-                    # Initialize with defaults using normalized symbol
-                    self.strategy_parameters[normalized_symbol] = StrategyParameters(symbol=normalized_symbol)
+                    # Initialize with defaults using normalized symbol and detect model type
+                    model_type = await self._detect_model_type(normalized_symbol)
+                    self.strategy_parameters[normalized_symbol] = StrategyParameters(
+                        symbol=normalized_symbol,
+                        model_type=model_type
+                    )
                     await self._cache_parameters(normalized_symbol, self.strategy_parameters[normalized_symbol])
                 
                 # Initialize market conditions with normalized symbol
@@ -257,6 +280,23 @@ class AdaptiveStrategyEngine:
         except Exception as e:
             logger.error(f"Failed to load strategy parameters: {e}")
             raise
+    
+    async def _detect_model_type(self, symbol: str) -> str:
+        """Detect model type (LSTM or regime-aware LightGBM) for a symbol"""
+        try:
+            from .model_registry import get_model_registry
+            registry = get_model_registry()
+            
+            # Get model metadata to determine type
+            metadata = registry.get_model_metadata(symbol)
+            if metadata and metadata.model_type == 'regime_aware_lgb':
+                return 'regime_aware_lgb'
+            else:
+                return 'lstm'  # Default to LSTM
+                
+        except Exception as e:
+            logger.warning(f"Failed to detect model type for {symbol}, defaulting to LSTM: {e}")
+            return 'lstm'
     
     async def _get_cached_parameters(self, symbol: str) -> Optional[Dict]:
         """Get cached strategy parameters from Redis"""
@@ -801,7 +841,7 @@ class AdaptiveStrategyEngine:
         params = self.strategy_parameters[normalized_symbol]
         conditions = self.market_conditions.get(normalized_symbol, MarketConditions())
         
-        return {
+        result = {
             'symbol': normalized_symbol,
             'buy_threshold': params.buy_threshold,
             'sell_threshold': params.sell_threshold,
@@ -812,8 +852,20 @@ class AdaptiveStrategyEngine:
             'market_regime': conditions.regime.value,
             'volatility_24h': conditions.volatility_24h,
             'momentum_24h': conditions.momentum_24h,
-            'last_updated': params.last_updated.isoformat()
+            'last_updated': params.last_updated.isoformat(),
+            'model_type': params.model_type
         }
+        
+        # Add regime-specific thresholds for LightGBM models
+        if params.model_type == 'regime_aware_lgb':
+            result.update({
+                'high_vol_buy_threshold': params.high_vol_buy_threshold,
+                'high_vol_sell_threshold': params.high_vol_sell_threshold,
+                'low_vol_buy_threshold': params.low_vol_buy_threshold,
+                'low_vol_sell_threshold': params.low_vol_sell_threshold
+            })
+        
+        return result
     
     async def _get_current_strategy_params(self, symbol: str) -> Dict[str, float]:
         """Get current strategy parameters for a symbol (used by test scripts)"""

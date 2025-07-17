@@ -29,9 +29,9 @@ logger = log_manager.get_logger("inference_data_processor")
 class InferenceDataConfig:
     """Configuration for inference data processing"""
     # Data requirements
-    min_data_points: int = 210  # Minimum hours of data (need 200+ for 200-period SMA)
+    min_data_points: int = 350  # Minimum hours of data (need 200+ for 200-period SMA)
     data_quality_threshold: float = 0.95  # Minimum completeness
-    lookback_hours: int = 240  # Hours of historical data for features (need 200+ for 200-period SMA, 168+ for rolling beta)
+    lookback_hours: int = 360  # Hours of historical data for features (need 200+ for 200-period SMA, 168+ for rolling beta)
     
     # Technical indicators
     rsi_period: int = 14
@@ -99,9 +99,9 @@ class InferenceDataProcessor:
         env_config = get_config()
         
         return InferenceDataConfig(
-            min_data_points=int(env_config.get('MIN_DATA_POINTS_FOR_INFERENCE', 210)),
+            min_data_points=int(env_config.get('MIN_DATA_POINTS_FOR_INFERENCE', 350)),
             data_quality_threshold=float(env_config.get('DATA_QUALITY_THRESHOLD', 0.95)),
-            lookback_hours=int(env_config.get('DATA_PROCESSOR_LOOKBACK_HOURS', 240)),
+            lookback_hours=int(env_config.get('DATA_PROCESSOR_LOOKBACK_HOURS', 360)),
             
             # Technical indicators from env
             rsi_period=int(env_config.get('RSI_PERIOD', 14)),
@@ -153,7 +153,7 @@ class InferenceDataProcessor:
             # 2. Fetch raw OHLCV data (no caching - always fresh for hourly inference)
             ohlcv_data = await self._fetch_ohlcv_data(token['token_id'], resolution, simulation_time)
             if not ohlcv_data or len(ohlcv_data) < self.config.min_data_points:
-                self.logger.warning(f"Insufficient data for {token_address}: {len(ohlcv_data) if ohlcv_data else 0} points")
+                self.logger.warning(f"Insufficient data for {token_address}: {len(ohlcv_data) if ohlcv_data else 0} points (need {self.config.min_data_points})")
                 return None
             
             # 3. Convert to DataFrame for processing

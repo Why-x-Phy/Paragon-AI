@@ -1,19 +1,21 @@
 """
-Calvin AI Simple Strategy Engine
+Calvin AI Strategy Engine
 
-Real-time strategy engine that integrates LSTM predictions with simple magnitude-based
-strategy logic for generating buy/sell/hold signals.
+Real-time strategy engine that integrates both LSTM and Regime-Aware LightGBM models
+with simple magnitude-based strategy logic for generating buy/sell/hold signals.
 
 Key Features:
+- Support for both LSTM (.h5) and Regime-Aware LightGBM (.pkl) models
 - <100ms prediction + strategy evaluation latency per token
 - Simple magnitude-based strategy (buy ≥2%, sell ≥3% predicted change)
+- Regime-aware prediction pipeline for LightGBM models
 - Real-time feature preprocessing integration
 - Configurable confidence-based signal filtering (default 10% minimal threshold)
 - Memory management for GPU models
 - Integration with existing model registry and data pipeline
 
 This integrates with:
-- model_registry.py for LSTM model access
+- model_registry.py for both LSTM and LightGBM model access
 - data_processor.py for feature engineering
 - simple_backtest_strategy logic from profit_functions.py
 - realtime_storage.py for live data
@@ -79,8 +81,14 @@ class TradingSignal:
     
     # Additional metadata
     model_version: str
+    model_type: str  # "lstm" or "regime_aware_lgb"
     processing_time_ms: float
     raw_prediction: float
+    
+    # New fields for regime-aware models
+    regime: Optional[str] = None  # "High Volatility" or "Low Volatility"
+    regime_confidence: Optional[float] = None
+    direction_confidence: Optional[float] = None
 
 @dataclass
 class StrategyConfig:
@@ -106,13 +114,13 @@ class StrategyConfig:
     model_memory_threshold_mb: float = 1500.0  # Conservative limit for 20 models
     gpu_memory_growth: bool = True
 
-class SimpleStrategyEngine:
+class StrategyEngine:
     """
-    Real-time strategy engine combining LSTM predictions with simple magnitude-based strategy
+    Real-time strategy engine supporting both LSTM and Regime-Aware LightGBM models
     """
     
     def __init__(self, config: Optional[StrategyConfig] = None, backtest_mode: bool = False):
-        """Initialize the strategy engine with optimized LSTM prediction pipeline"""
+        """Initialize the strategy engine with support for both model types"""
         # Initialize configuration with proper defaults
         if config is None:
             # Get the global config for correct defaults
@@ -142,8 +150,9 @@ class SimpleStrategyEngine:
         # Initialize database manager (async initialization)
         self._init_db_manager()
         
-        # Configure GPU memory for TensorFlow
-        self._configure_gpu_memory()
+        # Configure GPU memory for TensorFlow (only if available)
+        if HAS_TENSORFLOW:
+            self._configure_gpu_memory()
         
         # Log configuration
         self._log_initialization()
@@ -230,7 +239,7 @@ class SimpleStrategyEngine:
 
     async def generate_signal(self, symbol: str, version: Optional[str] = None, simulation_time: Optional[datetime] = None) -> Optional[TradingSignal]:
         """
-        Generate trading signal for a token using LSTM prediction + simple strategy
+        Generate trading signal for a token using either LSTM or LightGBM prediction + simple strategy
         
         Args:
             symbol: Token symbol (e.g., 'BONK', 'JUP')
@@ -272,44 +281,38 @@ class SimpleStrategyEngine:
                 return None
             logger.debug(f"Current price for {symbol}: ${current_price}")
             
-            # 3. Prepare features for prediction
-            logger.debug(f"Preparing features for {symbol}")
-            features = await self._prepare_features(symbol, metadata, simulation_time)
-            if features is None:
-                logger.warning(f"Failed to prepare features for {symbol}")
+            # 3. Generate prediction based on model type
+            if metadata.model_type == 'lstm':
+                prediction_result = await self._predict_with_lstm_model(model, metadata, symbol, simulation_time)
+            elif metadata.model_type == 'regime_aware_lgb':
+                prediction_result = await self._predict_with_lgb_model(model, metadata, symbol, simulation_time)
+            else:
+                logger.error(f"Unsupported model type: {metadata.model_type}")
                 return None
-            logger.debug(f"Features prepared for {symbol}: shape {features.shape}")
             
-            # 4. Generate LSTM prediction
-            raw_prediction = await self._predict_with_model(model, features, symbol)
-            if raw_prediction is None:
+            if not prediction_result:
                 logger.warning(f"Prediction failed for {symbol}")
                 return None
             
-            # 5. Convert prediction to price
-            predicted_price = await self._convert_prediction_to_price(
-                raw_prediction, current_price, symbol, metadata
-            )
-            
-            # 6. Apply simple magnitude-based strategy
+            # 4. Apply simple magnitude-based strategy
             signal = await self._apply_simple_strategy(
                 current_price=current_price,
-                predicted_price=predicted_price,
+                prediction_result=prediction_result,
                 strategy_params=strategy_params,
                 symbol=symbol,
                 metadata=metadata
             )
             
-            # 7. Calculate processing time
+            # 5. Calculate processing time
             processing_time_ms = (time.time() - start_time) * 1000
             
-            # 8. Create trading signal
+            # 6. Create trading signal
             trading_signal = TradingSignal(
                 symbol=symbol,
                 signal_type=signal['type'],
                 strength=signal['strength'],
                 confidence=signal['confidence'],
-                predicted_price=predicted_price,
+                predicted_price=prediction_result['predicted_price'],
                 current_price=current_price,
                 predicted_change_pct=signal['predicted_change_pct'],
                 timestamp=datetime.now(),
@@ -317,11 +320,15 @@ class SimpleStrategyEngine:
                 sell_threshold=strategy_params['sell_threshold'],
                 confidence_threshold=strategy_params['confidence_threshold'],
                 model_version=metadata.version,
+                model_type=metadata.model_type,
                 processing_time_ms=processing_time_ms,
-                raw_prediction=raw_prediction
+                raw_prediction=prediction_result['raw_prediction'],
+                regime=prediction_result.get('regime'),
+                regime_confidence=prediction_result.get('regime_confidence'),
+                direction_confidence=prediction_result.get('direction_confidence')
             )
             
-            # 9. Log performance
+            # 7. Log performance
             self.prediction_times.append(processing_time_ms)
             if processing_time_ms > self.config.max_prediction_latency_ms:
                 # Check if this was likely a cold model load
@@ -332,16 +339,133 @@ class SimpleStrategyEngine:
             else:
                 logger.debug(f"Generated signal for {symbol} in {processing_time_ms:.1f}ms")
             
-            # 10. Cache the signal
+            # 8. Cache the signal
             await self._cache_signal(trading_signal)
             
-            # 11. Store prediction in database (NEW: Fix for missing predictions)
+            # 9. Store prediction in database
             await self._store_prediction(trading_signal, metadata)
             
             return trading_signal
             
         except Exception as e:
             logger.error(f"Signal generation failed for {symbol}: {e}")
+            return None
+
+    async def _predict_with_lstm_model(self, model, metadata: ModelMetadata, symbol: str, simulation_time: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+        """Generate prediction using LSTM model (original implementation)"""
+        try:
+            # 1. Prepare features for LSTM prediction
+            features = await self._prepare_lstm_features(symbol, metadata, simulation_time)
+            if features is None:
+                logger.warning(f"Failed to prepare LSTM features for {symbol}")
+                return None
+            
+            # 2. Generate LSTM prediction
+            raw_prediction = await self._predict_with_tensorflow_model(model, features, symbol)
+            if raw_prediction is None:
+                logger.warning(f"LSTM prediction failed for {symbol}")
+                return None
+            
+            # 3. Get current price for conversion
+            current_price = await self._get_current_price(symbol, simulation_time)
+            if not current_price:
+                return None
+            
+            # 4. Convert prediction to price using LSTM method
+            predicted_price = await self._convert_lstm_prediction_to_price(
+                raw_prediction, current_price, symbol, metadata
+            )
+            
+            return {
+                'predicted_price': predicted_price,
+                'raw_prediction': raw_prediction,
+                'model_type': 'lstm'
+            }
+            
+        except Exception as e:
+            logger.error(f"LSTM prediction failed for {symbol}: {e}")
+            return None
+
+    async def _predict_with_lgb_model(self, model: Dict[str, Any], metadata: ModelMetadata, symbol: str, simulation_time: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+        """Generate prediction using Regime-Aware LightGBM model (new implementation)"""
+        try:
+            # 1. Prepare features for LightGBM prediction
+            features_df, regime_features_df = await self._prepare_lgb_features(symbol, simulation_time)
+            if features_df is None or regime_features_df is None:
+                logger.warning(f"Failed to prepare LightGBM features for {symbol}")
+                return None
+            
+            # 2. Get the latest features
+            latest_features = features_df.iloc[-1]
+            latest_regime_features = regime_features_df.iloc[-1]
+            
+            # 3. Prepare feature arrays - MUST match training exactly
+            exclude_cols = [
+                'target_return', 'target_direction', 'timestamp', 'date', 'time',
+                'symbol', 'token_address', 'resolution', 'source',  # Common metadata
+                'lunarcrush', 'lunarcrush_id', 'coingecko_id',  # ID columns
+                'name', 'slug', 'category', 'description',  # Text columns
+                'data_source'  # Can be numeric or text depending on time period
+            ]
+            
+            # Get numeric columns only (same as training)
+            numeric_cols = features_df.select_dtypes(include=[np.number]).columns.tolist()
+            feature_cols = [col for col in numeric_cols if col not in exclude_cols]
+            
+            X_features = latest_features[feature_cols].values.reshape(1, -1).astype(np.float32)
+            X_regime = latest_regime_features.values.reshape(1, -1).astype(np.float32)
+            
+            # 4. Detect regime
+            X_regime_scaled = model['regime_scaler'].transform(X_regime)
+            regime_prob = model['regime_classifier'].predict(X_regime_scaled)[0]
+            regime = 1 if regime_prob > 0.5 else 0  # 1 = high vol, 0 = low vol
+            regime_name = "High Volatility" if regime == 1 else "Low Volatility"
+            regime_confidence = regime_prob if regime == 1 else 1 - regime_prob
+            
+            logger.debug(f"🎯 Regime Detection for {symbol}: {regime_name} ({regime_confidence:.3f} confidence)")
+            
+            # 5. Select appropriate regressor and make return prediction
+            X_features_scaled = model['feature_scaler'].transform(X_features)
+            
+            if regime == 1:
+                return_pred = model['high_vol_regressor'].predict(X_features_scaled)[0]
+                model_used = "High-Vol Regressor"
+            else:
+                return_pred = model['low_vol_regressor'].predict(X_features_scaled)[0]
+                model_used = "Low-Vol Regressor"
+            
+            logger.debug(f"📊 Return Prediction for {symbol}: {return_pred*100:.3f}% ({model_used})")
+            
+            # 6. Apply direction classifier
+            # Combine regressor output with features
+            X_direction = np.column_stack([return_pred.reshape(1, -1), X_features_scaled])
+            direction_prob = model['direction_classifier'].predict(X_direction)[0]
+            direction = "UP" if direction_prob > 0.5 else "DOWN"
+            direction_confidence = direction_prob if direction == 'UP' else 1 - direction_prob
+            
+            logger.debug(f"📈 Direction Classification for {symbol}: {direction} ({direction_confidence:.3f} confidence)")
+            
+            # 7. Calculate predicted price
+            current_price = await self._get_current_price(symbol, simulation_time)
+            if not current_price:
+                return None
+            
+            # Use the return prediction to calculate predicted price
+            predicted_price = current_price * (1 + return_pred)
+            
+            return {
+                'predicted_price': predicted_price,
+                'raw_prediction': return_pred,
+                'model_type': 'regime_aware_lgb',
+                'regime': regime_name,
+                'regime_confidence': regime_confidence,
+                'direction': direction,
+                'direction_confidence': direction_confidence,
+                'model_used': model_used
+            }
+            
+        except Exception as e:
+            logger.error(f"LightGBM prediction failed for {symbol}: {e}")
             return None
 
     async def _get_current_price(self, symbol: str, simulation_time: Optional[datetime] = None) -> Optional[float]:
@@ -420,7 +544,7 @@ class SimpleStrategyEngine:
             logger.error(f"Failed to get current price for {symbol}: {e}")
             return None
 
-    async def _prepare_features(self, symbol: str, metadata: ModelMetadata, simulation_time: Optional[datetime] = None) -> Optional[np.ndarray]:
+    async def _prepare_lstm_features(self, symbol: str, metadata: ModelMetadata, simulation_time: Optional[datetime] = None) -> Optional[np.ndarray]:
         """
         Prepare features using EXACT same pattern as test_simple_inference.py (PROVEN TO WORK)
         
@@ -507,7 +631,7 @@ class SimpleStrategyEngine:
             logger.error(f"Feature preparation failed for {symbol}: {e}")
             return None
 
-    async def _predict_with_model(self, model, features: np.ndarray, symbol: str) -> Optional[float]:
+    async def _predict_with_tensorflow_model(self, model, features: np.ndarray, symbol: str) -> Optional[float]:
         """Generate prediction using LSTM model"""
         try:
             # Validate inputs
@@ -549,7 +673,136 @@ class SimpleStrategyEngine:
             logger.error(f"Model prediction failed for {symbol}: {e}")
             return None
 
-    async def _convert_prediction_to_price(self, raw_prediction: float, current_price: float, 
+    async def _prepare_lgb_features(self, symbol: str, simulation_time: Optional[datetime] = None) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """
+        Prepare features for LightGBM regime-aware model using InferenceDataProcessor
+        
+        Args:
+            symbol: Token symbol
+            simulation_time: Optional time for backtesting (defaults to current time)
+            
+        Returns:
+            Tuple of (features_dataframe, regime_features_dataframe) or (None, None) if failed
+        """
+        try:
+            logger.debug(f"Preparing LightGBM features for {symbol} using InferenceDataProcessor")
+            
+            # Get token address from symbol
+            await self._ensure_db_manager()
+            token_info = await self.db_manager.get_token_by_symbol(symbol)
+            if not token_info:
+                logger.error(f"Token {symbol} not found in database")
+                return None, None
+            
+            # Handle both dictionary and object returns from get_token_by_symbol
+            if hasattr(token_info, 'address'):
+                token_address = token_info.address
+            else:
+                token_address = token_info['address']
+            logger.debug(f"Found token {symbol} with address {token_address}")
+            
+            # Use InferenceDataProcessor which properly handles simulation_time
+            await self._ensure_inference_processor()
+            inference_data = await self.inference_processor.prepare_inference_data(
+                token_address=token_address,
+                resolution='1H',
+                simulation_time=simulation_time
+            )
+            
+            if not inference_data or not inference_data.get('ready_for_inference'):
+                logger.warning(f"Inference data not ready for {symbol}")
+                return None, None
+            
+            # Get features DataFrame from inference data
+            features_df = inference_data['features_dataframe']
+            
+            if features_df is None or features_df.empty or len(features_df) < 200:
+                logger.warning(f"Insufficient data: {len(features_df) if features_df is not None else 0} records")
+                return None, None
+            
+            logger.debug(f"📊 Loaded {len(features_df)} hours of data with {features_df.shape[1]} features")
+            
+            # Create regime features (same as training)
+            regime_features_df = self._create_regime_features(features_df)
+            
+            logger.debug(f"✅ LightGBM features prepared: {features_df.shape[1]} main features, {regime_features_df.shape[1]} regime features")
+            
+            return features_df, regime_features_df
+                
+        except Exception as e:
+            logger.error(f"LightGBM feature preparation failed for {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None
+
+    def _create_regime_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create regime detection features from OHLCV data (same as training)"""
+        regime_features = pd.DataFrame(index=df.index)
+        
+        # Volatility features
+        regime_features['volatility_24h'] = df['close'].pct_change().rolling(24).std()
+        regime_features['volatility_72h'] = df['close'].pct_change().rolling(72).std()
+        regime_features['volatility_168h'] = df['close'].pct_change().rolling(168).std()
+        
+        # Volatility ratios (with better epsilon for stability)
+        epsilon = 1e-6
+        regime_features['vol_ratio_24_72'] = regime_features['volatility_24h'] / (regime_features['volatility_72h'] + epsilon)
+        regime_features['vol_ratio_24_168'] = regime_features['volatility_24h'] / (regime_features['volatility_168h'] + epsilon)
+        
+        # ATR-based volatility
+        if 'ATRr_14' in df.columns:
+            regime_features['atr_14'] = df['ATRr_14']
+            regime_features['atr_change'] = df['ATRr_14'].pct_change(24)
+        
+        # Volume features
+        volume_std = df['volume'].rolling(168).std()
+        volume_mean = df['volume'].rolling(168).mean()
+        regime_features['volume_24h_zscore'] = np.where(
+            volume_std > epsilon,
+            (df['volume'] - volume_mean) / volume_std,
+            0
+        )
+        regime_features['volume_spike'] = (df['volume'] > df['volume'].rolling(168).quantile(0.9)).astype(int)
+        
+        # Price momentum
+        regime_features['momentum_24h'] = df['close'].pct_change(24)
+        regime_features['momentum_abs'] = regime_features['momentum_24h'].abs()
+        
+        # Range expansion
+        regime_features['range_24h'] = (df['high'].rolling(24).max() - df['low'].rolling(24).min()) / (df['close'] + epsilon)
+        range_mean = regime_features['range_24h'].rolling(168).mean()
+        regime_features['range_expansion'] = np.where(
+            range_mean > epsilon,
+            regime_features['range_24h'] / range_mean,
+            1.0
+        )
+        
+        # Realized volatility variations
+        if 'parkinson_volatility' in df.columns:
+            regime_features['parkinson_vol'] = df['parkinson_volatility']
+        if 'garman_klass_volatility' in df.columns:
+            regime_features['gk_vol'] = df['garman_klass_volatility']
+        
+        # Market microstructure
+        high_low_range = df['high'] - df['low']
+        regime_features['price_efficiency'] = np.where(
+            high_low_range > epsilon,
+            (df['close'] - df['open']).abs() / high_low_range,
+            0.5
+        )
+        
+        # Fill NaN values
+        regime_features = regime_features.fillna(method='ffill').fillna(0)
+        
+        # Clip extreme values to prevent infinity
+        regime_features = regime_features.clip(lower=-1e6, upper=1e6)
+        
+        # Replace any remaining inf values
+        regime_features = regime_features.replace([np.inf, -np.inf], 0)
+        
+        return regime_features
+
+    async def _convert_lstm_prediction_to_price(self, raw_prediction: float, current_price: float, 
                                          symbol: str, metadata: ModelMetadata) -> float:
         """Convert raw model prediction to actual price prediction using the same method as training"""
         try:
@@ -626,13 +879,21 @@ class SimpleStrategyEngine:
             logger.error(f"Prediction conversion failed for {symbol}: {e}")
             return current_price  # Fallback to current price
 
-    async def _apply_simple_strategy(self, current_price: float, predicted_price: float,
+    async def _apply_simple_strategy(self, current_price: float, prediction_result: Dict[str, Any],
                                    strategy_params: Dict[str, float], symbol: str,
                                    metadata: ModelMetadata) -> Dict[str, Any]:
         """Apply simple magnitude-based strategy logic"""
         try:
+            # Extract prediction and model type from prediction_result
+            raw_prediction = prediction_result['raw_prediction']
+            model_type = prediction_result['model_type']
+            
             # Calculate predicted percentage change
-            predicted_change_pct = (predicted_price - current_price) / current_price * 100
+            if model_type == 'lstm':
+                predicted_change_pct = (prediction_result['predicted_price'] - current_price) / current_price * 100
+            elif model_type == 'regime_aware_lgb':
+                # For regime-aware models, the raw_prediction is the return prediction
+                predicted_change_pct = raw_prediction * 100
             
             # Get strategy parameters
             buy_threshold = strategy_params.get('buy_threshold', self.config.default_buy_threshold)
@@ -729,10 +990,11 @@ class SimpleStrategyEngine:
             
             # Create prediction data
             from ..database.production_db import ModelPredictionData
+            model_name_prefix = "LGB" if signal.model_type == "regime_aware_lgb" else "LSTM"
             prediction_data = ModelPredictionData(
                 prediction_id=None,  # Will be auto-generated
                 token_id=token_info['token_id'],
-                model_name=f"LSTM_{signal.symbol}",
+                model_name=f"{model_name_prefix}_{signal.symbol}",
                 model_version=signal.model_version,
                 prediction_time=signal.timestamp,
                 prediction_action=signal.signal_type.value,
@@ -801,7 +1063,7 @@ class SimpleStrategyEngine:
 
     def _log_initialization(self):
         """Log strategy engine initialization details"""
-        logger.info(f"Simple Strategy Engine initialized (backtest_mode={self.backtest_mode})")
+        logger.info(f"Strategy Engine initialized (supports LSTM + LightGBM, backtest_mode={self.backtest_mode})")
         
         # Get actual confidence threshold value for logging
         from ..config.config import config
@@ -811,19 +1073,19 @@ class SimpleStrategyEngine:
                    f"sell_threshold={self.config.default_sell_threshold:.1%}, "
                    f"confidence_threshold={actual_confidence_threshold:.1%}")
         logger.info(f"Performance: target_latency={self.config.max_prediction_latency_ms}ms "
-                   f"(Note: First model loads will be slower due to GPU initialization)")
+                   f"(Note: First model loads will be slower, especially for TensorFlow models)")
         logger.info(f"Memory: max_models_in_memory={self.config.max_models_in_memory}, "
                    f"threshold={self.config.model_memory_threshold_mb}MB "
-                   f"(Optimized for ~20 token models)")
+                   f"(Optimized for ~20 models: LSTM + LightGBM)")
 
 # Convenience functions for easy integration
-_strategy_engine_instance: Optional[SimpleStrategyEngine] = None
+_strategy_engine_instance: Optional[StrategyEngine] = None
 
-def get_strategy_engine(backtest_mode: bool = False) -> SimpleStrategyEngine:
+def get_strategy_engine(backtest_mode: bool = False) -> StrategyEngine:
     """Get or create the global strategy engine instance"""
     global _strategy_engine_instance
     if _strategy_engine_instance is None or (backtest_mode and not getattr(_strategy_engine_instance, 'backtest_mode', False)):
-        _strategy_engine_instance = SimpleStrategyEngine(backtest_mode=backtest_mode)
+        _strategy_engine_instance = StrategyEngine(backtest_mode=backtest_mode)
     return _strategy_engine_instance
 
 async def generate_signal(symbol: str, version: Optional[str] = None) -> Optional[TradingSignal]:

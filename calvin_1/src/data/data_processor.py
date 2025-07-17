@@ -36,9 +36,9 @@ class DataProcessor:
         os.makedirs(self.data_dir, exist_ok=True)
         
         # Scalers for normalization
-        # Use symmetric MinMaxScaler for percentage changes to scale to [-1, 1]
-        # This preserves sign and bounds the output (good for crypto volatility)
-        self.price_scaler = MinMaxScaler(feature_range=(-1, 1))
+        # Use RobustScaler for percentage changes - handles outliers better across different tokens
+        # RobustScaler uses median/IQR instead of mean/std, making it more stable for crypto volatility
+        self.price_scaler = RobustScaler()
         self.feature_scaler = StandardScaler()
         
         # Store last known prices for predictions
@@ -94,6 +94,42 @@ class DataProcessor:
                     start_time=start_date,
                     end_time=end_date
                 )
+                
+                # ALSO fetch BTC and ETH data for correlation features
+                btc_data = None
+                eth_data = None
+                
+                # Get token symbol to check if it's BTC or ETH
+                symbol = token_info.symbol if hasattr(token_info, 'symbol') else None
+                
+                # Only fetch BTC/ETH if this isn't BTC or ETH itself
+                if symbol and symbol.upper() not in ['BTC', 'BITCOIN', 'ETH', 'ETHEREUM', 'WBTC', 'WETH']:
+                    logger.info("Fetching BTC and ETH data for correlation features")
+                    
+                    # Get BTC and ETH tokens
+                    btc_token = await db_manager.get_token_by_symbol('WBTC')
+                    eth_token = await db_manager.get_token_by_symbol('WETH')
+                    
+                    if btc_token:
+                        btc_data = await db_manager.get_ohlcv_data(
+                            token_id=btc_token['token_id'],
+                            resolution=resolution,
+                            start_time=start_date,
+                            end_time=end_date
+                        )
+                    
+                    if eth_token:
+                        eth_data = await db_manager.get_ohlcv_data(
+                            token_id=eth_token['token_id'],
+                            resolution=resolution,
+                            start_time=start_date,
+                            end_time=end_date
+                        )
+                
+                # Store BTC/ETH data in instance variables for later use
+                self._cached_btc_data = btc_data
+                self._cached_eth_data = eth_data
+                self._cached_data_timerange = (start_date, end_date)
                 
                 if ohlcv_data:
                     logger.info(f"Found {len(ohlcv_data):,} OHLCV records in TimescaleDB")
@@ -2027,8 +2063,9 @@ class DataProcessor:
         ]
         
         # Select features (drop target, original price used for inverse, and timestamps)
-        drop_cols = ['target', 'price_for_inverse', 'timestamp', 'date', 'time', 'data_source', 'lunarcrush_id']
-        feature_cols = [col for col in df.columns if col not in drop_cols and col != target_col]
+        # CRITICAL: Also exclude the target column (e.g., 'close') from features!
+        drop_cols = ['target', 'price_for_inverse', 'timestamp', 'date', 'time', 'data_source', 'lunarcrush_id', target_col]
+        feature_cols = [col for col in df.columns if col not in drop_cols]
         
         # Log feature types for transparency
         social_features = [col for col in feature_cols if any(ind in col for ind in social_indicators)]
@@ -2036,7 +2073,16 @@ class DataProcessor:
             logger.info(f"Including {len(social_features)} social features: {social_features}")
         
         # Apply intelligent outlier handling and scaling based on feature types
+        # DEBUG: Check if close is in feature_cols
+        if 'close' in feature_cols:
+            logger.warning(f"WARNING: 'close' column is in feature_cols and will be transformed!")
+            logger.warning(f"Close price before transformation - min: {df['close'].min():.4f}, max: {df['close'].max():.4f}, mean: {df['close'].mean():.4f}")
+        
         df = self._handle_outliers_and_scaling(df, feature_cols)
+        
+        # DEBUG: Check close price after transformation
+        if 'close' in df.columns:
+            logger.warning(f"Close price after transformation - min: {df['close'].min():.4f}, max: {df['close'].max():.4f}, mean: {df['close'].mean():.4f}")
         
         # Store feature names if requested
         if include_feature_names:
@@ -2073,9 +2119,18 @@ class DataProcessor:
         
         # Don't scale percentage changes - they're already normalized
         # Using StandardScaler instead of MinMaxScaler to preserve sign
+        # DEBUG: Check target distribution before scaling
+        unscaled_targets = df['target'].values
+        logger.info(f"Target distribution before scaling - min: {unscaled_targets.min():.4f}, max: {unscaled_targets.max():.4f}, mean: {unscaled_targets.mean():.6f}")
+        logger.info(f"Positive targets before scaling: {(unscaled_targets > 0).sum()}/{len(unscaled_targets)} ({(unscaled_targets > 0).mean()*100:.1f}%)")
+        
         targets  = self.price_scaler.transform(
             df['target'].values.reshape(-1, 1)
         ).flatten()
+        
+        # DEBUG: Check target distribution after scaling
+        logger.info(f"Target distribution after scaling - min: {targets.min():.4f}, max: {targets.max():.4f}, mean: {targets.mean():.6f}")
+        logger.info(f"Positive targets after scaling: {(targets > 0).sum()}/{len(targets)} ({(targets > 0).mean()*100:.1f}%)")
         
         # Keep the original prices corresponding to the features for inverse transform
         prices_for_inverse = df['price_for_inverse'].values
@@ -2427,19 +2482,8 @@ class DataProcessor:
         df = self.add_volume_profile_features(df)
         
         # Add intermarket correlation features (BTC/ETH)
-        # Since this method is now async, we need to handle it in the sync context
-        try:
-            # Try to get the current event loop
-            loop = asyncio.get_running_loop()
-            # If we're in an async context, we can't use asyncio.run
-            # Create a task and run it
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, self.add_intermarket_correlation_features(df, symbol))
-                df = future.result()
-        except RuntimeError:
-            # No event loop running, we can use asyncio.run directly
-            df = asyncio.run(self.add_intermarket_correlation_features(df, symbol))
+        # Now using cached data from fetch_price_data
+        df = self.add_intermarket_correlation_features(df, symbol)
         
         # Include sentiment data if requested
         if include_sentiment:
@@ -3456,9 +3500,8 @@ class DataProcessor:
         logger.info(f"Added {len(vol_profile_cols) + 1} volume profile features")
         return result
     
-    async def add_intermarket_correlation_features(self, df: pd.DataFrame, symbol: str = None, 
-                                            correlation_windows: list = [24, 48, 168],
-                                            db_manager: Optional['ProductionDBManager'] = None) -> pd.DataFrame:
+    def add_intermarket_correlation_features(self, df: pd.DataFrame, symbol: str = None, 
+                                            correlation_windows: list = [24, 48, 168]) -> pd.DataFrame:
         """
         Fix #25: Add BTC and ETH correlation features for better market context
         
@@ -3483,64 +3526,9 @@ class DataProcessor:
         result = df.copy()
         
         try:
-            # Get BTC and ETH data for the same time period
-            from ..database.production_db import get_db_manager
-            import asyncio
-            
-            # Get time range from current data
-            start_time = df['timestamp'].min()
-            end_time = df['timestamp'].max()
-            
-            # Fetch BTC and ETH data
-            async def fetch_market_data():
-                # Use the provided db_manager or get the singleton
-                if db_manager is None:
-                    from ..database.production_db import get_db_manager
-                    db_mgr = await get_db_manager()
-                else:
-                    db_mgr = db_manager
-                
-                # Get token IDs for BTC and ETH dynamically from database
-                btc_token = await db_mgr.get_token_by_symbol('WBTC')
-                eth_token = await db_mgr.get_token_by_symbol('WETH')
-                
-                if not btc_token or not eth_token:
-                    logger.warning("Could not find WBTC/WETH tokens in database for correlation features")
-                    # Add placeholder columns
-                    for window in correlation_windows:
-                        result[f'btc_correlation_{window}h'] = 0.5
-                        result[f'eth_correlation_{window}h'] = 0.5
-                        result[f'btc_relative_strength_{window}h'] = 0.0
-                        result[f'eth_relative_strength_{window}h'] = 0.0
-                    
-                    result['btc_eth_spread'] = 0.0
-                    result['market_regime_correlation'] = 0.5
-                    result['beta_to_btc'] = 1.0
-                    result['beta_to_eth'] = 1.0
-                    result['btc_eth_dominance'] = 0.0
-                    return result
-                
-                btc_token_id = btc_token['token_id']
-                eth_token_id = eth_token['token_id']
-                
-                btc_data = await db_mgr.get_ohlcv_data(
-                    token_id=btc_token_id,
-                    resolution='1H',
-                    start_time=start_time,
-                    end_time=end_time
-                )
-                
-                eth_data = await db_mgr.get_ohlcv_data(
-                    token_id=eth_token_id,
-                    resolution='1H',
-                    start_time=start_time,
-                    end_time=end_time
-                )
-                
-                return btc_data, eth_data
-            
-            # Since we're now in an async function, we can await directly
-            btc_data, eth_data = await fetch_market_data()
+            # Use cached BTC and ETH data from fetch_price_data
+            btc_data = getattr(self, '_cached_btc_data', None)
+            eth_data = getattr(self, '_cached_eth_data', None)
             
             if not btc_data or not eth_data:
                 logger.warning("Could not fetch BTC/ETH data for correlation features")
@@ -3703,17 +3691,19 @@ class DataProcessor:
         result = df.copy()
         
         # Categorize features by type
-        price_based_features = ['open', 'high', 'low', 'close', 'vwap', 'sma_', 'ema_', 'kama_', 'hma_', 
-                               'bb_upper', 'bb_lower', 'bb_middle', 'fib_', 'resistance_', 'support_',
-                               'poc_price', 'value_area_high', 'value_area_low']
+        # Separate exact matches from prefix patterns
+        price_exact_features = ['open', 'high', 'low', 'close', 'vwap', 'bb_upper', 'bb_lower', 
+                               'bb_middle', 'poc_price', 'value_area_high', 'value_area_low']
+        price_prefix_features = ['sma_', 'ema_', 'kama_', 'hma_', 'fib_', 'resistance_', 'support_']
         
-        ratio_features = ['rsi', 'stoch', 'willr', 'cci', 'cmf', 'pvt_oscillator', 'vol_efficiency',
-                         'price_relative_position', 'candle_ratio', 'close_rel_position']
+        ratio_exact_features = ['rsi', 'stoch', 'willr', 'cci', 'cmf', 'pvt_oscillator', 'vol_efficiency',
+                               'price_relative_position', 'candle_ratio', 'close_rel_position']
         
         percentage_features = ['returns', 'price_change', 'trend_pct', 'distance_pct', 'width_pct',
                               'volume_above_poc', 'volume_below_poc', 'win_rate']
         
-        count_features = ['volume', 'social_volume', 'interactions', 'posts', 'contributors']
+        count_exact_features = ['volume']
+        count_substring_features = ['social_volume', 'interactions', 'posts', 'contributors']
         
         binary_features = ['swing_high', 'swing_low', 'bullish_fvg', 'bearish_fvg', 'at_support', 
                           'at_resistance', 'in_value_area', 'breaks_resistance', 'breaks_support']
@@ -3732,17 +3722,17 @@ class DataProcessor:
             # Check if it's a binary feature
             if col in binary_features or result[col].nunique() <= 2:
                 feature_type = 'binary'
-            # Check if it's a price-based feature
-            elif any(pattern in col for pattern in price_based_features):
+            # Check if it's a price-based feature (exact match first, then prefix)
+            elif col in price_exact_features or any(col.startswith(prefix) for prefix in price_prefix_features):
                 feature_type = 'price'
-            # Check if it's a ratio feature (typically 0-100 or 0-1)
-            elif any(pattern in col for pattern in ratio_features):
+            # Check if it's a ratio feature (exact match)
+            elif col in ratio_exact_features:
                 feature_type = 'ratio'
             # Check if it's a percentage feature
             elif any(pattern in col for pattern in percentage_features):
                 feature_type = 'percentage'
-            # Check if it's a count feature
-            elif any(pattern in col for pattern in count_features):
+            # Check if it's a count feature (exact match first, then substring)
+            elif col in count_exact_features or any(pattern in col for pattern in count_substring_features):
                 feature_type = 'count'
             else:
                 feature_type = 'unknown'
@@ -3859,6 +3849,41 @@ class DataProcessor:
                 logger.warning(f"Insufficient OHLCV data for token {token_id}: {len(ohlcv_data) if ohlcv_data else 0} records")
                 return None
             
+            # ALSO fetch BTC and ETH data for correlation features
+            btc_data = None
+            eth_data = None
+            
+            # Only fetch BTC/ETH if this isn't BTC or ETH itself
+            if symbol and symbol.upper() not in ['BTC', 'BITCOIN', 'ETH', 'ETHEREUM', 'WBTC', 'WETH']:
+                logger.info("Fetching BTC and ETH data for correlation features in inference")
+                
+                # Get BTC and ETH tokens
+                btc_token = await db_manager.get_token_by_symbol('WBTC')
+                eth_token = await db_manager.get_token_by_symbol('WETH')
+                
+                if btc_token:
+                    btc_data = await db_manager.get_ohlcv_data(
+                        token_id=btc_token['token_id'],
+                        resolution='1H',
+                        start_time=start_time,
+                        end_time=end_time
+                    )
+                    logger.info(f"Fetched {len(btc_data) if btc_data else 0} BTC records for correlation")
+                
+                if eth_token:
+                    eth_data = await db_manager.get_ohlcv_data(
+                        token_id=eth_token['token_id'],
+                        resolution='1H',
+                        start_time=start_time,
+                        end_time=end_time
+                    )
+                    logger.info(f"Fetched {len(eth_data) if eth_data else 0} ETH records for correlation")
+            
+            # Store BTC/ETH data in instance variables for later use
+            self._cached_btc_data = btc_data
+            self._cached_eth_data = eth_data
+            self._cached_data_timerange = (start_time, end_time)
+            
             # 2. Convert to DataFrame (same format as training)
             data_records = []
             for record in ohlcv_data:
@@ -3925,7 +3950,7 @@ class DataProcessor:
             df = self.add_volume_profile_features(df)
             
             # Add intermarket correlation features (BTC/ETH)
-            df = await self.add_intermarket_correlation_features(df, symbol, db_manager=db_manager)
+            df = self.add_intermarket_correlation_features(df, symbol)
             
             # 4. Add social data if symbol provided
             if symbol:
@@ -4050,3 +4075,200 @@ class DataProcessor:
             return False
         
         return True
+    
+    def prepare_two_output_targets(self, df: pd.DataFrame, target_col: str = 'close', 
+                                  prediction_horizon: int = 1) -> np.ndarray:
+        """
+        Prepare targets for two-output model: direction and magnitude
+        
+        Args:
+            df: DataFrame with price data
+            target_col: Column to use for calculating targets
+            prediction_horizon: Number of time steps to predict ahead
+            
+        Returns:
+            Two-output targets: shape (n_samples, 2) where:
+            - Column 0: Direction (0 for down, 1 for up)
+            - Column 1: Magnitude (raw absolute percentage change, e.g., 0.05 = 5%)
+        """
+        logger.info(f"Preparing two-output targets for {target_col}")
+        
+        # Get target series
+        target_series = df[target_col]
+        
+        # Calculate percentage change
+        pct_change = target_series.pct_change(periods=prediction_horizon).shift(-prediction_horizon)
+        
+        # Direction: 1 for positive change, 0 for negative/zero change
+        direction = (pct_change > 0).astype(int)
+        
+        # Magnitude: raw absolute percentage change (NO SCALING)
+        # This preserves natural scale where 0.05 = 5% move, 0.10 = 10% move, etc.
+        magnitude = np.abs(pct_change)
+        
+        # Combine into two-output format
+        two_output_targets = np.column_stack([direction, magnitude])
+        
+        # Remove NaN values
+        valid_mask = ~np.isnan(two_output_targets).any(axis=1)
+        two_output_targets = two_output_targets[valid_mask]
+        
+        logger.info(f"Two-output targets prepared: {two_output_targets.shape}")
+        logger.info(f"Direction distribution: {np.mean(two_output_targets[:, 0]):.2%} positive")
+        logger.info(f"Magnitude stats: mean={np.mean(two_output_targets[:, 1]):.4f} ({np.mean(two_output_targets[:, 1])*100:.2f}%), max={np.max(two_output_targets[:, 1]):.4f} ({np.max(two_output_targets[:, 1])*100:.2f}%)")
+        logger.info(f"Magnitude >5%: {np.mean(two_output_targets[:, 1] > 0.05):.1%}, >10%: {np.mean(two_output_targets[:, 1] > 0.10):.1%}")
+        
+        return two_output_targets
+    
+    def prepare_two_output_ml_data(
+        self, 
+        df: pd.DataFrame, 
+        target_col: str = 'close',
+        sequence_length: int = 24,
+        prediction_horizon: int = 1,
+        test_size: float = 0.2,
+        include_feature_names: bool = True,
+        test_mode: bool = False
+    ) -> Union[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray], 
+               Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str]]]:
+        """
+        Prepare data for two-output ML model training
+        
+        Returns:
+            X_train, X_test, y_train, y_test where y has shape (n_samples, 2)
+            for [direction, magnitude] targets
+        """
+        logger.info(f"Preparing two-output ML data with sequence length {sequence_length}")
+        
+        # Handle duplicate columns (same as original method)
+        duplicate_cols = df.columns[df.columns.duplicated()].tolist()
+        if duplicate_cols:
+            logger.warning(f"Found duplicate column names: {duplicate_cols}")
+            df = df.loc[:, ~df.columns.duplicated(keep='first')]
+            logger.info(f"Removed duplicate columns, new shape: {df.shape}")
+        
+        # Prepare two-output targets
+        two_output_targets = self.prepare_two_output_targets(df, target_col, prediction_horizon)
+        
+        # Align dataframe with targets (remove NaN rows)
+        target_series = df[target_col]
+        pct_change = target_series.pct_change(periods=prediction_horizon).shift(-prediction_horizon)
+        valid_mask = ~np.isnan(pct_change)
+        df_aligned = df[valid_mask].copy()
+        
+        # Ensure we have the same number of samples
+        min_samples = min(len(df_aligned), len(two_output_targets))
+        df_aligned = df_aligned.iloc[:min_samples]
+        two_output_targets = two_output_targets[:min_samples]
+        
+        # Drop rows to purge forward-fill artifacts
+        df_aligned = df_aligned.iloc[sequence_length:].copy()
+        two_output_targets = two_output_targets[sequence_length:]
+        
+        logger.info(f"Aligned data shape: {df_aligned.shape}, targets shape: {two_output_targets.shape}")
+        
+        # Select features (same as original method)
+        drop_cols = ['target', 'price_for_inverse', 'timestamp', 'date', 'time', 'data_source', 'lunarcrush_id']
+        feature_cols = [col for col in df_aligned.columns if col not in drop_cols and col != target_col]
+        
+        # Apply outlier handling and scaling
+        df_aligned = self._handle_outliers_and_scaling(df_aligned, feature_cols)
+        
+        # Store feature names if requested
+        if include_feature_names:
+            feature_names = feature_cols.copy()
+            logger.info(f"Returning {len(feature_names)} feature names")
+        
+        # Fit scalers
+        scalers_already_loaded = hasattr(self, '_scalers_loaded') and self._scalers_loaded
+        
+        if test_mode:
+            if not scalers_already_loaded:
+                logger.info("Test mode: fitting scalers on entire dataset")
+                self.feature_scaler.fit(df_aligned[feature_cols].values)
+                # Note: We don't scale two-output targets - they're already in 0-1 range
+        else:
+            if not scalers_already_loaded:
+                train_cutoff = int(len(df_aligned) * (1 - test_size))
+                self.feature_scaler.fit(df_aligned.iloc[:train_cutoff][feature_cols].values)
+        
+        # Scale features
+        features = self.feature_scaler.transform(df_aligned[feature_cols].values)
+        
+        # Create sequences
+        X, y = self._create_two_output_sequences(features, two_output_targets, sequence_length)
+        
+        # Safety checks
+        if np.isnan(X).any():
+            logger.warning("NaN values detected in X, replacing with 0")
+            X = np.nan_to_num(X, nan=0.0)
+        
+        if np.isnan(y).any():
+            logger.warning("NaN values detected in y, replacing with 0")
+            y = np.nan_to_num(y, nan=0.0)
+        
+        if X.size == 0 or y.size == 0:
+            logger.error("Empty arrays after sequence creation")
+            if include_feature_names:
+                return np.array([]), np.array([]), np.array([]), np.array([]), []
+            else:
+                return np.array([]), np.array([]), np.array([]), np.array([])
+        
+        # Split data
+        if test_mode:
+            X_train, y_train = None, None
+            X_test, y_test = X, y
+            logger.info(f"Test mode - X_test: {X_test.shape}, y_test: {y_test.shape}")
+        else:
+            split_index = int(len(X) * (1 - test_size))
+            X_train = X[:split_index]
+            X_test = X[split_index:]
+            y_train = y[:split_index]
+            y_test = y[split_index:]
+            logger.info(f"Training mode - X_train: {X_train.shape}, X_test: {X_test.shape}")
+            logger.info(f"y_train: {y_train.shape}, y_test: {y_test.shape}")
+        
+        if include_feature_names:
+            return X_train, X_test, y_train, y_test, feature_names
+        else:
+            return X_train, X_test, y_train, y_test
+    
+    def _create_two_output_sequences(self, features: np.ndarray, targets: np.ndarray, 
+                                   sequence_length: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create sequences for two-output model
+        
+        Args:
+            features: Scaled feature array
+            targets: Two-output targets (direction, magnitude)
+            sequence_length: Length of input sequences
+            
+        Returns:
+            X: Feature sequences (n_samples, sequence_length, n_features)
+            y: Target sequences (n_samples, 2) for [direction, magnitude]
+        """
+        if len(features) < sequence_length:
+            logger.error(f"Not enough data for sequences: {len(features)} < {sequence_length}")
+            return np.array([]), np.array([])
+        
+        # Ensure features and targets have same length
+        min_length = min(len(features), len(targets))
+        features = features[:min_length]
+        targets = targets[:min_length]
+        
+        X = []
+        y = []
+        
+        for i in range(sequence_length, len(features)):
+            # Feature sequence
+            X.append(features[i-sequence_length:i])
+            # Target at current position (already shifted in prepare_two_output_targets)
+            y.append(targets[i])
+        
+        X = np.array(X)
+        y = np.array(y)
+        
+        logger.info(f"Created {len(X)} sequences of length {sequence_length}")
+        logger.info(f"X shape: {X.shape}, y shape: {y.shape}")
+        
+        return X, y

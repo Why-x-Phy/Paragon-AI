@@ -1,8 +1,9 @@
 """
-Calvin AI LSTM Model Registry
+Calvin AI Model Registry
 
-Centralized registry for managing trained LSTM models with:
+Centralized registry for managing trained models with:
 - Integration with existing trained models in models/ directory
+- Support for both LSTM (.h5) and Regime-Aware LightGBM (.pkl) models
 - Model versioning and metadata management  
 - Redis caching for model loading performance
 - Hot model swapping capability
@@ -11,6 +12,7 @@ Centralized registry for managing trained LSTM models with:
 
 This integrates with:
 - Existing LSTM models (.h5 files)
+- New Regime-Aware LightGBM models (.pkl files)
 - data_processor.py for feature preprocessing
 - profit_functions.py simple_backtest_strategy
 - Redis caching infrastructure
@@ -21,7 +23,7 @@ import os
 import json
 import asyncio
 import hashlib
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Union
 from datetime import datetime, timedelta
 from pathlib import Path
 import numpy as np
@@ -29,6 +31,7 @@ import pandas as pd
 import redis
 import pickle
 from dataclasses import dataclass, asdict
+import joblib
 
 # TensorFlow imports with error handling
 try:
@@ -50,15 +53,15 @@ logger = log
 
 @dataclass
 class ModelMetadata:
-    """Metadata for a trained LSTM model"""
+    """Metadata for a trained model (LSTM or Regime-Aware LightGBM)"""
     model_path: str
     symbol: str
-    model_type: str
+    model_type: str  # "lstm" or "regime_aware_lgb"
     created_at: datetime
     last_used: Optional[datetime]
     version: str  # Date version (YYYYMMDD) - maintained for backward compatibility
-    input_shape: Tuple[int, int]
-    sequence_length: int
+    input_shape: Optional[Tuple[int, int]]  # Optional for LightGBM models
+    sequence_length: Optional[int]  # Optional for LightGBM models
     prediction_horizon: int
     
     # Enhanced versioning
@@ -83,11 +86,16 @@ class ModelMetadata:
     usage_count: int = 0
     last_performance_score: Optional[float] = None
     performance_degradation_count: int = 0
+    
+    # New fields for regime-aware models
+    regime_classifier_type: Optional[str] = None  # For regime-aware models
+    regressor_type: Optional[str] = None  # For regime-aware models
+    direction_classifier_type: Optional[str] = None  # For regime-aware models
 
-class LSTMModelRegistry:
+class ModelRegistry:
     """
-    Centralized registry for managing LSTM models with Redis caching and 
-    integration with existing Calvin AI infrastructure
+    Centralized registry for managing both LSTM and Regime-Aware LightGBM models
+    with Redis caching and integration with existing Calvin AI infrastructure
     """
     
     def __init__(self, models_dir: Optional[str] = None, redis_client: Optional[redis.Redis] = None):
@@ -95,7 +103,7 @@ class LSTMModelRegistry:
         Initialize model registry
         
         Args:
-            models_dir: Directory containing .h5 model files (defaults to config)
+            models_dir: Directory containing model files (defaults to config)
             redis_client: Redis client for caching (will create if None)
         """
         # Use existing configuration system
@@ -139,8 +147,8 @@ class LSTMModelRegistry:
                 self.redis_client = None
                 self.redis_binary_client = None
         
-        # In-memory model cache for hot swapping
-        self._model_cache: Dict[str, tf.keras.Model] = {}
+        # In-memory model cache for hot swapping (supports both LSTM and LightGBM)
+        self._model_cache: Dict[str, Union[tf.keras.Model, Dict[str, Any]]] = {}
         self._metadata_cache: Dict[str, ModelMetadata] = {}
         
         # Cache configuration from environment
@@ -153,7 +161,7 @@ class LSTMModelRegistry:
         # Initialize registry
         self._initialize_registry()
         
-        logger.info(f"LSTM Model Registry initialized")
+        logger.info(f"Model Registry initialized (supports LSTM + LightGBM)")
         logger.info(f"Models directory: {self.models_dir}")
         logger.info(f"Registry path: {self.registry_path}")
         logger.info(f"Redis caching: {'enabled' if self.redis_client else 'disabled'}")
@@ -162,24 +170,27 @@ class LSTMModelRegistry:
         """Initialize the registry by scanning existing models and only loading the latest version per symbol"""
         logger.info("Initializing model registry...")
         
-        # Scan for existing .h5 files
+        # Scan for both .h5 (LSTM) and .pkl (LightGBM) files
         h5_files = list(self.models_dir.glob("*.h5"))
-        logger.info(f"Found {len(h5_files)} .h5 model files")
+        pkl_files = list(self.models_dir.glob("*regime_aware*.pkl"))  # Only regime-aware pkl files
         
-        if not h5_files:
+        logger.info(f"Found {len(h5_files)} LSTM (.h5) files and {len(pkl_files)} regime-aware LightGBM (.pkl) files")
+        
+        if not h5_files and not pkl_files:
             logger.warning("No model files found to register")
             return
         
         # 🆕 OPTIMIZATION: Parse all filenames first without loading models
         parsed_models = {}  # symbol -> List[(file_path, parsed_data)]
         
+        # Process LSTM models
         for model_file in h5_files:
             try:
                 filename = model_file.stem
-                parsed = self._parse_model_filename(filename)
+                parsed = self._parse_lstm_filename(filename)
                 
                 if not parsed:
-                    logger.warning(f"Could not parse model filename: {filename}")
+                    logger.warning(f"Could not parse LSTM filename: {filename}")
                     continue
                 
                 symbol = parsed['symbol']
@@ -189,7 +200,26 @@ class LSTMModelRegistry:
                 parsed_models[symbol].append((model_file, parsed))
                 
             except Exception as e:
-                logger.error(f"Failed to parse model filename {model_file}: {e}")
+                logger.error(f"Failed to parse LSTM filename {model_file}: {e}")
+        
+        # Process LightGBM regime-aware models  
+        for model_file in pkl_files:
+            try:
+                filename = model_file.stem
+                parsed = self._parse_lgb_filename(filename)
+                
+                if not parsed:
+                    logger.warning(f"Could not parse LightGBM filename: {filename}")
+                    continue
+                
+                symbol = parsed['symbol']
+                if symbol not in parsed_models:
+                    parsed_models[symbol] = []
+                
+                parsed_models[symbol].append((model_file, parsed))
+                
+            except Exception as e:
+                logger.error(f"Failed to parse LightGBM filename {model_file}: {e}")
         
         # 🆕 OPTIMIZATION: For each symbol, find and register only the latest version
         total_models_available = sum(len(models) for models in parsed_models.values())
@@ -199,10 +229,11 @@ class LSTMModelRegistry:
             if not symbol_models:
                 continue
             
-            # Sort models using the same priority logic as _find_model_key
+            # Sort models using enhanced priority logic for both LSTM and LightGBM
             def sort_key(item):
                 model_file, parsed = item
-                # Priority: improved models first, then new format, then date (newest first), then semantic version
+                # Priority: LightGBM > LSTM, improved > regular, new format > legacy, then date
+                is_lgb = parsed['model_type'] == 'regime_aware_lgb'
                 is_improved = parsed.get('is_improved', False)
                 is_new = not parsed['is_legacy']
                 date_version = parsed['date_version']
@@ -216,7 +247,7 @@ class LSTMModelRegistry:
                     except (ValueError, IndexError):
                         pass
                 
-                return (is_improved, is_new, date_version, semantic_parts)
+                return (is_lgb, is_improved, is_new, date_version, semantic_parts)
             
             # Get the latest model for this symbol
             latest_model = max(symbol_models, key=sort_key)
@@ -226,15 +257,24 @@ class LSTMModelRegistry:
             if len(symbol_models) > 1:
                 latest_file, latest_parsed = latest_model
                 skipped_count = len(symbol_models) - 1
-                model_type = "improved" if latest_parsed.get('is_improved', False) else ("new format" if not latest_parsed['is_legacy'] else "legacy")
-                logger.debug(f"📊 {symbol}: Selected {model_type} model {latest_parsed['filename']}, skipping {skipped_count} older versions")
+                model_type = latest_parsed['model_type']
+                if model_type == 'regime_aware_lgb':
+                    model_desc = "regime-aware LightGBM"
+                elif latest_parsed.get('is_improved', False):
+                    model_desc = "improved LSTM"
+                else:
+                    model_desc = "LSTM"
+                logger.debug(f"📊 {symbol}: Selected {model_desc} model {latest_parsed['filename']}, skipping {skipped_count} older versions")
         
         # 🆕 REGISTER ONLY THE LATEST MODELS
         logger.info(f"🎯 Optimization: Registering {len(models_to_register)} latest models (skipping {total_models_available - len(models_to_register)} older versions)")
         
         for model_file, parsed_data in models_to_register:
             try:
-                self._register_existing_model(model_file)
+                if parsed_data['model_type'] == 'regime_aware_lgb':
+                    self._register_existing_lgb_model(model_file)
+                else:
+                    self._register_existing_lstm_model(model_file)
             except Exception as e:
                 logger.error(f"Failed to register latest model {model_file}: {e}")
         
@@ -243,8 +283,12 @@ class LSTMModelRegistry:
         models_skipped = total_models_available - len(models_to_register)
         efficiency_pct = (models_skipped / total_models_available * 100) if total_models_available > 0 else 0
         
+        # Count model types
+        lstm_count = sum(1 for _, parsed in models_to_register if parsed['model_type'] == 'lstm')
+        lgb_count = sum(1 for _, parsed in models_to_register if parsed['model_type'] == 'regime_aware_lgb')
+        
         logger.info(f"✅ Registry initialization complete: {len(self._metadata_cache)} latest models registered")
-        logger.info(f"📈 Performance: {symbols_loaded} symbols loaded, {models_skipped} older models skipped ({efficiency_pct:.1f}% reduction)")
+        logger.info(f"📈 Performance: {symbols_loaded} symbols loaded ({lstm_count} LSTM, {lgb_count} LightGBM), {models_skipped} older models skipped ({efficiency_pct:.1f}% reduction)")
         
         # Log which symbols we have models for
         symbols = list(set(parsed['symbol'] for _, parsed in models_to_register))
@@ -254,113 +298,145 @@ class LSTMModelRegistry:
         else:
             logger.info(f"🎯 Available symbols: {', '.join(symbols[:10])}... (and {len(symbols)-10} more)")
 
-    def register_new_model(self, model_path: str, symbol: str, semantic_version: str, 
-                          model_type: str = "lstm", **kwargs) -> bool:
+    def _parse_lstm_filename(self, filename: str) -> Dict[str, Any]:
         """
-        Register a newly trained model with semantic versioning
+        Parse LSTM model filename formats
         
-        Args:
-            model_path: Path to the .h5 model file
-            symbol: Token symbol
-            semantic_version: Semantic version (e.g., "v1.0.0")
-            model_type: Model type (default: "lstm")
-            **kwargs: Additional metadata fields
-            
+        Supports:
+        - Legacy: symbol_lstm_YYYYMMDD.h5 (e.g., "Fartcoin_lstm_20250614.h5")
+        - New: symbol_lstm_vMAJOR.MINOR.PATCH_YYYYMMDD.h5 (e.g., "Fartcoin_lstm_v1.0.0_20250614.h5")
+        - Improved: symbol_lstm_improved_vMAJOR.MINOR.PATCH_YYYYMMDD.h5 (e.g., "Fartcoin_lstm_improved_v1.0.0_20250614.h5")
+        
         Returns:
-            True if registration successful, False otherwise
+            Dict with parsed components or None if invalid format
         """
-        if not HAS_TENSORFLOW:
-            logger.error("TensorFlow not available")
-            return False
-            
-        try:
-            model_path_obj = Path(model_path)
-            if not model_path_obj.exists():
-                logger.error(f"Model file not found: {model_path}")
-                return False
-            
-            # Load model to get input shape
-            # Prepare custom objects for model loading
-            from ..model.profit_functions import (
-                simple_directional_loss, 
-                direction_focused_loss,
-                directional_loss,
-                profit_loss,
-                combined_profit_mse_loss,
-                direction_accuracy
-            )
-            
-            custom_objects = {
-                'simple_directional_loss': simple_directional_loss,
-                'direction_focused_loss': direction_focused_loss,
-                'directional_loss': directional_loss,
-                'profit_loss': profit_loss,
-                'combined_profit_mse_loss': combined_profit_mse_loss,
-                'direction_accuracy': direction_accuracy
-            }
-            
-            model = tf.keras.models.load_model(str(model_path), custom_objects=custom_objects)
-            input_shape = model.input_shape[1:]  # Remove batch dimension
-            sequence_length = input_shape[0] if len(input_shape) > 0 else 0
-            
-            # Extract date from filename or use current date
-            filename = model_path_obj.stem
-            parsed = self._parse_model_filename(filename)
-            date_version = parsed['date_version'] if parsed else datetime.now().strftime('%Y%m%d')
-            
-            # Create metadata
-            metadata = ModelMetadata(
-                model_path=str(model_path),
-                symbol=symbol,
-                model_type=model_type,
-                created_at=datetime.fromtimestamp(model_path_obj.stat().st_mtime),
-                last_used=None,
-                version=date_version,
-                semantic_version=semantic_version,
-                is_legacy=False,  # New format
-                input_shape=input_shape,
-                sequence_length=sequence_length,
-                prediction_horizon=kwargs.get('prediction_horizon', 1),
-                mse=kwargs.get('mse'),
-                mae=kwargs.get('mae'),
-                rmse=kwargs.get('rmse'),
-                direction_accuracy=kwargs.get('direction_accuracy'),
-                model_hash=self._calculate_model_hash(model_path_obj),
-                buy_threshold=kwargs.get('buy_threshold', 0.01),
-                sell_threshold=kwargs.get('sell_threshold', 0.015),
-                confidence_threshold=kwargs.get('confidence_threshold', 0.10)
-            )
-            
-            # Create model key
-            model_key = f"{symbol}_{semantic_version}_{date_version}"
-            
-            # Store in cache
-            self._metadata_cache[model_key] = metadata
-            
-            # Save metadata to disk
-            metadata_file = self.registry_path / f"{model_key}_metadata.json"
-            with open(metadata_file, 'w') as f:
-                json.dump(self._serialize_metadata(metadata), f, indent=2)
-            
-            logger.info(f"Registered new model: {model_key} (semantic: {semantic_version})")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to register new model {model_path}: {e}")
-            return False
+        parts = filename.split('_')
+        
+        if len(parts) < 3:
+            return None
+        
+        symbol = parts[0]
+        
+        # Must contain 'lstm' for LSTM models
+        if 'lstm' not in parts:
+            return None
+        
+        model_type = 'lstm'
+        
+        # Check for "improved" models
+        is_improved = False
+        improved_index = -1
+        for i, part in enumerate(parts):
+            if part == 'improved':
+                is_improved = True
+                improved_index = i
+                break
+        
+        # Check for new format with semantic version
+        semantic_version = None
+        date_version = None
+        is_legacy = True
+        
+        # Look for semantic version pattern (vX.Y.Z)
+        start_index = improved_index + 1 if is_improved else 2
+        for i, part in enumerate(parts[start_index:], start_index):
+            if part.startswith('v') and '.' in part:
+                # Found semantic version
+                semantic_version = part
+                is_legacy = False
+                # Date should be the next part
+                if i + 1 < len(parts):
+                    date_candidate = parts[i + 1]
+                    if len(date_candidate) == 8 and date_candidate.isdigit():
+                        date_version = date_candidate
+                break
+        
+        # If no semantic version found, look for date in legacy format
+        if is_legacy:
+            for part in parts[2:]:
+                if len(part) == 8 and part.isdigit():
+                    date_version = part
+                    break
+        
+        # Default date if none found
+        if not date_version:
+            date_version = datetime.now().strftime('%Y%m%d')
+        
+        return {
+            'symbol': symbol,
+            'model_type': model_type,
+            'semantic_version': semantic_version,
+            'date_version': date_version,
+            'is_legacy': is_legacy,
+            'is_improved': is_improved,
+            'filename': filename
+        }
 
-    def _register_existing_model(self, model_path: Path):
-        """Register an existing .h5 model file"""
+    def _parse_lgb_filename(self, filename: str) -> Dict[str, Any]:
+        """
+        Parse LightGBM regime-aware model filename formats
+        
+        Supports:
+        - Regime-aware: symbol_regime_aware_YYYYMMDD_HHMMSS.pkl (e.g., "Fartcoin_regime_aware_20250716_162439.pkl")
+        
+        Returns:
+            Dict with parsed components or None if invalid format
+        """
+        parts = filename.split('_')
+        
+        if len(parts) < 3:
+            return None
+        
+        # Must contain 'regime' and 'aware' for regime-aware models
+        if 'regime' not in parts or 'aware' not in parts:
+            return None
+        
+        symbol = parts[0]
+        model_type = 'regime_aware_lgb'
+        
+        # Extract date and time parts (last two parts typically)
+        date_version = None
+        time_version = None
+        
+        # Look for YYYYMMDD pattern
+        for part in parts:
+            if len(part) == 8 and part.isdigit():
+                date_version = part
+                break
+        
+        # Look for HHMMSS pattern
+        for part in parts:
+            if len(part) == 6 and part.isdigit():
+                time_version = part
+                break
+        
+        # Default date if none found
+        if not date_version:
+            date_version = datetime.now().strftime('%Y%m%d')
+        
+        return {
+            'symbol': symbol,
+            'model_type': model_type,
+            'semantic_version': None,  # LightGBM models don't use semantic versioning yet
+            'date_version': date_version,
+            'time_version': time_version,
+            'is_legacy': False,  # LightGBM models are new format
+            'is_improved': False,  # Not applicable for LightGBM
+            'filename': filename
+        }
+
+    def _register_existing_lstm_model(self, model_path: Path):
+        """Register an existing LSTM .h5 model file"""
         if not HAS_TENSORFLOW:
-            logger.warning("TensorFlow not available, skipping model registration")
+            logger.warning("TensorFlow not available, skipping LSTM model registration")
             return
             
         # Parse filename using enhanced parser
         filename = model_path.stem
-        parsed = self._parse_model_filename(filename)
+        parsed = self._parse_lstm_filename(filename)
         
         if not parsed:
-            logger.warning(f"Could not parse model filename: {filename}")
+            logger.warning(f"Could not parse LSTM model filename: {filename}")
             return
         
         symbol = parsed['symbol']
@@ -433,93 +509,84 @@ class LSTMModelRegistry:
             with open(metadata_file, 'w') as f:
                 json.dump(self._serialize_metadata(metadata), f, indent=2)
             
-            model_type = "improved" if parsed.get('is_improved', False) else ("new format" if not parsed['is_legacy'] else "legacy")
-            logger.info(f"Registered model: {model_key} (symbol: {symbol}, type: {model_type})")
+            model_type_desc = "improved LSTM" if parsed.get('is_improved', False) else ("new format LSTM" if not parsed['is_legacy'] else "legacy LSTM")
+            logger.info(f"Registered model: {model_key} (symbol: {symbol}, type: {model_type_desc})")
             
         except Exception as e:
-            logger.error(f"Failed to load model {model_path}: {e}")
+            logger.error(f"Failed to load LSTM model {model_path}: {e}")
 
-    def _parse_model_filename(self, filename: str) -> Dict[str, Any]:
-        """
-        Parse both legacy and new model filename formats
+    def _register_existing_lgb_model(self, model_path: Path):
+        """Register an existing LightGBM regime-aware .pkl model file"""
+        # Parse filename using LightGBM parser
+        filename = model_path.stem
+        parsed = self._parse_lgb_filename(filename)
         
-        Supports:
-        - Legacy: symbol_modeltype_YYYYMMDD.h5 (e.g., "Fartcoin_lstm_20250614.h5")
-        - New: symbol_modeltype_vMAJOR.MINOR.PATCH_YYYYMMDD.h5 (e.g., "Fartcoin_lstm_v1.0.0_20250614.h5")
-        - Improved: symbol_modeltype_improved_vMAJOR.MINOR.PATCH_YYYYMMDD.h5 (e.g., "Fartcoin_lstm_improved_v1.0.0_20250614.h5")
+        if not parsed:
+            logger.warning(f"Could not parse LightGBM model filename: {filename}")
+            return
         
-        Returns:
-            Dict with parsed components or None if invalid format
-        """
-        parts = filename.split('_')
+        symbol = parsed['symbol']
+        model_type = parsed['model_type']
         
-        if len(parts) < 3:
-            return None
-        
-        symbol = parts[0]
-        model_type = parts[1]
-        
-        # Check for "improved" models
-        is_improved = False
-        improved_index = -1
-        for i, part in enumerate(parts):
-            if part == 'improved':
-                is_improved = True
-                improved_index = i
-                break
-        
-        # Check for new format with semantic version
-        semantic_version = None
-        date_version = None
-        is_legacy = True
-        
-        # Look for semantic version pattern (vX.Y.Z)
-        start_index = improved_index + 1 if is_improved else 2
-        for i, part in enumerate(parts[start_index:], start_index):
-            if part.startswith('v') and '.' in part:
-                # Found semantic version
-                semantic_version = part
-                is_legacy = False
-                # Date should be the next part
-                if i + 1 < len(parts):
-                    date_candidate = parts[i + 1]
-                    if len(date_candidate) == 8 and date_candidate.isdigit():
-                        date_version = date_candidate
-                break
-        
-        # If no semantic version found, look for date in legacy format
-        if is_legacy:
-            for part in parts[2:]:
-                if len(part) == 8 and part.isdigit():
-                    date_version = part
-                    break
-        
-        # Default date if none found
-        if not date_version:
-            date_version = datetime.now().strftime('%Y%m%d')
-        
-        return {
-            'symbol': symbol,
-            'model_type': model_type,
-            'semantic_version': semantic_version,
-            'date_version': date_version,
-            'is_legacy': is_legacy,
-            'is_improved': is_improved,  # NEW: Track if this is an improved model
-            'filename': filename
-        }
-
-    def _extract_version_from_filename(self, filename: str) -> str:
-        """Extract version/date from model filename (backward compatibility)"""
-        parsed = self._parse_model_filename(filename)
-        if parsed:
-            return parsed['date_version']
-        
-        # Fallback to original logic
-        parts = filename.split('_')
-        for part in parts:
-            if len(part) == 8 and part.isdigit():
-                return part
-        return datetime.now().strftime('%Y%m%d')
+        # Load model to validate and get metadata
+        try:
+            logger.debug(f"Loading LightGBM model from: {model_path}")
+            model_data = joblib.load(model_path)
+            
+            # Validate that this is a regime-aware model
+            required_components = ['regime_classifier', 'high_vol_regressor', 'low_vol_regressor', 'direction_classifier']
+            missing_components = [comp for comp in required_components if comp not in model_data]
+            
+            if missing_components:
+                logger.warning(f"Invalid regime-aware model {filename}: missing {missing_components}")
+                return
+            
+            # Extract metadata from model file
+            symbol_in_file = model_data.get('symbol', symbol)
+            timestamp_in_file = model_data.get('timestamp', 'Unknown')
+            
+            # Create metadata for LightGBM model
+            metadata = ModelMetadata(
+                model_path=str(model_path),
+                symbol=symbol,
+                model_type=model_type,
+                created_at=datetime.fromtimestamp(model_path.stat().st_mtime),
+                last_used=None,
+                version=parsed['date_version'],  # Date version
+                semantic_version=parsed['semantic_version'],  # None for now
+                is_legacy=parsed['is_legacy'],  # False for LightGBM
+                input_shape=None,  # Not applicable for LightGBM
+                sequence_length=None,  # Not applicable for LightGBM  
+                prediction_horizon=1,  # Default
+                mse=None,  # Could extract from model_data if available
+                mae=None,
+                rmse=None,
+                direction_accuracy=None,
+                model_hash=self._calculate_model_hash(model_path),
+                regime_classifier_type=str(type(model_data['regime_classifier']).__name__),
+                regressor_type=str(type(model_data['high_vol_regressor']).__name__),
+                direction_classifier_type=str(type(model_data['direction_classifier']).__name__)
+            )
+            
+            # Create model key for LightGBM
+            time_suffix = f"_{parsed['time_version']}" if parsed['time_version'] else ""
+            model_key = f"{symbol}_regime_aware_{metadata.version}{time_suffix}"
+            
+            # Store in cache
+            self._metadata_cache[model_key] = metadata
+            
+            # Save metadata to disk
+            metadata_file = self.registry_path / f"{model_key}_metadata.json"
+            with open(metadata_file, 'w') as f:
+                json.dump(self._serialize_metadata(metadata), f, indent=2)
+            
+            logger.info(f"Registered model: {model_key} (symbol: {symbol}, type: regime-aware LightGBM)")
+            logger.debug(f"  Regime classifier: {metadata.regime_classifier_type}")
+            logger.debug(f"  Regressors: {metadata.regressor_type}")
+            logger.debug(f"  Direction classifier: {metadata.direction_classifier_type}")
+            
+        except Exception as e:
+            logger.error(f"Failed to load LightGBM model {model_path}: {e}")
 
     def _calculate_model_hash(self, model_path: Path) -> str:
         """Calculate hash of model file for integrity checking"""
@@ -555,7 +622,7 @@ class LSTMModelRegistry:
             
         return ModelMetadata(**data)
 
-    def get_model(self, symbol: str, version: Optional[str] = None) -> Optional[tf.keras.Model]:
+    def get_model(self, symbol: str, version: Optional[str] = None) -> Optional[Union[tf.keras.Model, Dict[str, Any]]]:
         """
         Get a trained model for a symbol
         
@@ -618,7 +685,11 @@ class LSTMModelRegistry:
             }
             
             # Load model with custom objects
-            model = tf.keras.models.load_model(metadata.model_path, custom_objects=custom_objects)
+            if metadata.model_type == 'lstm':
+                model = tf.keras.models.load_model(metadata.model_path, custom_objects=custom_objects)
+            elif metadata.model_type == 'regime_aware_lgb':
+                # LightGBM models are not TensorFlow models, so we just load the pickle
+                model = joblib.load(metadata.model_path)
             
             # Verify model integrity
             if self._verify_model_integrity(metadata):
@@ -658,11 +729,11 @@ class LSTMModelRegistry:
                     symbol_models.append((key, metadata))
             
             if symbol_models:
-                # Sort by priority: improved models > new format > legacy format, then by date, then by semantic version
+                # Sort by priority: LightGBM > LSTM, improved > regular, new format > legacy, then by date
                 def sort_key(item):
                     key, metadata = item
-                    # Priority: improved models first, then new format, then date (newest first), then semantic version
-                    # Check if this is an improved model by looking at the model path
+                    # Priority: LightGBM > LSTM, improved > regular, new format > legacy, then by date
+                    is_lgb = metadata.model_type == 'regime_aware_lgb'
                     is_improved = '_improved_' in metadata.model_path or 'lstm_improved' in metadata.model_path
                     is_new = not metadata.is_legacy
                     date_version = metadata.version
@@ -676,7 +747,7 @@ class LSTMModelRegistry:
                         except (ValueError, IndexError):
                             pass
                     
-                    return (is_improved, is_new, date_version, semantic_parts)
+                    return (is_lgb, is_improved, is_new, date_version, semantic_parts)
                 
                 # Get the highest priority model
                 latest_item = max(symbol_models, key=sort_key)
@@ -692,7 +763,7 @@ class LSTMModelRegistry:
         current_hash = self._calculate_model_hash(Path(metadata.model_path))
         return current_hash == metadata.model_hash
 
-    def _cache_model_in_memory(self, model_key: str, model: tf.keras.Model):
+    def _cache_model_in_memory(self, model_key: str, model: Union[tf.keras.Model, Dict[str, Any]]):
         """Cache model in memory with LRU eviction"""
         # Remove oldest model if cache is full
         if len(self._model_cache) >= self.max_models_in_memory:
@@ -706,7 +777,7 @@ class LSTMModelRegistry:
         self._model_cache[model_key] = model
         logger.debug(f"Cached model in memory: {model_key}")
 
-    def _cache_model_in_redis(self, model_key: str, model: tf.keras.Model):
+    def _cache_model_in_redis(self, model_key: str, model: Union[tf.keras.Model, Dict[str, Any]]):
         """Cache model in Redis for persistence across restarts"""
         if not self.redis_binary_client:
             return
@@ -714,8 +785,11 @@ class LSTMModelRegistry:
         try:
             # Serialize model weights (more efficient than full model)
             # Note: model.get_weights() already returns numpy arrays
-            weights_data = model.get_weights()
-            serialized_weights = pickle.dumps(weights_data)
+            if isinstance(model, tf.keras.Model):
+                weights_data = model.get_weights()
+                serialized_weights = pickle.dumps(weights_data)
+            elif isinstance(model, dict): # For LightGBM models
+                serialized_weights = pickle.dumps(model)
             
             redis_key = f"model_weights:{model_key}"
             # Use binary client to avoid UTF-8 decoding issues
@@ -725,7 +799,7 @@ class LSTMModelRegistry:
         except Exception as e:
             logger.warning(f"Failed to cache model in Redis: {e}")
 
-    def _load_model_from_redis(self, model_key: str) -> Optional[tf.keras.Model]:
+    def _load_model_from_redis(self, model_key: str) -> Optional[Union[tf.keras.Model, Dict[str, Any]]]:
         """Load model from Redis cache"""
         if not self.redis_binary_client:
             return None
@@ -760,11 +834,18 @@ class LSTMModelRegistry:
                     'direction_accuracy': direction_accuracy
                 }
                 
-                model = tf.keras.models.load_model(metadata.model_path, custom_objects=custom_objects)
+                if metadata.model_type == 'lstm':
+                    model = tf.keras.models.load_model(metadata.model_path, custom_objects=custom_objects)
+                elif metadata.model_type == 'regime_aware_lgb':
+                    # LightGBM models are not TensorFlow models, so we just load the pickle
+                    model = joblib.load(metadata.model_path)
                 
                 # Restore cached weights
-                weights_data = pickle.loads(serialized_weights)
-                model.set_weights(weights_data)
+                if isinstance(model, tf.keras.Model):
+                    weights_data = pickle.loads(serialized_weights)
+                    model.set_weights(weights_data)
+                elif isinstance(model, dict): # For LightGBM models
+                    model = pickle.loads(serialized_weights)
                 
                 logger.debug(f"Loaded model from Redis cache: {model_key}")
                 return model
@@ -842,8 +923,15 @@ class LSTMModelRegistry:
         
         This method first checks the adaptive strategy engine for dynamically adjusted parameters,
         then falls back to static model metadata or global config defaults.
+        
+        For regime-aware LightGBM models, returns regime-specific thresholds.
+        For LSTM models, returns standard thresholds.
         """
         try:
+            # Detect model type
+            metadata = self.get_model_metadata(symbol, version)
+            model_type = metadata.model_type if metadata else 'lstm'
+            
             # Try to get adaptive parameters from the adaptive strategy engine
             try:
                 from . import adaptive_strategy
@@ -853,12 +941,24 @@ class LSTMModelRegistry:
                     # Get adapted parameters with _adaptive flag
                     adapted_params = await adaptive_engine.get_adapted_parameters(symbol)
                     if adapted_params:
-                        return {
+                        result = {
                             'buy_threshold': adapted_params['buy_threshold'],
                             'sell_threshold': adapted_params['sell_threshold'],
                             'confidence_threshold': adapted_params['confidence_threshold'],
-                            '_adaptive': True  # Flag to indicate these are adaptive parameters
+                            '_adaptive': True,  # Flag to indicate these are adaptive parameters
+                            'model_type': model_type
                         }
+                        
+                        # Add regime-specific thresholds for LightGBM models
+                        if model_type == 'regime_aware_lgb':
+                            result.update({
+                                'high_vol_buy_threshold': adapted_params.get('high_vol_buy_threshold', 0.02),
+                                'high_vol_sell_threshold': adapted_params.get('high_vol_sell_threshold', 0.03),
+                                'low_vol_buy_threshold': adapted_params.get('low_vol_buy_threshold', 0.0075),
+                                'low_vol_sell_threshold': adapted_params.get('low_vol_sell_threshold', 0.0115)
+                            })
+                        
+                        return result
             except (ImportError, AttributeError) as e:
                 # Adaptive engine not available or not initialized
                 logger.debug(f"Adaptive strategy engine not available: {e}")
@@ -866,6 +966,17 @@ class LSTMModelRegistry:
             # Fall back to static parameters
             static_params = self.get_strategy_parameters(symbol, version)
             static_params['_adaptive'] = False  # Flag to indicate these are static parameters
+            static_params['model_type'] = model_type
+            
+            # Add regime-specific thresholds for LightGBM models (static defaults)
+            if model_type == 'regime_aware_lgb':
+                static_params.update({
+                    'high_vol_buy_threshold': 0.02,    # 2.0% for high volatility
+                    'high_vol_sell_threshold': 0.03,   # 3.0% for high volatility
+                    'low_vol_buy_threshold': 0.005,    # 0.5% for low volatility
+                    'low_vol_sell_threshold': 0.01     # 1.0% for low volatility
+                })
+            
             return static_params
             
         except Exception as e:
@@ -989,6 +1100,180 @@ class LSTMModelRegistry:
         metadata.last_performance_score = total_return
         self._save_metadata(model_key, metadata)
 
+    def register_new_model(self, model_path: str, symbol: str, model_type: str = "lstm", 
+                          semantic_version: Optional[str] = None, **kwargs) -> bool:
+        """
+        Register a newly trained model (LSTM or LightGBM)
+        
+        Args:
+            model_path: Path to the model file (.h5 for LSTM, .pkl for LightGBM)
+            symbol: Token symbol
+            model_type: Model type ("lstm" or "regime_aware_lgb")
+            semantic_version: Semantic version (e.g., "v1.0.0") - optional for LightGBM
+            **kwargs: Additional metadata fields
+            
+        Returns:
+            True if registration successful, False otherwise
+        """
+        try:
+            model_path_obj = Path(model_path)
+            if not model_path_obj.exists():
+                logger.error(f"Model file not found: {model_path}")
+                return False
+            
+            if model_type == "lstm":
+                return self._register_new_lstm_model(model_path_obj, symbol, semantic_version, **kwargs)
+            elif model_type == "regime_aware_lgb":
+                return self._register_new_lgb_model(model_path_obj, symbol, **kwargs)
+            else:
+                logger.error(f"Unsupported model type: {model_type}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to register new model {model_path}: {e}")
+            return False
+
+    def _register_new_lstm_model(self, model_path: Path, symbol: str, semantic_version: str, **kwargs) -> bool:
+        """Register a newly trained LSTM model"""
+        if not HAS_TENSORFLOW:
+            logger.error("TensorFlow not available")
+            return False
+            
+        try:
+            # Load model to get input shape
+            from ..model.profit_functions import (
+                simple_directional_loss, 
+                direction_focused_loss,
+                directional_loss,
+                profit_loss,
+                combined_profit_mse_loss,
+                direction_accuracy
+            )
+            
+            custom_objects = {
+                'simple_directional_loss': simple_directional_loss,
+                'direction_focused_loss': direction_focused_loss,
+                'directional_loss': directional_loss,
+                'profit_loss': profit_loss,
+                'combined_profit_mse_loss': combined_profit_mse_loss,
+                'direction_accuracy': direction_accuracy
+            }
+            
+            model = tf.keras.models.load_model(str(model_path), custom_objects=custom_objects)
+            input_shape = model.input_shape[1:]  # Remove batch dimension
+            sequence_length = input_shape[0] if len(input_shape) > 0 else 0
+            
+            # Extract date from filename or use current date
+            filename = model_path.stem
+            parsed = self._parse_lstm_filename(filename)
+            date_version = parsed['date_version'] if parsed else datetime.now().strftime('%Y%m%d')
+            
+            # Create metadata
+            metadata = ModelMetadata(
+                model_path=str(model_path),
+                symbol=symbol,
+                model_type="lstm",
+                created_at=datetime.fromtimestamp(model_path.stat().st_mtime),
+                last_used=None,
+                version=date_version,
+                semantic_version=semantic_version,
+                is_legacy=False,  # New format
+                input_shape=input_shape,
+                sequence_length=sequence_length,
+                prediction_horizon=kwargs.get('prediction_horizon', 1),
+                mse=kwargs.get('mse'),
+                mae=kwargs.get('mae'),
+                rmse=kwargs.get('rmse'),
+                direction_accuracy=kwargs.get('direction_accuracy'),
+                model_hash=self._calculate_model_hash(model_path),
+                buy_threshold=kwargs.get('buy_threshold', 0.01),
+                sell_threshold=kwargs.get('sell_threshold', 0.015),
+                confidence_threshold=kwargs.get('confidence_threshold', 0.10)
+            )
+            
+            # Create model key
+            model_key = f"{symbol}_{semantic_version}_{date_version}"
+            
+            # Store in cache
+            self._metadata_cache[model_key] = metadata
+            
+            # Save metadata to disk
+            metadata_file = self.registry_path / f"{model_key}_metadata.json"
+            with open(metadata_file, 'w') as f:
+                json.dump(self._serialize_metadata(metadata), f, indent=2)
+            
+            logger.info(f"Registered new LSTM model: {model_key} (semantic: {semantic_version})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to register new LSTM model {model_path}: {e}")
+            return False
+
+    def _register_new_lgb_model(self, model_path: Path, symbol: str, **kwargs) -> bool:
+        """Register a newly trained LightGBM regime-aware model"""
+        try:
+            # Load and validate LightGBM model
+            model_data = joblib.load(model_path)
+            
+            # Validate that this is a regime-aware model
+            required_components = ['regime_classifier', 'high_vol_regressor', 'low_vol_regressor', 'direction_classifier']
+            missing_components = [comp for comp in required_components if comp not in model_data]
+            
+            if missing_components:
+                logger.error(f"Invalid regime-aware model: missing {missing_components}")
+                return False
+            
+            # Extract date from filename or use current date
+            filename = model_path.stem
+            parsed = self._parse_lgb_filename(filename)
+            date_version = parsed['date_version'] if parsed else datetime.now().strftime('%Y%m%d')
+            time_version = parsed.get('time_version') if parsed else datetime.now().strftime('%H%M%S')
+            
+            # Create metadata for LightGBM model
+            metadata = ModelMetadata(
+                model_path=str(model_path),
+                symbol=symbol,
+                model_type="regime_aware_lgb",
+                created_at=datetime.fromtimestamp(model_path.stat().st_mtime),
+                last_used=None,
+                version=date_version,
+                semantic_version=None,  # LightGBM models don't use semantic versioning yet
+                is_legacy=False,  # LightGBM models are new format
+                input_shape=None,  # Not applicable for LightGBM
+                sequence_length=None,  # Not applicable for LightGBM
+                prediction_horizon=kwargs.get('prediction_horizon', 1),
+                mse=kwargs.get('mse'),
+                mae=kwargs.get('mae'),
+                rmse=kwargs.get('rmse'),
+                direction_accuracy=kwargs.get('direction_accuracy'),
+                model_hash=self._calculate_model_hash(model_path),
+                buy_threshold=kwargs.get('buy_threshold', 0.01),
+                sell_threshold=kwargs.get('sell_threshold', 0.015),
+                confidence_threshold=kwargs.get('confidence_threshold', 0.10),
+                regime_classifier_type=str(type(model_data['regime_classifier']).__name__),
+                regressor_type=str(type(model_data['high_vol_regressor']).__name__),
+                direction_classifier_type=str(type(model_data['direction_classifier']).__name__)
+            )
+            
+            # Create model key for LightGBM
+            time_suffix = f"_{time_version}" if time_version else ""
+            model_key = f"{symbol}_regime_aware_{date_version}{time_suffix}"
+            
+            # Store in cache
+            self._metadata_cache[model_key] = metadata
+            
+            # Save metadata to disk
+            metadata_file = self.registry_path / f"{model_key}_metadata.json"
+            with open(metadata_file, 'w') as f:
+                json.dump(self._serialize_metadata(metadata), f, indent=2)
+            
+            logger.info(f"Registered new LightGBM model: {model_key}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to register new LightGBM model {model_path}: {e}")
+            return False
+
     def get_health_status(self) -> Dict[str, Any]:
         """Get health status of the model registry"""
         total_models = len(self._metadata_cache)
@@ -1002,6 +1287,10 @@ class LSTMModelRegistry:
         legacy_models = sum(1 for m in self._metadata_cache.values() if m.is_legacy)
         new_format_models = total_models - legacy_models
         
+        # Count model types
+        lstm_models = sum(1 for m in self._metadata_cache.values() if m.model_type == 'lstm')
+        lgb_models = sum(1 for m in self._metadata_cache.values() if m.model_type == 'regime_aware_lgb')
+        
         redis_status = "connected" if self.redis_client else "disconnected"
         try:
             if self.redis_client:
@@ -1012,6 +1301,8 @@ class LSTMModelRegistry:
         
         return {
             'total_models': total_models,
+            'lstm_models': lstm_models,
+            'lgb_models': lgb_models,
             'legacy_format_models': legacy_models,
             'new_format_models': new_format_models,
             'models_in_memory': models_in_memory,
@@ -1022,17 +1313,17 @@ class LSTMModelRegistry:
         }
 
 # Global registry instance for reuse across the application
-_registry_instance: Optional[LSTMModelRegistry] = None
+_registry_instance: Optional[ModelRegistry] = None
 
-def get_model_registry() -> LSTMModelRegistry:
+def get_model_registry() -> ModelRegistry:
     """Get or create the global model registry instance"""
     global _registry_instance
     if _registry_instance is None:
-        _registry_instance = LSTMModelRegistry()
+        _registry_instance = ModelRegistry()
     return _registry_instance
 
 # Convenience functions for easy integration
-def load_model(symbol: str, version: Optional[str] = None) -> Optional[tf.keras.Model]:
+def load_model(symbol: str, version: Optional[str] = None) -> Optional[Union[tf.keras.Model, Dict[str, Any]]]:
     """Convenience function to load a model"""
     registry = get_model_registry()
     return registry.get_model(symbol, version)
@@ -1048,8 +1339,8 @@ def run_backtest(symbol: str, ohlcv_data: pd.DataFrame,
     registry = get_model_registry()
     return registry.run_simple_backtest(symbol, ohlcv_data, version) 
 
-def register_model(model_path: str, symbol: str, semantic_version: str, 
-                  model_type: str = "lstm", **kwargs) -> bool:
-    """Convenience function to register a new model with semantic versioning"""
+def register_model(model_path: str, symbol: str, model_type: str = "lstm", 
+                  semantic_version: Optional[str] = None, **kwargs) -> bool:
+    """Convenience function to register a new model"""
     registry = get_model_registry()
-    return registry.register_new_model(model_path, symbol, semantic_version, model_type, **kwargs) 
+    return registry.register_new_model(model_path, symbol, model_type, semantic_version, **kwargs) 

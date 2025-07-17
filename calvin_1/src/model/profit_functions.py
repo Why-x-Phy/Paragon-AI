@@ -1583,3 +1583,117 @@ def robust_directional_loss(y_true, y_pred):
     )
     
     return total_loss 
+
+def two_output_strategy(direction_probs, magnitude_strengths, ohlcv_df=None, 
+                       include_detailed_trades=False, verbosity=0,
+                       direction_threshold=0.6, magnitude_threshold=0.02,  # 2% minimum move
+                       **kwargs):
+    """
+    Trading strategy for two-output model predictions with raw percentage changes
+    
+    Args:
+        direction_probs: Array of direction probabilities (0-1)
+        magnitude_strengths: Array of magnitude predictions (raw percentage changes, e.g., 0.05 = 5%)
+        ohlcv_df: DataFrame with OHLCV data
+        include_detailed_trades: Whether to return detailed trade information
+        verbosity: Logging level
+        direction_threshold: Minimum confidence for direction (default 0.6 = 60%)
+        magnitude_threshold: Minimum magnitude for significant moves (default 0.02 = 2%)
+        **kwargs: Additional parameters
+        
+    Returns:
+        Dictionary with strategy results including profit metrics and signals
+    """
+    
+    if verbosity > 0:
+        print(f"🎯 Two-Output Strategy Analysis")
+        print(f"   Direction threshold: {direction_threshold:.1%}")
+        print(f"   Magnitude threshold: {magnitude_threshold:.1%}")
+        print(f"   Samples: {len(direction_probs)}")
+    
+    # Initialize signals
+    signals = np.zeros(len(direction_probs))  # 0 = hold, 1 = buy, -1 = sell
+    
+    # Generate trading signals based on both direction and magnitude
+    for i in range(len(direction_probs)):
+        direction_prob = direction_probs[i]
+        magnitude_pred = magnitude_strengths[i]
+        
+        # Check if magnitude is significant enough
+        if magnitude_pred >= magnitude_threshold:
+            # Strong upward prediction
+            if direction_prob >= direction_threshold:
+                signals[i] = 1  # BUY
+            # Strong downward prediction  
+            elif direction_prob <= (1 - direction_threshold):
+                signals[i] = -1  # SELL
+            # Else: hold (magnitude significant but direction uncertain)
+        # Else: hold (magnitude too small to trade)
+    
+    # Calculate signal statistics
+    buy_signals = np.sum(signals == 1)
+    sell_signals = np.sum(signals == -1)
+    hold_signals = np.sum(signals == 0)
+    
+    # Calculate confidence metrics
+    high_confidence_buy = np.sum((direction_probs >= direction_threshold) & 
+                                (magnitude_strengths >= magnitude_threshold))
+    high_confidence_sell = np.sum((direction_probs <= (1 - direction_threshold)) & 
+                                 (magnitude_strengths >= magnitude_threshold))
+    
+    # Magnitude statistics
+    significant_moves = magnitude_strengths >= magnitude_threshold
+    avg_significant_magnitude = np.mean(magnitude_strengths[significant_moves]) if np.any(significant_moves) else 0
+    
+    if verbosity > 0:
+        print(f"📊 Signal Distribution:")
+        print(f"   Buy signals: {buy_signals} ({buy_signals/len(signals):.1%})")
+        print(f"   Sell signals: {sell_signals} ({sell_signals/len(signals):.1%})")
+        print(f"   Hold signals: {hold_signals} ({hold_signals/len(signals):.1%})")
+        print(f"🎯 Confidence Analysis:")
+        print(f"   High confidence buys: {high_confidence_buy}")
+        print(f"   High confidence sells: {high_confidence_sell}")
+        print(f"   Significant moves (>{magnitude_threshold:.1%}): {np.sum(significant_moves)} ({np.mean(significant_moves):.1%})")
+        print(f"   Avg significant magnitude: {avg_significant_magnitude:.2%}")
+    
+    # Basic results dictionary
+    results = {
+        'signals': signals,
+        'buy_signals': buy_signals,
+        'sell_signals': sell_signals,
+        'hold_signals': hold_signals,
+        'signal_rate': (buy_signals + sell_signals) / len(signals),
+        'direction_threshold': direction_threshold,
+        'magnitude_threshold': magnitude_threshold,
+        'avg_direction_prob': np.mean(direction_probs),
+        'avg_magnitude': np.mean(magnitude_strengths),
+        'significant_moves': np.sum(significant_moves),
+        'avg_significant_magnitude': avg_significant_magnitude
+    }
+    
+    # If OHLCV data provided, calculate returns
+    if ohlcv_df is not None and len(ohlcv_df) == len(signals):
+        # Simple return calculation
+        returns = ohlcv_df['close'].pct_change().fillna(0)
+        
+        # Calculate strategy returns
+        strategy_returns = signals * returns
+        cumulative_returns = (1 + strategy_returns).cumprod()
+        
+        total_return = cumulative_returns.iloc[-1] - 1
+        win_rate = np.mean(strategy_returns[strategy_returns != 0] > 0) if np.any(strategy_returns != 0) else 0
+        
+        results.update({
+            'total_return': total_return,
+            'win_rate': win_rate,
+            'num_trades': np.sum(signals != 0),
+            'avg_trade_return': np.mean(strategy_returns[strategy_returns != 0]) if np.any(strategy_returns != 0) else 0
+        })
+        
+        if verbosity > 0:
+            print(f"📈 Performance (if executed):")
+            print(f"   Total return: {total_return:.2%}")
+            print(f"   Win rate: {win_rate:.1%}")
+            print(f"   Number of trades: {np.sum(signals != 0)}")
+    
+    return results

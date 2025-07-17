@@ -52,6 +52,10 @@ logs/
 *.pt
 *.pth
 *.ckpt
+**/models/old_models/*
+plots/
+*feature_scaler.pkl
+*price_scaler.pkl
 
 # OS specific
 .DS_Store
@@ -158,6 +162,7 @@ test_results/
 debug_results/
 *_test_output.*
 *_debug_output.*
+**/z_experimental/*
 
 # Jupyter notebook test files
 *_test.ipynb

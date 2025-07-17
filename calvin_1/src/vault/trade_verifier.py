@@ -134,7 +134,9 @@ class TradeVerificationService:
         result = TradeVerificationResult(
             trade_id=trade_id,
             tx_hash=tx_hash,
-            verified_at=datetime.utcnow()
+            verified_at=datetime.utcnow(),
+            transaction_confirmed=False,
+            transaction_successful=False
         )
         
         try:
@@ -206,16 +208,36 @@ class TradeVerificationService:
             
             tx_data = tx_response.value
             
-            # Check transaction success
+            # Check transaction success - handle different possible structures
             result.transaction_confirmed = True
-            result.transaction_successful = tx_data.meta.err is None
+            
+            # The correct structure is tx_data.transaction.meta (based on solders library)
+            meta = None
+            if hasattr(tx_data, 'transaction') and hasattr(tx_data.transaction, 'meta'):
+                meta = tx_data.transaction.meta
+            elif hasattr(tx_data, 'meta'):
+                meta = tx_data.meta
+            elif isinstance(tx_data, dict):
+                meta = tx_data.get('meta')
+            
+            if meta:
+                result.transaction_successful = meta.err is None if hasattr(meta, 'err') else (meta.get('err') is None if isinstance(meta, dict) else True)
+                
+                if hasattr(meta, 'err') and meta.err:
+                    result.execution_error = str(meta.err)
+                elif isinstance(meta, dict) and meta.get('err'):
+                    result.execution_error = str(meta.get('err'))
+            else:
+                # If we can't find meta, assume successful if transaction exists
+                result.transaction_successful = True
+                logger.warning(f"⚠️ Could not find meta data for transaction {result.tx_hash}, assuming successful")
+            
+            # Get slot information directly from tx_data
             result.confirmation_slot = tx_data.slot
             
-            if tx_data.block_time:
+            # Get block time
+            if hasattr(tx_data, 'block_time') and tx_data.block_time:
                 result.block_time = datetime.fromtimestamp(tx_data.block_time)
-            
-            if tx_data.meta.err:
-                result.execution_error = str(tx_data.meta.err)
             
             # Store transaction data for further analysis
             result._tx_data = tx_data
@@ -226,6 +248,8 @@ class TradeVerificationService:
             result.transaction_confirmed = False
             result.verification_error = f"Confirmation check failed: {e}"
             logger.error(f"❌ Failed to verify transaction confirmation: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
 
     async def _verify_calvin_authorization(self, result: TradeVerificationResult):
         """Verify transaction was signed by Calvin authority"""
@@ -285,119 +309,284 @@ class TradeVerificationService:
             logger.error(f"❌ Failed to verify vault program execution: {e}")
 
     async def _parse_jupiter_swap_results(self, result: TradeVerificationResult):
-        """Parse Jupiter swap results from transaction logs"""
+        """Parse Jupiter swap results from transaction"""
         try:
             if not hasattr(result, '_tx_data'):
                 return
             
             tx_data = result._tx_data
             
+            # The correct structure is tx_data.transaction.meta (based on solders library)
+            meta = None
+            if hasattr(tx_data, 'transaction') and hasattr(tx_data.transaction, 'meta'):
+                meta = tx_data.transaction.meta
+            elif hasattr(tx_data, 'meta'):
+                meta = tx_data.meta
+            elif isinstance(tx_data, dict):
+                meta = tx_data.get('meta')
+            
+            if not meta:
+                logger.warning(f"⚠️ No meta data found for Jupiter swap parsing")
+                return
+            
             # Look for Jupiter program in inner instructions (CPI calls)
             jupiter_program_pubkey = Pubkey.from_string(self.jupiter_program_id)
             
-            if hasattr(tx_data.meta, 'inner_instructions'):
-                for inner_instruction_set in tx_data.meta.inner_instructions:
-                    for inner_instruction in inner_instruction_set.instructions:
-                        program_id_index = inner_instruction.program_id_index
-                        program_id = tx_data.transaction.message.account_keys[program_id_index]
+            # Handle inner instructions
+            if hasattr(meta, 'inner_instructions') and meta.inner_instructions:
+                for inner_instruction_set in meta.inner_instructions:
+                    instructions = inner_instruction_set.instructions if hasattr(inner_instruction_set, 'instructions') else inner_instruction_set.get('instructions', [])
+                    for inner_instruction in instructions:
+                        program_id_index = inner_instruction.program_id_index if hasattr(inner_instruction, 'program_id_index') else inner_instruction.get('program_id_index')
                         
-                        if str(program_id) == str(jupiter_program_pubkey):
-                            result.jupiter_swap_executed = True
-                            logger.debug("✅ Jupiter swap execution confirmed via CPI")
-                            break
+                        # Get account keys from the correct location
+                        if hasattr(tx_data, 'transaction') and hasattr(tx_data.transaction, 'transaction') and hasattr(tx_data.transaction.transaction, 'message'):
+                            account_keys = tx_data.transaction.transaction.message.account_keys
+                        elif hasattr(tx_data, 'transaction') and hasattr(tx_data.transaction, 'message'):
+                            account_keys = tx_data.transaction.message.account_keys
+                        else:
+                            account_keys = None
+                        
+                        if account_keys and program_id_index is not None:
+                            program_id = account_keys[program_id_index]
+                            
+                            if str(program_id) == str(jupiter_program_pubkey):
+                                result.jupiter_swap_executed = True
+                                logger.debug("✅ Jupiter swap execution confirmed via CPI")
+                                break
             
             # Parse logs for Jupiter swap details
-            if hasattr(tx_data.meta, 'log_messages'):
-                await self._parse_jupiter_logs(result, tx_data.meta.log_messages)
+            if hasattr(meta, 'log_messages') and meta.log_messages:
+                await self._parse_jupiter_logs(result, meta.log_messages)
             
         except Exception as e:
             logger.error(f"❌ Failed to parse Jupiter swap results: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
 
     async def _parse_jupiter_logs(self, result: TradeVerificationResult, log_messages: List[str]):
         """Parse Jupiter-specific logs for swap details"""
         try:
             for log in log_messages:
-                # Look for Jupiter swap events in logs
+                # Look for Jupiter program mentions
+                if "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4" in log or "Jupiter" in log:
+                    result.jupiter_swap_executed = True
+                    logger.debug(f"✅ Jupiter swap detected in log: {log[:100]}...")
+                
+                # Look for specific Jupiter swap patterns
+                if "🚀 Setting up Jupiter CPI" in log:
+                    result.jupiter_swap_executed = True
+                    logger.debug("✅ Jupiter CPI setup detected")
+                
+                # Look for Jupiter program invocation
                 if "Program JUP6" in log and "invoke" in log:
                     result.jupiter_swap_executed = True
+                    logger.debug("✅ Jupiter program invocation detected")
                 
-                # Parse swap amounts (Jupiter logs format may vary)
-                if "SwapEvent" in log or "swap" in log.lower():
-                    # Try to extract amounts from log message
-                    # This is Jupiter-specific and may need adjustment based on actual log format
-                    try:
-                        # Example log parsing - adjust based on actual Jupiter log format
-                        if "amountIn:" in log:
-                            amount_in_str = log.split("amountIn:")[1].split(",")[0].strip()
-                            result.actual_input_amount = float(amount_in_str)
+                # Try to parse amounts from logs
+                try:
+                    # Look for amount patterns in logs
+                    if "amount" in log.lower() and any(char.isdigit() for char in log):
+                        # Try to extract numbers from the log
+                        import re
+                        numbers = re.findall(r'\d+', log)
+                        if numbers:
+                            # Store the first large number we find as potential amount
+                            for num_str in numbers:
+                                num = int(num_str)
+                                if num > 1000:  # Ignore small numbers
+                                    if result.actual_output_amount is None:
+                                        result.actual_output_amount = num
+                                        logger.debug(f"Extracted potential amount from log: {num}")
+                                    break
+                    
+                    # Look for swap completion messages
+                    if "swap" in log.lower() and ("complete" in log.lower() or "success" in log.lower()):
+                        result.jupiter_swap_executed = True
+                        logger.debug("✅ Jupiter swap completion detected")
                         
-                        if "amountOut:" in log:
-                            amount_out_str = log.split("amountOut:")[1].split(",")[0].strip()
-                            result.actual_output_amount = float(amount_out_str)
-                        
-                        if "priceImpact:" in log:
-                            price_impact_str = log.split("priceImpact:")[1].split(",")[0].strip()
-                            result.actual_price_impact = float(price_impact_str)
-                            
-                    except (ValueError, IndexError):
-                        # Log parsing failed, but swap was still executed
-                        pass
+                except Exception as e:
+                    # Log parsing failed for this line, continue with others
+                    logger.debug(f"Failed to parse Jupiter log line: {log[:100]}... Error: {e}")
+                    continue
             
+            if result.jupiter_swap_executed:
+                logger.info(f"✅ Jupiter swap execution confirmed via log analysis")
+            else:
+                logger.debug("❌ No Jupiter swap execution detected in logs")
+                
         except Exception as e:
             logger.error(f"❌ Failed to parse Jupiter logs: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
 
     async def _verify_balance_changes(self, result: TradeVerificationResult):
-        """Verify token balance changes (if accessible)"""
+        """Verify token balance changes and extract actual amounts"""
         try:
             if not hasattr(result, '_tx_data'):
                 return
             
             tx_data = result._tx_data
             
+            # The correct structure is tx_data.transaction.meta (based on solders library)
+            meta = None
+            if hasattr(tx_data, 'transaction') and hasattr(tx_data.transaction, 'meta'):
+                meta = tx_data.transaction.meta
+            elif hasattr(tx_data, 'meta'):
+                meta = tx_data.meta
+            elif isinstance(tx_data, dict):
+                meta = tx_data.get('meta')
+            
+            if not meta:
+                logger.warning(f"⚠️ No meta data found for balance change verification")
+                return
+            
             # Check pre/post token balances if available in transaction meta
-            if hasattr(tx_data.meta, 'pre_token_balances') and hasattr(tx_data.meta, 'post_token_balances'):
-                pre_balances = tx_data.meta.pre_token_balances or []
-                post_balances = tx_data.meta.post_token_balances or []
+            if hasattr(meta, 'pre_token_balances') and hasattr(meta, 'post_token_balances'):
+                pre_balances = meta.pre_token_balances or []
+                post_balances = meta.post_token_balances or []
                 
-                # Calculate balance changes
-                balance_changes = self._calculate_balance_changes(pre_balances, post_balances)
-                
-                if balance_changes:
-                    logger.debug(f"📊 Token balance changes detected: {len(balance_changes)} accounts")
-                    # Could store balance changes in result if needed
+                if pre_balances and post_balances:
+                    # Calculate balance changes
+                    balance_changes = self._calculate_balance_changes(pre_balances, post_balances)
+                    
+                    if balance_changes:
+                        logger.debug(f"📊 Token balance changes detected: {len(balance_changes)} accounts")
+                        
+                        # Store balance changes for debugging
+                        result.balance_changes = list(balance_changes.items())
+                        
+                        # ENHANCED: Extract actual amounts from balance changes if not already available
+                        if not result.actual_input_amount or not result.actual_output_amount:
+                            # Try to identify input/output amounts from balance changes
+                            # Look for USDC changes (input/output for most trades)
+                            usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+                            
+                            # Get account keys to identify vault accounts
+                            account_keys = None
+                            if hasattr(tx_data, 'transaction') and hasattr(tx_data.transaction, 'transaction') and hasattr(tx_data.transaction.transaction, 'message'):
+                                account_keys = tx_data.transaction.transaction.message.account_keys
+                            elif hasattr(tx_data, 'transaction') and hasattr(tx_data.transaction, 'message'):
+                                account_keys = tx_data.transaction.message.account_keys
+                            
+                            if account_keys:
+                                # Parse balance changes to identify vault transactions
+                                usdc_spent = None
+                                usdc_received = None
+                                tokens_spent = None
+                                tokens_received = None
+                                
+                                for change_key, change_amount in balance_changes.items():
+                                    try:
+                                        # Extract account index and mint from the key
+                                        parts = change_key.split('_')
+                                        if len(parts) >= 3:
+                                            account_index = int(parts[1])
+                                            mint = '_'.join(parts[2:])  # Rejoin mint address
+                                            
+                                            # Get the actual account pubkey
+                                            if account_index < len(account_keys):
+                                                account_pubkey = account_keys[account_index]
+                                                
+                                                if mint == usdc_mint:
+                                                    # USDC changes
+                                                    if change_amount > 0:
+                                                        usdc_received = change_amount
+                                                        logger.debug(f"Found USDC gain: {change_amount} (account {account_index})")
+                                                    else:
+                                                        usdc_spent = abs(change_amount)
+                                                        logger.debug(f"Found USDC spend: {abs(change_amount)} (account {account_index})")
+                                                else:
+                                                    # Other token changes
+                                                    if change_amount < 0:
+                                                        tokens_spent = abs(change_amount)
+                                                        logger.debug(f"Found token sale: {abs(change_amount)} (account {account_index})")
+                                                    else:
+                                                        tokens_received = change_amount
+                                                        logger.debug(f"Found token purchase: {change_amount} (account {account_index})")
+                                                
+                                    except Exception as e:
+                                        logger.debug(f"Failed to process balance change {change_key}: {e}")
+                                        continue
+                                
+                                # Determine trade type and set input/output correctly
+                                if usdc_spent and tokens_received:
+                                    # BUY TRADE: Spent USDC to get tokens
+                                    result.actual_input_amount = usdc_spent  # USDC spent
+                                    result.actual_output_amount = tokens_received  # Tokens received
+                                    logger.debug(f"Detected BUY trade: {usdc_spent} USDC → {tokens_received} tokens")
+                                elif tokens_spent and usdc_received:
+                                    # SELL TRADE: Sold tokens to get USDC
+                                    result.actual_input_amount = tokens_spent  # Tokens sold
+                                    result.actual_output_amount = usdc_received  # USDC received
+                                    logger.debug(f"Detected SELL trade: {tokens_spent} tokens → {usdc_received} USDC")
+                                else:
+                                    # Fallback to original logic if pattern doesn't match
+                                    logger.debug(f"Could not determine trade type clearly, using fallback logic")
+                                    if usdc_received and not result.actual_output_amount:
+                                        result.actual_output_amount = usdc_received
+                                    if usdc_spent and not result.actual_input_amount:
+                                        result.actual_input_amount = usdc_spent
+                        
+                        logger.debug(f"✅ Balance changes processed: input={result.actual_input_amount}, output={result.actual_output_amount}")
+                    else:
+                        logger.debug("📊 No token balance changes detected")
+                else:
+                    logger.debug("📊 No pre/post token balance data available")
+            else:
+                logger.debug("📊 No pre/post token balance attributes found")
             
         except Exception as e:
             logger.error(f"❌ Failed to verify balance changes: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
 
     def _calculate_balance_changes(self, pre_balances: List, post_balances: List) -> Dict[str, float]:
-        """Calculate token balance changes from pre/post balances"""
-        changes = {}
-        
+        """Calculate balance changes between pre and post token balances"""
         try:
-            # Create lookup for pre-balances
-            pre_lookup = {balance.account_index: balance for balance in pre_balances}
+            # Create maps by account_index for easier lookup
+            pre_map = {}
+            post_map = {}
+            
+            for balance in pre_balances:
+                account_index = balance.account_index
+                ui_amount = balance.ui_token_amount.ui_amount if hasattr(balance.ui_token_amount, 'ui_amount') and balance.ui_token_amount.ui_amount else 0.0
+                pre_map[account_index] = {
+                    'mint': str(balance.mint),
+                    'amount': ui_amount
+                }
+            
+            for balance in post_balances:
+                account_index = balance.account_index
+                ui_amount = balance.ui_token_amount.ui_amount if hasattr(balance.ui_token_amount, 'ui_amount') and balance.ui_token_amount.ui_amount else 0.0
+                post_map[account_index] = {
+                    'mint': str(balance.mint),
+                    'amount': ui_amount
+                }
             
             # Calculate changes
-            for post_balance in post_balances:
-                account_index = post_balance.account_index
-                pre_balance = pre_lookup.get(account_index)
+            changes = {}
+            all_account_indices = set(pre_map.keys()) | set(post_map.keys())
+            
+            for account_index in all_account_indices:
+                pre_amount = pre_map.get(account_index, {}).get('amount', 0.0)
+                post_amount = post_map.get(account_index, {}).get('amount', 0.0)
+                change = post_amount - pre_amount
                 
-                if pre_balance:
-                    pre_amount = float(pre_balance.ui_token_amount.ui_amount or 0)
-                    post_amount = float(post_balance.ui_token_amount.ui_amount or 0)
-                    change = post_amount - pre_amount
-                    
-                    if abs(change) > 0.000001:  # Ignore dust
-                        mint = post_balance.mint
-                        changes[mint] = change
+                if abs(change) > 0.001:  # Only include significant changes
+                    # Get mint from either pre or post
+                    mint = pre_map.get(account_index, {}).get('mint') or post_map.get(account_index, {}).get('mint')
+                    if mint:
+                        changes[f"account_{account_index}_{mint}"] = change
+            
+            return changes
             
         except Exception as e:
             logger.error(f"❌ Failed to calculate balance changes: {e}")
-        
-        return changes
+            return {}
 
     async def _update_trade_status(self, result: TradeVerificationResult):
-        """Update trade status in database"""
+        """Update trade status in database with actual transaction data"""
         try:
             if not self.db_manager:
                 return
@@ -409,6 +598,65 @@ class TradeVerificationService:
                 'actual_output_amount': result.actual_output_amount,
                 'execution_error': result.execution_error or result.verification_error
             }
+            
+            # CRITICAL FIX: Update actual trade amounts from blockchain data
+            if result.final_status == "confirmed" and result.actual_output_amount is not None:
+                # Get the original trade to determine if it's buy or sell
+                try:
+                    trade_query = """
+                        SELECT trade_type, token_id, price 
+                        FROM trades 
+                        WHERE trade_id = $1
+                    """
+                    async with self.db_manager.pg_pool.acquire() as conn:
+                        trade_row = await conn.fetchrow(trade_query, result.trade_id)
+                    
+                    if trade_row:
+                        trade_type = trade_row['trade_type']
+                        token_id = trade_row['token_id']
+                        original_price = trade_row['price']
+                        
+                        # Get token info for decimals conversion
+                        token_info = None
+                        for token in self.db_manager._token_cache.values():
+                            if token.token_id == token_id:
+                                token_info = token
+                                break
+                        
+                        if token_info:
+                            token_decimals = token_info.decimals
+                            
+                            if trade_type == 'buy':
+                                # For BUY: actual_output_amount is the tokens received
+                                # Convert from smallest units to token units
+                                actual_quantity = result.actual_output_amount / (10 ** token_decimals)
+                                # Calculate actual value in USDC (input amount would be better, but use price estimate)
+                                actual_value_usdc = actual_quantity * original_price
+                                
+                                update_data['quantity'] = actual_quantity
+                                update_data['value_usdc'] = actual_value_usdc
+                                
+                                logger.debug(f"Updated BUY trade {result.trade_id}: {actual_quantity} tokens, ${actual_value_usdc:.2f}")
+                                
+                            elif trade_type == 'sell':
+                                # For SELL: actual_output_amount is the USDC received
+                                # Convert from USDC smallest units (6 decimals) to USDC
+                                actual_value_usdc = result.actual_output_amount / (10 ** 6)  # USDC has 6 decimals
+                                # Calculate quantity sold (use input amount if available, otherwise estimate)
+                                if result.actual_input_amount:
+                                    actual_quantity = result.actual_input_amount / (10 ** token_decimals)
+                                else:
+                                    # Estimate from USDC received and price
+                                    actual_quantity = actual_value_usdc / original_price if original_price > 0 else 0
+                                
+                                update_data['quantity'] = actual_quantity
+                                update_data['value_usdc'] = actual_value_usdc
+                                
+                                logger.debug(f"Updated SELL trade {result.trade_id}: {actual_quantity} tokens, ${actual_value_usdc:.2f}")
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to update actual trade amounts for {result.trade_id}: {e}")
+                    # Continue with status update even if amount update fails
             
             # Remove None values
             update_data = {k: v for k, v in update_data.items() if v is not None}

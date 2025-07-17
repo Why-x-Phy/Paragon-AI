@@ -32,7 +32,7 @@ class InferenceScheduleConfig:
     ohlcv_interval_minutes: int = 60  # Every hour
     ohlcv_fetch_delay_seconds: int = 60  # Wait 60 seconds after hour for fresh data
     ohlcv_lookback_hours: int = 48   # Get last 48 hours from API (freshness buffer)
-    ohlcv_inference_lookback_hours: int = 360  # Total data needed for inference (15 days)
+    ohlcv_inference_lookback_hours: int = 480  # Total data needed for inference (20 days, increased for 200 datapoint features)
     ohlcv_resolution: str = "1H"     # Hourly resolution for inference
     
     # UPDATED: Social data timing (1 min after hour, same as OHLCV)

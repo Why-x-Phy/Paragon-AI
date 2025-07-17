@@ -52,7 +52,7 @@ class TriggerType(Enum):
 @dataclass
 class RiskLimits:
     """Risk management configuration"""
-    max_position_size_usdc: float = 10000.0  # Max position size in USDC
+    max_position_size_usdc: float = 20000.0  # Max position size in USDC (increased for vault)
     max_portfolio_exposure_pct: float = 80.0  # Max % of portfolio in positions
     max_single_token_exposure_pct: float = 20.0  # Max % exposure to single token
     max_drawdown_pct: float = 10.0  # Max portfolio drawdown %
@@ -140,7 +140,7 @@ class PositionManager:
     def _load_risk_limits_from_env(self) -> RiskLimits:
         """Load risk limits from environment variables"""
         return RiskLimits(
-            max_position_size_usdc=float(getattr(self.config, 'POSITION_MAX_SIZE_USDC', 10000.0)),
+            max_position_size_usdc=float(getattr(self.config, 'POSITION_MAX_SIZE_USDC', 20000.0)),
             max_portfolio_exposure_pct=float(getattr(self.config, 'PORTFOLIO_MAX_EXPOSURE_PCT', 80.0)),
             max_single_token_exposure_pct=float(getattr(self.config, 'TOKEN_MAX_EXPOSURE_PCT', 20.0)),
             max_drawdown_pct=float(getattr(self.config, 'MAX_DRAWDOWN_PCT', 10.0)),

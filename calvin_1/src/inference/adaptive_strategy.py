@@ -74,7 +74,7 @@ class StrategyParameters:
     
     # Adaptation ranges for standard thresholds
     min_buy_threshold: float = 0.002   # 0.2% minimum - catch small moves
-    max_buy_threshold: float = 0.03    # 3.0% maximum - crypto can move fast
+    max_buy_threshold: float = 0.025   # 2.5% maximum - reduced from 3.0% for crypto
     min_sell_threshold: float = 0.003   # 0.3% minimum - quick exits
     max_sell_threshold: float = 0.04    # 4.0% maximum - let winners run in crypto
     min_confidence: float = 0.05  # Very low minimum
@@ -229,6 +229,9 @@ class AdaptiveStrategyEngine:
             # Load existing strategy parameters
             await self._load_strategy_parameters()
             
+            # Reset any tokens with unreasonably high thresholds (fix for existing cache)
+            await self.reset_high_threshold_tokens()
+            
             # Load performance history
             await self._load_performance_history()
             
@@ -238,6 +241,56 @@ class AdaptiveStrategyEngine:
             logger.error(f"Failed to initialize adaptive strategy engine: {e}")
             raise
     
+    async def reset_high_threshold_tokens(self, max_buy_threshold: float = 0.025, max_sell_threshold: float = 0.025):
+        """Reset tokens with thresholds above reasonable levels back to defaults"""
+        try:
+            reset_count = 0
+            for symbol, params in self.strategy_parameters.items():
+                if (params.buy_threshold > max_buy_threshold or 
+                    params.sell_threshold > max_sell_threshold):
+                    
+                    logger.info(f"Resetting high thresholds for {symbol}: "
+                              f"buy={params.buy_threshold:.1%}→1.0%, "
+                              f"sell={params.sell_threshold:.1%}→1.5%")
+                    
+                    # Reset to defaults but keep performance tracking
+                    old_total_signals = params.total_signals
+                    old_profitable_signals = params.profitable_signals
+                    old_win_rate = params.win_rate
+                    old_avg_return = params.avg_return
+                    
+                    # Create new parameters with defaults
+                    new_params = StrategyParameters(symbol=symbol)
+                    
+                    # Restore performance tracking
+                    new_params.total_signals = old_total_signals
+                    new_params.profitable_signals = old_profitable_signals
+                    new_params.win_rate = old_win_rate
+                    new_params.avg_return = old_avg_return
+                    new_params.last_updated = datetime.now()
+                    
+                    # Update in memory and cache
+                    self.strategy_parameters[symbol] = new_params
+                    await self._cache_parameters(symbol, new_params)
+                    
+                    # Clear Redis cache to force reload
+                    try:
+                        redis_key = f"adaptive_strategy_params:{symbol}"
+                        self.redis_client.delete(redis_key)
+                    except Exception as e:
+                        logger.warning(f"Failed to clear Redis cache for {symbol}: {e}")
+                    
+                    reset_count += 1
+            
+            if reset_count > 0:
+                logger.info(f"🔄 Reset {reset_count} tokens with high thresholds back to defaults")
+            
+            return reset_count
+            
+        except Exception as e:
+            logger.error(f"Failed to reset high threshold tokens: {e}")
+            return 0
+
     async def _load_strategy_parameters(self):
         """Load strategy parameters from Redis cache or initialize defaults"""
         try:
@@ -663,22 +716,54 @@ class AdaptiveStrategyEngine:
         original_buy = params.buy_threshold
         original_sell = params.sell_threshold
         
-        # Adjust based on win rate
-        if params.win_rate < self.config.min_win_rate_threshold:
-            # Poor performance: increase thresholds (be more selective)
-            adjustment = (self.config.min_win_rate_threshold - params.win_rate) * 2.0
-            params.buy_threshold = min(params.buy_threshold * (1 + adjustment), params.max_buy_threshold)
-            params.sell_threshold = min(params.sell_threshold * (1 + adjustment), params.max_sell_threshold)
-            
-        elif params.win_rate > self.config.max_win_rate_threshold:
-            # Excellent performance: decrease thresholds (capture more opportunities)
-            adjustment = (params.win_rate - self.config.max_win_rate_threshold) * 1.0
-            params.buy_threshold = max(params.buy_threshold * (1 - adjustment), params.min_buy_threshold)
-            params.sell_threshold = max(params.sell_threshold * (1 - adjustment), params.min_sell_threshold)
+        # FIXED: Skip performance adaptation for tokens with insufficient trade history
+        # A 0% win rate with few signals is not meaningful for adaptation
+        if params.total_signals < 20:  # Need at least 20 signals for meaningful win rate
+            logger.debug(f"Skipping performance adaptation for {normalized_symbol}: "
+                        f"only {params.total_signals} signals (need 20+ for reliable win rate)")
+            return False
+        
+        # FIXED: Handle edge case where win rate is 0% but we have signals
+        # This often happens when signals are generated but no trades executed
+        if params.win_rate == 0.0 and params.total_signals >= 20:
+            logger.debug(f"Token {normalized_symbol} has 0% win rate with {params.total_signals} signals - "
+                        f"applying conservative threshold increase instead of aggressive")
+            # Conservative increase for 0% win rate (max 20% increase)
+            conservative_adjustment = 0.15  # 15% increase
+            params.buy_threshold = min(
+                params.buy_threshold * (1 + conservative_adjustment), 
+                params.max_buy_threshold
+            )
+            params.sell_threshold = min(
+                params.sell_threshold * (1 + conservative_adjustment), 
+                params.max_sell_threshold
+            )
+        else:
+            # Normal performance-based adaptation
+            # Adjust based on win rate
+            if params.win_rate < self.config.min_win_rate_threshold:
+                # Poor performance: increase thresholds (be more selective)
+                # FIXED: Cap the adjustment to prevent excessive increases
+                raw_adjustment = (self.config.min_win_rate_threshold - params.win_rate) * 2.0
+                # Cap adjustment at 50% to prevent thresholds going too high
+                adjustment = min(raw_adjustment, 0.5)
+                
+                params.buy_threshold = min(params.buy_threshold * (1 + adjustment), params.max_buy_threshold)
+                params.sell_threshold = min(params.sell_threshold * (1 + adjustment), params.max_sell_threshold)
+                
+                logger.debug(f"Performance adaptation for {normalized_symbol}: "
+                           f"win_rate={params.win_rate:.2f}%, raw_adj={raw_adjustment:.2f}, "
+                           f"capped_adj={adjustment:.2f}")
+                
+            elif params.win_rate > self.config.max_win_rate_threshold:
+                # Excellent performance: decrease thresholds (capture more opportunities)
+                adjustment = (params.win_rate - self.config.max_win_rate_threshold) * 1.0
+                params.buy_threshold = max(params.buy_threshold * (1 - adjustment), params.min_buy_threshold)
+                params.sell_threshold = max(params.sell_threshold * (1 - adjustment), params.min_sell_threshold)
         
         # Return True if parameters changed
-        return (abs(params.buy_threshold - original_buy) > 0.01 or 
-                abs(params.sell_threshold - original_sell) > 0.01)
+        return (abs(params.buy_threshold - original_buy) > 0.001 or 
+                abs(params.sell_threshold - original_sell) > 0.001)
     
     async def _adapt_for_momentum(self, symbol: str, conditions: MarketConditions) -> bool:
         """Adapt parameters based on market momentum"""

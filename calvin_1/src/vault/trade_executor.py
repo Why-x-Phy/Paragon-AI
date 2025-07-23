@@ -29,6 +29,15 @@ from ..config.config import config
 from ..utils.logger import log
 from ..database.production_db import get_db_manager
 
+# Constants
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+JUPITER_PROGRAM_ID = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+
+# Dust thresholds - ignore positions below these amounts
+DUST_THRESHOLD_LAMPORTS = 100  # 100 lamports = 0.0001 tokens (6 decimals)
+DUST_THRESHOLD_TOKENS = 0.0001  # Equivalent in human-readable tokens
+
 logger = log
 
 class VaultTradeExecutor:
@@ -148,6 +157,35 @@ class VaultTradeExecutor:
                 if vault_state.get('paused', True):
                     logger.warning("⚠️ Vault is paused, skipping trades")
                     return results
+                    
+                # Refresh NAV before trades using JavaScript service
+                logger.info("📊 Refreshing NAV before trades using JavaScript service...")
+                try:
+                    import subprocess
+                    import os
+                    
+                    # Get the path to the JavaScript service
+                    js_service_path = os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                        "force_nav_update.js"
+                    )
+                    
+                    # Run the JavaScript service
+                    result = subprocess.run(
+                        ["node", js_service_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    
+                    if result.returncode == 0:
+                        logger.info(f"✅ Pre-trade NAV refreshed successfully via JavaScript service")
+                    else:
+                        logger.warning(f"⚠️ Failed to refresh pre-trade NAV: {result.stderr}, continuing anyway...")
+                except subprocess.TimeoutExpired:
+                    logger.warning("⚠️ NAV refresh service timed out, continuing anyway...")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to run NAV refresh service: {e}, continuing anyway...")
             else:
                 logger.info("📝 Running in simulation mode (no vault client)")
             
@@ -178,26 +216,33 @@ class VaultTradeExecutor:
                         tx_sig = await self.execute_single_trade(sell_signal, None, trade_type='sell')
                         
                         if tx_sig:
-                            # Record as pending first, then verify
-                            trade_id = await self._record_trade_execution(sell_signal, None, tx_sig, "pending", trade_type='sell')
-                            logger.info(f"📤 SELL submitted: {sell_signal.symbol} - {tx_sig[:12]}...")
-                            
-                            # Verify transaction immediately (for real transactions)
-                            if trade_id and self.trade_verifier and not tx_sig.startswith('SIM_'):
-                                verification_result = await self._verify_trade_immediately(trade_id, tx_sig)
+                            # Verify transaction immediately (for real transactions) BEFORE recording
+                            if self.trade_verifier and not tx_sig.startswith('SIM_'):
+                                verification_result = await self._verify_trade_immediately(None, tx_sig)
                                 if verification_result.final_status == "confirmed":
+                                    # Only record in database AFTER verification passes
+                                    trade_id = await self._record_trade_execution(sell_signal, None, tx_sig, "confirmed", trade_type='sell')
+                                    if trade_id:
+                                        # Update the verification result with the correct trade_id
+                                        await self._update_verification_trade_id(verification_result, trade_id)
                                     results.append(tx_sig)
                                     logger.info(f"✅ SELL confirmed: {sell_signal.symbol} - {tx_sig[:12]}...")
                                 else:
                                     logger.error(f"❌ SELL verification failed: {sell_signal.symbol} - {verification_result.execution_error}")
+                                    # Don't record failed trades in database
                             elif tx_sig.startswith('SIM_'):
-                                # For simulations, just add to results
+                                # For simulations, record immediately since no verification needed
+                                trade_id = await self._record_trade_execution(sell_signal, None, tx_sig, "confirmed", trade_type='sell')
                                 results.append(tx_sig)
                                 logger.info(f"📝 SELL simulation completed: {sell_signal.symbol}")
+                            else:
+                                # No verifier available, record as pending (legacy behavior)
+                                trade_id = await self._record_trade_execution(sell_signal, None, tx_sig, "pending", trade_type='sell')
+                                results.append(tx_sig)
+                                logger.info(f"📤 SELL submitted (no verification): {sell_signal.symbol} - {tx_sig[:12]}...")
                         else:
-                            # Record failed trade with detailed error info
+                            # Don't record failed trades in database - just log the failure
                             error_msg = f"SELL execution returned None for {sell_signal.symbol}"
-                            await self._record_trade_execution(sell_signal, None, None, "failed", error_msg, trade_type='sell')
                             logger.warning(f"❌ SELL failed: {sell_signal.symbol} - execution returned None")
                             
                     except Exception as e:
@@ -209,11 +254,8 @@ class VaultTradeExecutor:
                         logger.debug(f"  - Vault client available: {self.vault_client is not None}")
                         logger.debug(f"  - Jupiter client available: {self.jupiter_client is not None}")
                         
-                        # Record the failed trade with detailed error
-                        try:
-                            await self._record_trade_execution(sell_signal, None, None, "failed", error_msg, trade_type='sell')
-                        except Exception as record_error:
-                            logger.error(f"❌ Failed to record failed SELL trade: {record_error}")
+                        # Don't record failed trades in database - just log the failure
+                        logger.debug(f"SELL execution details: {error_msg}")
             
             # Execute BUY signals after sells (to use freed up capital)
             if portfolio_signal.buy_signals:
@@ -227,15 +269,17 @@ class VaultTradeExecutor:
                             logger.warning(f"⚠️ No allocation found for {buy_signal.symbol}")
                             continue
                         
-                        # NEW: Prevent buying if already holding the token
+                        # NEW: Prevent buying if already holding the token (above dust threshold)
                         token_mint = await self._get_token_mint(buy_signal.symbol)
                         if not token_mint:
                             logger.warning(f"⚠️ Token mint not found for {buy_signal.symbol}")
                             continue
                         token_balance = await self.vault_client.get_token_balance(token_mint) if self.vault_client else 0
-                        if token_balance > 0:
+                        if token_balance > DUST_THRESHOLD_TOKENS:
                             logger.warning(f"🚫 Skipping BUY for {buy_signal.symbol}: already holding {token_balance} tokens in vault")
                             continue
+                        elif token_balance > 0:
+                            logger.info(f"💨 Ignoring dust balance for {buy_signal.symbol} ({token_balance} tokens < {DUST_THRESHOLD_TOKENS} threshold)")
                         
                         # Trade size managed by portfolio coordinator - no artificial validation needed
                         trade_size = allocation.position_value_usdc
@@ -245,30 +289,38 @@ class VaultTradeExecutor:
                         tx_sig = await self.execute_single_trade(buy_signal, allocation, trade_type='buy')
                         
                         if tx_sig:
-                            # Record as pending first, then verify
-                            trade_id = await self._record_trade_execution(buy_signal, allocation, tx_sig, "pending", trade_type='buy')
-                            logger.info(f"📤 BUY submitted: {buy_signal.symbol} - {tx_sig[:12]}...")
-                            
-                            # Verify transaction immediately (for real transactions)
-                            if trade_id and self.trade_verifier and not tx_sig.startswith('SIM_'):
-                                verification_result = await self._verify_trade_immediately(trade_id, tx_sig)
+                            # Verify transaction immediately (for real transactions) BEFORE recording
+                            if self.trade_verifier and not tx_sig.startswith('SIM_'):
+                                verification_result = await self._verify_trade_immediately(None, tx_sig)
                                 if verification_result.final_status == "confirmed":
+                                    # Only record in database AFTER verification passes
+                                    trade_id = await self._record_trade_execution(buy_signal, allocation, tx_sig, "confirmed", trade_type='buy')
+                                    if trade_id:
+                                        # Update the verification result with the correct trade_id
+                                        await self._update_verification_trade_id(verification_result, trade_id)
                                     results.append(tx_sig)
                                     logger.info(f"✅ BUY confirmed: {buy_signal.symbol} - {tx_sig[:12]}...")
                                 else:
                                     logger.error(f"❌ BUY verification failed: {buy_signal.symbol} - {verification_result.execution_error}")
+                                    # Don't record failed trades in database
                             elif tx_sig.startswith('SIM_'):
-                                # For simulations, just add to results
+                                # For simulations, record immediately since no verification needed
+                                trade_id = await self._record_trade_execution(buy_signal, allocation, tx_sig, "confirmed", trade_type='buy')
                                 results.append(tx_sig)
                                 logger.info(f"📝 BUY simulation completed: {buy_signal.symbol}")
+                            else:
+                                # No verifier available, record as pending (legacy behavior)
+                                trade_id = await self._record_trade_execution(buy_signal, allocation, tx_sig, "pending", trade_type='buy')
+                                results.append(tx_sig)
+                                logger.info(f"📤 BUY submitted (no verification): {buy_signal.symbol} - {tx_sig[:12]}...")
                         else:
-                            # Record failed trade
-                            await self._record_trade_execution(buy_signal, allocation, None, "failed", trade_type='buy')
+                            # Don't record failed trades in database - just log the failure
                             logger.warning(f"❌ BUY failed: {buy_signal.symbol}")
                             
                     except Exception as e:
                         logger.error(f"❌ Failed to execute BUY for {buy_signal.symbol}: {e}")
-                        await self._record_trade_execution(buy_signal, allocation, None, "failed", str(e), trade_type='buy')
+                        # Don't record failed trades in database - just log the failure
+                        logger.debug(f"BUY execution details: {str(e)}")
             
             # Final summary
             success_rate = len(results) / total_signals if total_signals > 0 else 0
@@ -281,16 +333,62 @@ class VaultTradeExecutor:
             logger.info(f"   🔥 {sell_count} SELL signals processed")
             logger.info(f"   💡 Sells executed first for optimal risk management")
             
+            # Refresh NAV after trades using JavaScript service and check for performance fees
+            if self.vault_client and len(results) > 0:
+                logger.info("📊 Refreshing NAV after trades using JavaScript service...")
+                
+                # Call the JavaScript NAV refresh service
+                try:
+                    import subprocess
+                    import os
+                    
+                    # Get the path to the JavaScript service
+                    js_service_path = os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                        "force_nav_update.js"
+                    )
+                    
+                    # Run the JavaScript service
+                    result = subprocess.run(
+                        ["node", js_service_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    
+                    if result.returncode == 0:
+                        logger.info(f"✅ NAV refreshed successfully via JavaScript service")
+                        
+                        # Check if we should collect performance fees
+                        # Only collect fees if we had successful sells (liquidating profits)
+                        had_sells = any(sig for sig in results if 'SELL' in str(sig).upper() or any(s for s in portfolio_signal.sell_signals))
+                        
+                        if had_sells:
+                            logger.info("💰 Checking for performance fees after sells...")
+                            fee_sig = await self.vault_client.collect_performance_fees()
+                            if fee_sig:
+                                logger.info(f"✅ Performance fees collected: {fee_sig[:12]}...")
+                            else:
+                                logger.info("ℹ️ No performance fees to collect")
+                    else:
+                        logger.warning(f"⚠️ Failed to refresh NAV via JavaScript service: {result.stderr}")
+                except subprocess.TimeoutExpired:
+                    logger.error("❌ NAV refresh service timed out after 30 seconds")
+                except Exception as e:
+                    logger.error(f"❌ Failed to run NAV refresh service: {e}")
+            
             return results
             
         except Exception as e:
             logger.error(f"❌ Portfolio trade execution failed: {e}")
             return results
 
-    async def _verify_trade_immediately(self, trade_id: int, tx_hash: str):
+    async def _verify_trade_immediately(self, trade_id: Optional[int], tx_hash: str):
         """Immediately verify trade execution (blocks until confirmed)"""
         try:
-            logger.debug(f"🔍 Verifying trade {trade_id} immediately...")
+            # Use a placeholder trade_id for verification (will be updated later if needed)
+            verification_trade_id = trade_id or 0
+            logger.debug(f"🔍 Verifying transaction {tx_hash[:12]}... immediately...")
             
             # Wait a moment for transaction to propagate
             await asyncio.sleep(3)
@@ -298,31 +396,31 @@ class VaultTradeExecutor:
             # Attempt verification with retries
             max_retries = 3
             for attempt in range(max_retries):
-                result = await self.trade_verifier.verify_trade_execution(trade_id, tx_hash)
+                result = await self.trade_verifier.verify_trade_execution(verification_trade_id, tx_hash)
                 
                 if result.final_status == 'confirmed':
-                    logger.info(f"✅ Trade {trade_id} verified successfully on-chain")
+                    logger.info(f"✅ Transaction {tx_hash[:12]}... verified successfully on-chain")
                     return result
                 elif result.final_status == 'failed':
-                    logger.error(f"❌ Trade {trade_id} failed on-chain: {result.execution_error}")
+                    logger.error(f"❌ Transaction {tx_hash[:12]}... failed on-chain: {result.execution_error}")
                     return result
                 else:
                     # Still pending, wait and retry
                     if attempt < max_retries - 1:
-                        logger.debug(f"⏳ Trade {trade_id} still pending, retrying in 5s...")
+                        logger.debug(f"⏳ Transaction {tx_hash[:12]}... still pending, retrying in 5s...")
                         await asyncio.sleep(5)
             
             # If we get here, verification timed out
-            logger.warning(f"⏰ Trade {trade_id} verification timed out")
+            logger.warning(f"⏰ Transaction {tx_hash[:12]}... verification timed out")
             result.final_status = 'timeout'
             return result
                     
         except Exception as e:
-            logger.error(f"❌ Immediate trade verification failed for {trade_id}: {e}")
+            logger.error(f"❌ Immediate trade verification failed for {tx_hash[:12]}...: {e}")
             # Return a failed result
             from ..vault.trade_verifier import TradeVerificationResult
             result = TradeVerificationResult(
-                trade_id=trade_id,
+                trade_id=verification_trade_id,
                 tx_hash=tx_hash,
                 verified_at=datetime.utcnow(),
                 transaction_confirmed=False,
@@ -331,6 +429,20 @@ class VaultTradeExecutor:
             result.final_status = 'failed'
             result.verification_error = str(e)
             return result
+
+    async def _update_verification_trade_id(self, verification_result, trade_id: int):
+        """Update the verification result with the correct trade_id and update database status"""
+        try:
+            if verification_result and trade_id:
+                # Update the verification result
+                verification_result.trade_id = trade_id
+                
+                # Update the database with the verification results
+                if self.trade_verifier:
+                    await self.trade_verifier._update_trade_status(verification_result)
+                    logger.debug(f"✅ Updated database status for trade {trade_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to update verification trade_id for {trade_id}: {e}")
 
     async def _verify_trade_async(self, trade_id: int, tx_hash: str):
         """Asynchronously verify trade execution (don't block main flow) - DEPRECATED"""
@@ -404,12 +516,22 @@ class VaultTradeExecutor:
                 
                 # Execute SELL through vault smart contract
                 if self.vault_client:
+                    # Store pre-trade USDC balance for slippage validation
+                    usdc_balance_before = await self.vault_client.get_token_balance("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+                    
                     tx_sig = await self.vault_client.execute_trade(
                         jupiter_data=jupiter_data,
                         source_mint=token_mint,  # Token we're selling
                         destination_mint="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
                         amount_in=position_size  # Pass the amount of tokens to sell
                     )
+                    
+                    # ✅ VALIDATE SLIPPAGE PROTECTION after trade execution
+                    if tx_sig and isinstance(jupiter_data, dict) and jupiter_data.get('slippage_protection'):
+                        await self._validate_trade_slippage(
+                            tx_sig, jupiter_data, usdc_balance_before, 
+                            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", trade_type='sell'
+                        )
                 else:
                     # Simulate vault execution for sell
                     tx_sig = await self._simulate_vault_execution(signal.symbol, None, trade_type='sell')
@@ -441,12 +563,22 @@ class VaultTradeExecutor:
                 
                 # Execute BUY through vault smart contract
                 if self.vault_client:
+                    # Store pre-trade token balance for slippage validation
+                    token_balance_before = await self.vault_client.get_token_balance(token_mint)
+                    
                     tx_sig = await self.vault_client.execute_trade(
                         jupiter_data=jupiter_data,
                         source_mint="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
                         destination_mint=token_mint,  # Token we're buying
                         amount_usdc=allocation.position_value_usdc
                     )
+                    
+                    # ✅ VALIDATE SLIPPAGE PROTECTION after trade execution
+                    if tx_sig and isinstance(jupiter_data, dict) and jupiter_data.get('slippage_protection'):
+                        await self._validate_trade_slippage(
+                            tx_sig, jupiter_data, token_balance_before, 
+                            token_mint, trade_type='buy'
+                        )
                 else:
                     # Simulate vault execution for buy
                     tx_sig = await self._simulate_vault_execution(signal.symbol, allocation, trade_type='buy')
@@ -464,6 +596,62 @@ class VaultTradeExecutor:
         except Exception as e:
             logger.error(f"❌ Single {trade_type.upper()} trade execution failed for {signal.symbol}: {e}")
             return None
+
+    async def _validate_trade_slippage(self, tx_sig: str, jupiter_data: dict, balance_before: float, 
+                                      output_mint: str, trade_type: str) -> bool:
+        """
+        Validate that a trade's actual output meets slippage protection requirements
+        
+        Args:
+            tx_sig: Transaction signature
+            jupiter_data: Jupiter swap data containing slippage protection
+            balance_before: Token balance before the trade
+            output_mint: The output token mint address
+            trade_type: 'buy' or 'sell'
+            
+        Returns:
+            True if trade meets slippage requirements, False otherwise
+        """
+        try:
+            # Wait a moment for the transaction to be processed
+            await asyncio.sleep(2)
+            
+            # Get the balance after trade
+            balance_after = await self.vault_client.get_token_balance(output_mint)
+            actual_output = balance_after - balance_before
+            
+            # Convert to token units (balance is usually in decimal form)
+            if output_mint == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v":  # USDC
+                actual_output_units = int(actual_output * 1_000_000)  # Convert to micro-USDC
+            else:
+                # Get token decimals and convert
+                if self.db_manager:
+                    token_info = await self.db_manager.get_token_by_address(output_mint)
+                    # token_info is a TokenInfo object, not a dict
+                    decimals = token_info.decimals if token_info else 6
+                else:
+                    decimals = 6  # Default
+                actual_output_units = int(actual_output * (10 ** decimals))
+            
+            # Use Jupiter client's validation method
+            is_valid = self.jupiter_client.validate_trade_output(actual_output_units, jupiter_data)
+            
+            if is_valid:
+                logger.info(f"✅ {trade_type.upper()} trade passed slippage validation: {tx_sig[:12]}...")
+            else:
+                logger.error(f"❌ {trade_type.upper()} trade FAILED slippage validation: {tx_sig[:12]}...")
+                logger.error(f"   This trade may have been MEV attacked or had poor execution!")
+                
+                # Log the details for investigation
+                slippage_protection = jupiter_data.get('slippage_protection', {})
+                logger.error(f"   Expected minimum: {slippage_protection.get('minimum_amount_out', 0)}")
+                logger.error(f"   Actual received: {actual_output_units}")
+                
+            return is_valid
+            
+        except Exception as e:
+            logger.error(f"❌ Error validating trade slippage: {e}")
+            return False
 
     async def _get_position_size_to_sell(self, symbol: str) -> float:
         """

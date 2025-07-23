@@ -14,6 +14,10 @@ from ..database.production_db import get_db_manager, PositionData
 from ..utils.logger import log_manager
 from .position_manager import PositionManager
 
+# Dust thresholds - ignore positions below these amounts
+DUST_THRESHOLD_TOKENS = 0.0001  # 0.0001 tokens minimum
+DUST_THRESHOLD_USDC = 0.01  # $0.01 USDC minimum position value
+
 logger = log_manager.get_logger("position_sync")
 
 
@@ -127,6 +131,11 @@ async def get_vault_holdings(vault_client: VaultClient) -> List[VaultHolding]:
                 
                 # Calculate value
                 value_usdc = token_amount * current_price
+                
+                # Apply dust threshold filtering
+                if token_amount <= DUST_THRESHOLD_TOKENS or value_usdc < DUST_THRESHOLD_USDC:
+                    logger.debug(f"💨 Ignoring dust holding: {token_info.symbol} - {token_amount:.6f} tokens (${value_usdc:.6f} USDC)")
+                    continue
                 
                 holding = VaultHolding(
                     token_address=mint_str,

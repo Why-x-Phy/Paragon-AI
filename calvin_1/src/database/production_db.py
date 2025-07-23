@@ -442,6 +442,42 @@ class ProductionDBManager:
         # First try cache lookup (fast path)
         for token in self._token_cache.values():
             if token.symbol.upper() == symbol.upper():
+                # Check if we're in a valid event loop before trying database query
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                    # Check if our pool was created in a different (now closed) loop
+                    if hasattr(self, '_loop') and self._loop and self._loop.is_closed():
+                        self.logger.debug(f"Database connection pool was created in closed event loop, using cache only for {symbol}")
+                        # Return cache data without LunarCrush fields
+                        return {
+                            'token_id': token.token_id,
+                            'address': token.address,
+                            'symbol': token.symbol,
+                            'name': token.name,
+                            'decimals': token.decimals,
+                            'is_active': token.is_active,
+                            'lunarcrush_id': None,
+                            'lunarcrush_symbol': None,
+                            'lunarcrush_topic': None,
+                            'social_data_available': False
+                        }
+                except RuntimeError:
+                    # No event loop running, return cache data only
+                    self.logger.debug(f"No event loop running, using cache only for {symbol}")
+                    return {
+                        'token_id': token.token_id,
+                        'address': token.address,
+                        'symbol': token.symbol,
+                        'name': token.name,
+                        'decimals': token.decimals,
+                        'is_active': token.is_active,
+                        'lunarcrush_id': None,
+                        'lunarcrush_symbol': None,
+                        'lunarcrush_topic': None,
+                        'social_data_available': False
+                    }
+                
                 # Get additional LunarCrush fields from database for this token
                 try:
                     query = """
@@ -468,7 +504,11 @@ class ProductionDBManager:
                             'social_data_available': row['social_data_available']
                         }
                 except Exception as e:
-                    self.logger.warning(f"Failed to get LunarCrush fields from database: {e}")
+                    # Don't log event loop closed errors as warnings
+                    if "Event loop is closed" in str(e) or "connection was closed" in str(e):
+                        self.logger.debug(f"Database connection closed, using cache data for {symbol}")
+                    else:
+                        self.logger.warning(f"Failed to get LunarCrush fields from database: {e}")
                 
                 # Fallback to basic cache data if database query fails
                 return {
@@ -488,44 +528,27 @@ class ProductionDBManager:
         try:
             query = """
                 SELECT token_id, address, symbol, name, decimals, is_active,
-                       lunarcrush_id, lunarcrush_symbol, lunarcrush_topic, 
+                       lunarcrush_id, lunarcrush_symbol, lunarcrush_topic,
                        social_data_available
                 FROM tokens 
                 WHERE UPPER(symbol) = UPPER($1)
-                LIMIT 1
             """
+            
             async with self.pg_pool.acquire() as conn:
                 row = await conn.fetchrow(query, symbol)
-                
+            
             if row:
-                # Update cache with this token for future lookups
-                token = TokenInfo(
-                    token_id=row['token_id'],
-                    address=row['address'],
-                    symbol=row['symbol'],
-                    name=row['name'],
-                    decimals=row['decimals'],
-                    is_active=row['is_active']
-                )
-                self._token_cache[token.address] = token
-                self._token_id_cache[token.token_id] = token
+                return dict(row)
+            else:
+                self.logger.warning(f"Token {symbol} not found in database")
+                return None
                 
-                return {
-                    'token_id': row['token_id'],
-                    'address': row['address'],
-                    'symbol': row['symbol'],
-                    'name': row['name'],
-                    'decimals': row['decimals'],
-                    'is_active': row['is_active'],
-                    'lunarcrush_id': row['lunarcrush_id'],
-                    'lunarcrush_symbol': row['lunarcrush_symbol'],
-                    'lunarcrush_topic': row['lunarcrush_topic'],
-                    'social_data_available': row['social_data_available']
-                }
         except Exception as e:
-            self.logger.error(f"Failed to get token by symbol from database: {e}")
-        
-        return None
+            if "Event loop is closed" in str(e) or "connection was closed" in str(e):
+                self.logger.debug(f"Database connection closed while looking up {symbol}")
+            else:
+                self.logger.error(f"Failed to get token by symbol: {e}")
+            return None
     
     async def get_or_create_token(self, address: str, symbol: str, name: str, decimals: int = 9) -> Dict:
         """Get existing token or create new one"""
@@ -911,7 +934,9 @@ class ProductionDBManager:
                 data = json.loads(cached)
                 return [PositionData(**pos) for pos in data]
             
-            # Query database
+            # Query database (filter out dust positions)
+            dust_threshold_usdc = 0.01  # $0.01 minimum position value
+            
             query = """
                 SELECT position_id, token_id, position_type, status, entry_price, entry_quantity,
                        entry_value_usdc, entry_time, entry_tx_hash, exit_price, exit_quantity,
@@ -919,12 +944,12 @@ class ProductionDBManager:
                        realized_pnl_usdc, unrealized_pnl_usdc, fees_paid_usdc,
                        model_prediction_confidence, model_version
                 FROM positions 
-                WHERE status = 'open'
+                WHERE status = 'open' AND entry_value_usdc >= $1
             """
             
-            params = []
+            params = [dust_threshold_usdc]
             if token_id:
-                query += " AND token_id = $1"
+                query += " AND token_id = $2"
                 params.append(token_id)
             
             query += " ORDER BY entry_time DESC"

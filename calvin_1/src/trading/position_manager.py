@@ -28,6 +28,11 @@ from ..database.production_db import (
 from ..data.realtime_storage import RealtimeDataStorage, PositionTrigger
 from ..config.config import config
 
+# Dust thresholds - ignore positions below these amounts
+DUST_THRESHOLD_LAMPORTS = 100  # 100 lamports = 0.0001 tokens (6 decimals)
+DUST_THRESHOLD_TOKENS = 0.0001  # Equivalent in human-readable tokens
+DUST_THRESHOLD_USDC = 0.01  # $0.01 USDC minimum position value
+
 
 class PositionStatus(Enum):
     """Position status enumeration"""
@@ -188,6 +193,11 @@ class PositionManager:
             self.position_by_token.clear()
             
             for position in open_positions:
+                # Apply dust threshold
+                if position.entry_value_usdc < DUST_THRESHOLD_USDC:
+                    self.logger.debug(f"Ignoring dust position: {position.position_id} (Value: {position.entry_value_usdc:.2f} USDC)")
+                    continue
+                
                 self.active_positions[position.position_id] = position
                 
                 # Group by token
@@ -195,7 +205,7 @@ class PositionManager:
                     self.position_by_token[position.token_id] = []
                 self.position_by_token[position.token_id].append(position.position_id)
             
-            self.logger.info(f"Loaded {len(open_positions)} open positions")
+            self.logger.info(f"Loaded {len(open_positions)} open positions, {len(self.active_positions)} after dust filtering")
             
         except Exception as e:
             self.logger.error(f"Failed to load open positions: {e}")
@@ -493,6 +503,10 @@ class PositionManager:
     
     async def _validate_position_risk(self, token_id: int, position_value: float):
         """Validate position against risk limits"""
+        # Check dust threshold first
+        if position_value < DUST_THRESHOLD_USDC:
+            raise ValueError(f"Position value ${position_value:.4f} below dust threshold ${DUST_THRESHOLD_USDC}")
+        
         # Check minimum position size
         if position_value < self.risk_limits.min_position_size_usdc:
             raise ValueError(f"Position value ${position_value:.2f} below minimum ${self.risk_limits.min_position_size_usdc}")
@@ -523,7 +537,7 @@ class PositionManager:
             raise ValueError(f"Portfolio exposure would exceed limit: ${portfolio_exposure + position_value:.2f} > ${max_portfolio_exposure:.2f}")
     
     async def _calculate_token_exposure(self, token_id: int) -> float:
-        """Calculate current exposure to a specific token"""
+        """Calculate current exposure to a specific token (excluding dust positions)"""
         exposure = 0.0
         
         if token_id in self.position_by_token:
@@ -531,18 +545,24 @@ class PositionManager:
                 position = self.active_positions[position_id]
                 current_price = await self.db_manager.get_latest_price(token_id)
                 if current_price:
-                    exposure += position.entry_quantity * current_price
+                    position_value = position.entry_quantity * current_price
+                    # Skip dust positions in exposure calculation
+                    if position_value >= DUST_THRESHOLD_USDC:
+                        exposure += position_value
         
         return exposure
     
     async def _calculate_portfolio_exposure(self) -> float:
-        """Calculate total portfolio exposure"""
+        """Calculate total portfolio exposure (excluding dust positions)"""
         total_exposure = 0.0
         
         for position in self.active_positions.values():
             current_price = await self.db_manager.get_latest_price(position.token_id)
             if current_price:
-                total_exposure += position.entry_quantity * current_price
+                position_value = position.entry_quantity * current_price
+                # Skip dust positions in portfolio exposure calculation
+                if position_value >= DUST_THRESHOLD_USDC:
+                    total_exposure += position_value
         
         return total_exposure
     

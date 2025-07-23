@@ -90,6 +90,10 @@ class HourlyInferenceScheduler:
         self.scheduler_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         
+        # 🔧 DATABASE MANAGER REGISTRY - Track all created DB managers for cleanup
+        self._db_manager_registry = []
+        self._original_db_manager = None
+        
         # Statistics - ENHANCED for Phase 3.2
         self.stats = {
             'ohlcv_runs': 0,
@@ -123,10 +127,15 @@ class HourlyInferenceScheduler:
                 # Store the loop reference
                 thread_db_manager._loop = current_loop
                 
+                # Track this manager in our registry for cleanup
+                self._db_manager_registry.append(thread_db_manager)
+                
                 # Store original and use thread-local
-                if not hasattr(self, '_original_db_manager'):
+                if not hasattr(self, '_original_db_manager') or self._original_db_manager is None:
                     self._original_db_manager = self.db_manager
                 self.db_manager = thread_db_manager
+                
+                self.logger.debug(f"✅ Created DB manager #{len(self._db_manager_registry)} for event loop")
                 
                 return True
             return False
@@ -142,15 +151,19 @@ class HourlyInferenceScheduler:
                 if self.db_manager != self._original_db_manager:
                     try:
                         await self.db_manager.close()
+                        # Remove from registry if present
+                        if self.db_manager in self._db_manager_registry:
+                            self._db_manager_registry.remove(self.db_manager)
                     except Exception as e:
-                        self.logger.debug(f"Error closing thread-local DB manager: {e}")
+                        self.logger.error(f"Error closing thread-local database manager: {e}")
                 
                 # Restore original
                 self.db_manager = self._original_db_manager
-                delattr(self, '_original_db_manager')
+                self.logger.debug("Restored original database manager")
+                
         except Exception as e:
-            self.logger.error(f"Error restoring DB manager: {e}")
-        
+            self.logger.error(f"Error restoring original database manager: {e}")
+    
     async def initialize(self):
         """Initialize the inference scheduler"""
         try:
@@ -1478,38 +1491,45 @@ class HourlyInferenceScheduler:
         self.logger.info("🧠 Starting adaptive strategy parameter updates")
         
         try:
-            # Create a completely isolated event loop for this thread
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            # Run in isolated thread with asyncio.run() to avoid event loop conflicts
+            import concurrent.futures
             
-            # Create a new database manager for this thread's loop
-            # This avoids conflicts with the main application's database connections
-            from ..database.production_db import ProductionDBManager
-            thread_db_manager = ProductionDBManager()
-            loop.run_until_complete(thread_db_manager.initialize())
+            def run_updates():
+                """Run updates with proper async isolation"""
+                return asyncio.run(self._isolated_adaptive_strategy_updates())
             
-            try:
-                # Run the async updates in this isolated loop
-                # Store the db_manager temporarily and use the thread's
-                original_db_manager = self.db_manager
-                self.db_manager = thread_db_manager
-                
-                loop.run_until_complete(self._run_adaptive_strategy_updates_async())
-                
-                # Restore original db_manager
-                self.db_manager = original_db_manager
-            finally:
-                # Clean up the thread's database connection
-                loop.run_until_complete(thread_db_manager.close())
-                # Clean up the loop
-                loop.close()
-                asyncio.set_event_loop(None)
+            # Execute in a thread pool to avoid event loop conflicts
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(run_updates)
+                future.result()  # Wait for completion
             
         except Exception as e:
             self.logger.error(f"Error in adaptive strategy updates: {e}")
             # Import traceback for better error logging
             import traceback
             self.logger.error(f"Traceback: {traceback.format_exc()}")
+    
+    async def _isolated_adaptive_strategy_updates(self):
+        """Run adaptive updates with isolated database connection"""
+        # Create a fresh database manager for this isolated async context
+        from ..database.production_db import ProductionDBManager
+        isolated_db_manager = ProductionDBManager()
+        
+        # Initialize with a fresh connection pool
+        isolated_db_manager._connection_pool = None
+        await isolated_db_manager.initialize()
+        
+        # Store original and use isolated
+        original_db_manager = self.db_manager
+        self.db_manager = isolated_db_manager
+        
+        try:
+            # Run the actual updates
+            await self._run_adaptive_strategy_updates_async()
+        finally:
+            # Restore original and clean up
+            self.db_manager = original_db_manager
+            await isolated_db_manager.close()
     
     async def _run_adaptive_strategy_updates_async(self):
         """Async adaptive strategy parameter updates"""
@@ -1585,39 +1605,83 @@ class HourlyInferenceScheduler:
         self.logger.info("🚀 Starting data fetch + inference + trading cycle")
         
         try:
-            # Create a completely isolated event loop for this thread
-            # This prevents conflicts with the main application's event loop
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            # Instead of creating a new event loop, run in a separate thread with asyncio.run()
+            # This properly isolates the async context
+            import concurrent.futures
+            import functools
             
-            # Create a new database manager for this thread's loop
-            # This avoids conflicts with the main application's database connections
-            from ..database.production_db import ProductionDBManager
-            thread_db_manager = ProductionDBManager()
-            loop.run_until_complete(thread_db_manager.initialize())
+            def run_cycle():
+                """Run the cycle with proper async isolation"""
+                return asyncio.run(self._isolated_data_and_trading_cycle())
             
-            try:
-                # Run the async cycle in this isolated loop
-                # Store the db_manager temporarily and use the thread's
-                original_db_manager = self.db_manager
-                self.db_manager = thread_db_manager
-                
-                loop.run_until_complete(self._run_data_and_trading_cycle_async())
-                
-                # Restore original db_manager
-                self.db_manager = original_db_manager
-            finally:
-                # Clean up the thread's database connection
-                loop.run_until_complete(thread_db_manager.close())
-                # Clean up the loop
-                loop.close()
-                asyncio.set_event_loop(None)
+            # Execute in a thread pool to avoid event loop conflicts
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(run_cycle)
+                future.result()  # Wait for completion
+            
+
             
         except Exception as e:
             self.logger.error(f"Error starting data and trading cycle: {e}")
             # Import traceback for better error logging
             import traceback
             self.logger.error(f"Traceback: {traceback.format_exc()}")
+    
+    async def _isolated_data_and_trading_cycle(self):
+        """Run data and trading cycle with isolated database connection"""
+        # Create a fresh database manager for this isolated async context
+        from ..database.production_db import ProductionDBManager
+        isolated_db_manager = ProductionDBManager()
+        original_db_manager = None
+        
+        try:
+            # Initialize with a fresh connection pool
+            isolated_db_manager._connection_pool = None
+            await isolated_db_manager.initialize()
+            
+            # Store the current event loop reference
+            import asyncio
+            isolated_db_manager._loop = asyncio.get_running_loop()
+            
+            # Store original and use isolated
+            original_db_manager = self.db_manager
+            self.db_manager = isolated_db_manager
+            
+            # Run the actual cycle - IMPORTANT: Everything must happen within this try block
+            # to ensure the event loop is still running when database operations occur
+            await self._run_data_and_trading_cycle_async()
+            
+            # Wait for any pending database operations to complete
+            await self._wait_for_pending_tasks(timeout=10.0)
+            
+        except Exception as e:
+            self.logger.error(f"Data and trading cycle failed: {e}")
+            # Only try to record if we have a valid db_manager
+            if self.db_manager and hasattr(self.db_manager, '_loop'):
+                try:
+                    # Check if the event loop is still running
+                    loop = getattr(self.db_manager, '_loop', None)
+                    if loop and not loop.is_closed():
+                        await self._record_vault_trading_cycle(
+                            signals=None, results=[], status='failed',
+                            cycle_start=datetime.utcnow(), error=str(e)
+                        )
+                except Exception as record_error:
+                    self.logger.error(f"Failed to record error state: {record_error}")
+        finally:
+            # CRITICAL: Always clean up the isolated database manager
+            try:
+                # First restore the original manager to avoid using closed connections
+                if original_db_manager:
+                    self.db_manager = original_db_manager
+                
+                # Then clean up the isolated manager
+                if isolated_db_manager:
+                    self.logger.debug("Cleaning up isolated database manager...")
+                    await isolated_db_manager.close()
+                    self.logger.debug("✅ Isolated database manager cleaned up")
+            except Exception as cleanup_error:
+                self.logger.error(f"Failed to clean up database manager: {cleanup_error}")
     
     async def _run_data_and_trading_cycle_async(self):
         """Async combined data fetch + inference + trading cycle"""
@@ -1860,6 +1924,11 @@ class HourlyInferenceScheduler:
     async def stop_async(self):
         """Async version of stop_scheduler for integration"""
         self.stop_scheduler()
+        
+        # Clean up all database managers to prevent connection pool exhaustion
+        await self.cleanup_all_db_managers()
+        
+        self.logger.info("✅ Scheduler stopped and database connections cleaned up")
 
     def get_enhanced_statistics(self) -> Dict[str, Any]:
         """Get enhanced statistics including vault trading metrics"""
@@ -1883,6 +1952,167 @@ class HourlyInferenceScheduler:
         
         return base_stats
     
+    async def cleanup_all_db_managers(self):
+        """Clean up all created database managers to prevent connection pool exhaustion"""
+        try:
+            initial_count = len(self._db_manager_registry)
+            self.logger.info(f"🧹 Cleaning up {initial_count} database managers...")
+            
+            cleanup_count = 0
+            errors = []
+            
+            # Clean up all tracked managers
+            for db_manager in self._db_manager_registry:
+                try:
+                    # Get pool stats before closing
+                    pool_stats = db_manager.get_pool_stats() if hasattr(db_manager, 'get_pool_stats') else {}
+                    active_connections = pool_stats.get('pool_info', {}).get('active_connections', 0)
+                    
+                    if active_connections > 0:
+                        self.logger.debug(f"Closing DB manager with {active_connections} active connections")
+                    
+                    await db_manager.close()
+                    cleanup_count += 1
+                except Exception as e:
+                    errors.append(str(e))
+                    self.logger.error(f"Failed to close DB manager: {e}")
+            
+            # Clear the registry
+            self._db_manager_registry.clear()
+            
+            # Restore original manager
+            if self._original_db_manager:
+                self.db_manager = self._original_db_manager
+            
+            self.logger.info(f"✅ Cleaned up {cleanup_count}/{initial_count} database managers")
+            
+            if errors:
+                self.logger.warning(f"⚠️ {len(errors)} cleanup errors occurred")
+                
+        except Exception as e:
+            self.logger.error(f"Critical error during database manager cleanup: {e}")
+
+    async def _restore_original_db_manager(self):
+        """Restore original database manager and clean up thread-local one"""
+        try:
+            if hasattr(self, '_original_db_manager'):
+                # Close thread-local manager if different
+                if self.db_manager != self._original_db_manager:
+                    try:
+                        await self.db_manager.close()
+                        # Remove from registry if present
+                        if self.db_manager in self._db_manager_registry:
+                            self._db_manager_registry.remove(self.db_manager)
+                    except Exception as e:
+                        self.logger.error(f"Error closing thread-local database manager: {e}")
+                
+                # Restore original
+                self.db_manager = self._original_db_manager
+                self.logger.debug("Restored original database manager")
+                
+        except Exception as e:
+            self.logger.error(f"Error restoring original database manager: {e}")
+
+    def _schedule_tasks(self):
+        """Schedule all periodic tasks"""
+        # Clear any existing schedule
+        schedule.clear()
+        
+        # Data + Inference + Trading cycle (XX:01)
+        schedule.every().hour.at(":01").do(self._run_data_and_trading_cycle)
+        
+        # OHLCV data updates (XX:06)
+        schedule.every().hour.at(":06").do(self._run_ohlcv_updates)
+        
+        # Social data updates (XX:31)
+        schedule.every().hour.at(":31").do(self._run_social_updates)
+        
+        # Adaptive strategy updates (XX:55)
+        schedule.every().hour.at(":55").do(self._run_adaptive_strategy_updates)
+        
+        # 🔧 PERIODIC DATABASE CLEANUP - Run every 3 hours to prevent connection pool exhaustion
+        schedule.every(3).hours.do(self._run_periodic_cleanup)
+        
+        self.logger.info("✅ Scheduled tasks configured:")
+        self.logger.info("  - Data + Inference + Trading: XX:01")
+        self.logger.info("  - OHLCV Updates: XX:06")
+        self.logger.info("  - Social Updates: XX:31")
+        self.logger.info("  - Adaptive Strategy: XX:55")
+        self.logger.info("  - Database Cleanup: Every 3 hours")
+
+    def _run_periodic_cleanup(self):
+        """Run periodic database cleanup to prevent connection pool exhaustion"""
+        self.logger.info("🧹 Running periodic database cleanup...")
+        
+        try:
+            # Run cleanup in isolated context
+            import concurrent.futures
+            
+            def run_cleanup():
+                """Run cleanup with proper async isolation"""
+                return asyncio.run(self._async_periodic_cleanup())
+            
+            # Execute in a thread pool to avoid event loop conflicts
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(run_cleanup)
+                future.result()  # Wait for completion
+                
+        except Exception as e:
+            self.logger.error(f"Error running periodic cleanup: {e}")
+    
+    async def _async_periodic_cleanup(self):
+        """Async periodic cleanup implementation"""
+        try:
+            # Get current pool stats before cleanup
+            current_stats = self.db_manager.get_pool_stats() if self.db_manager else {}
+            active_connections = current_stats.get('pool_info', {}).get('active_connections', 0)
+            total_connections = current_stats.get('pool_info', {}).get('total_connections', 0)
+            
+            self.logger.info(f"📊 Current pool usage: {active_connections}/{total_connections} connections")
+            
+            # Only cleanup if we have accumulated managers
+            if len(self._db_manager_registry) > 0:
+                await self.cleanup_all_db_managers()
+                
+                # Get stats after cleanup
+                new_stats = self.db_manager.get_pool_stats() if self.db_manager else {}
+                new_active = new_stats.get('pool_info', {}).get('active_connections', 0)
+                
+                self.logger.info(f"✅ Cleanup complete. Active connections reduced from {active_connections} to {new_active}")
+            else:
+                self.logger.info("✅ No database managers to clean up")
+                
+        except Exception as e:
+            self.logger.error(f"Periodic cleanup failed: {e}")
+
+    async def _wait_for_pending_tasks(self, timeout: float = 5.0):
+        """Wait for any pending tasks to complete before closing event loop"""
+        try:
+            import asyncio
+            
+            # Get all pending tasks
+            pending = asyncio.all_tasks(asyncio.get_running_loop())
+            current_task = asyncio.current_task()
+            
+            # Filter out the current task
+            pending = {task for task in pending if task != current_task}
+            
+            if pending:
+                self.logger.debug(f"Waiting for {len(pending)} pending tasks to complete...")
+                
+                # Wait for tasks with timeout
+                done, pending = await asyncio.wait(pending, timeout=timeout, return_when=asyncio.ALL_COMPLETED)
+                
+                if pending:
+                    self.logger.warning(f"{len(pending)} tasks did not complete within timeout, cancelling...")
+                    for task in pending:
+                        task.cancel()
+                    
+                    # Wait a bit more for cancellation
+                    await asyncio.wait(pending, timeout=1.0, return_when=asyncio.ALL_COMPLETED)
+                    
+        except Exception as e:
+            self.logger.error(f"Error waiting for pending tasks: {e}")
 
 
 # =============================================================================

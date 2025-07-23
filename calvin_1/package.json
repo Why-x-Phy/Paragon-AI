@@ -8,11 +8,14 @@
     "install-deps": "npm install"
   },
   "dependencies": {
+    "@coral-xyz/anchor": "^0.31.1",
     "@jup-ag/api": "^6.0.42",
     "@project-serum/anchor": "^0.26.0",
     "@pythnetwork/client": "latest",
     "@pythnetwork/hermes-client": "^2.0.0",
     "@pythnetwork/pyth-solana-receiver": "^0.10.1",
+    "@pythnetwork/solana-utils": "^0.4.5",
+    "@solana/spl-token": "^0.4.13",
     "@solana/web3.js": "^1.95.0",
     "@switchboard-xyz/common": "latest",
     "@switchboard-xyz/on-demand": "latest",

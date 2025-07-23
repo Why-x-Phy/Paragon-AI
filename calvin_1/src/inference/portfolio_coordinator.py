@@ -37,7 +37,7 @@ import json
 # Local imports
 from ..config.config import config
 from ..utils.logger import log
-from .strategy_engine import SimpleStrategyEngine, TradingSignal, SignalType, SignalStrength
+from .strategy_engine import StrategyEngine, TradingSignal, SignalType, SignalStrength
 from .model_registry import get_model_registry
 from ..trading.position_manager import PositionManager, RiskLimits
 from ..database.production_db import get_db_manager
@@ -60,7 +60,7 @@ class PortfolioConfig:
     min_cash_reserve_pct: float = 20.0  # Min cash reserve
     
     # Position sizing based on signal strength (percentage of portfolio value)
-    base_position_size_pct: float = 3.0  # Base position size for weak signals
+    base_position_size_pct: float = 2.0  # Base position size for weak signals
     strong_signal_multiplier: float = 1.5  # Additional % for strong signals
     moderate_signal_multiplier: float = 1.2  # Additional % for moderate signals
     weak_signal_multiplier: float = 0.8  # Additional % for weak signals
@@ -83,7 +83,7 @@ class PortfolioConfig:
     max_drawdown_pct: float = 15.0  # Max portfolio drawdown
     
     # Token management
-    max_concurrent_positions: int = 18  # Max number of open positions
+    max_concurrent_positions: int = 8  # Max number of open positions
     min_liquidity_usdc: float = 1000.0  # Min daily volume for trading
     
     # Portfolio coordination
@@ -145,7 +145,7 @@ class PortfolioCoordinator:
         self.config = config or self._load_config_from_env()
         self.db_manager = db_manager  # Use provided db_manager if available
         self.redis_client = None
-        self.strategy_engine: Optional[SimpleStrategyEngine] = None
+        self.strategy_engine: Optional[StrategyEngine] = None
         self.position_manager: Optional['PositionManager'] = None
         
         # Risk management
@@ -186,7 +186,7 @@ class PortfolioCoordinator:
             min_cash_reserve_pct=100.0 - float(os.getenv('PORTFOLIO_MAX_EXPOSURE_PCT', 80.0)),
             
             # Position sizing based on signal strength
-            base_position_size_pct=float(os.getenv('BASE_POSITION_SIZE_PCT', 5.0)),
+            base_position_size_pct=float(os.getenv('BASE_POSITION_SIZE_PCT', 2.0)),
             strong_signal_multiplier=float(os.getenv('STRONG_SIGNAL_MULTIPLIER', 1.5)),
             moderate_signal_multiplier=float(os.getenv('MODERATE_SIGNAL_MULTIPLIER', 1.2)),
             weak_signal_multiplier=float(os.getenv('WEAK_SIGNAL_MULTIPLIER', 0.8)),
@@ -194,7 +194,7 @@ class PortfolioCoordinator:
             # Portfolio coordination - FIXED: Use signal_strength as default (matches enum)
             allocation_method=AllocationMethod(os.getenv('PORTFOLIO_ALLOCATION_METHOD', 'signal_strength')),
             rebalance_threshold_pct=float(os.getenv('PORTFOLIO_REBALANCE_THRESHOLD_PCT', 5.0)),
-            max_concurrent_positions=int(os.getenv('MAX_CONCURRENT_POSITIONS', 15)),
+            max_concurrent_positions=int(os.getenv('MAX_CONCURRENT_POSITIONS', 8)),
             correlation_limit=float(os.getenv('PORTFOLIO_CORRELATION_LIMIT', 0.7)),
             
             # Signal filtering - Use global config for confidence threshold
@@ -241,9 +241,9 @@ class PortfolioCoordinator:
             else:
                 logger.info("Using provided database manager from scheduler")
             
-            # Initialize strategy engine - it will handle its own thread-local DB
-            from ..inference.strategy_engine import SimpleStrategyEngine
-            self.strategy_engine = SimpleStrategyEngine()
+            # Initialize strategy engine with our thread-local db_manager
+            from ..inference.strategy_engine import get_strategy_engine
+            self.strategy_engine = get_strategy_engine(db_manager=self.db_manager)
             
             # Initialize model registry
             self.model_registry = get_model_registry()
@@ -759,6 +759,26 @@ class PortfolioCoordinator:
             
             # Get current open positions to avoid duplicates
             open_positions = portfolio_state.get('open_positions', {})
+            position_count = portfolio_state.get('position_count', len(open_positions))
+            
+            # Count pending sell signals to calculate expected freed slots
+            sell_signals = [s for s in signals if s.signal_type == SignalType.SELL and s.symbol in open_positions]
+            expected_freed_slots = len(sell_signals)
+            
+            # 🚫 ENFORCE MAX CONCURRENT POSITIONS LIMIT (considering pending sells)
+            effective_position_count = position_count - expected_freed_slots
+            if effective_position_count >= self.config.max_concurrent_positions:
+                logger.warning(f"⚠️ MAX CONCURRENT POSITIONS REACHED: {position_count}/{self.config.max_concurrent_positions}")
+                logger.info(f"   Currently holding: {list(open_positions.keys())}")
+                logger.info(f"   Blocking all new buy signals until positions are closed")
+                return allocations  # Return empty allocations - no new positions allowed
+            
+            # Calculate how many new positions we can open (including expected freed slots)
+            available_position_slots = self.config.max_concurrent_positions - effective_position_count
+            logger.info(f"📊 Position slots: {position_count}/{self.config.max_concurrent_positions} used")
+            if expected_freed_slots > 0:
+                logger.info(f"   📤 Expecting to free {expected_freed_slots} slots from sell signals")
+            logger.info(f"   📥 {available_position_slots} slots available for new positions")
             
             # Filter to actionable signals
             buy_signals = [s for s in signals if s.signal_type == SignalType.BUY]
@@ -771,8 +791,18 @@ class PortfolioCoordinator:
             logger.debug(f"Portfolio value: ${portfolio_value:,.2f}, Available cash: ${available_cash:,.2f}")
             logger.debug(f"Currently holding {len(open_positions)} positions: {list(open_positions.keys())}")
             
+            # Sort buy signals by confidence to prioritize the best ones
+            buy_signals_sorted = sorted(buy_signals, key=lambda s: s.confidence, reverse=True)
+            
+            # Limit buy signals to available position slots
+            if len(buy_signals_sorted) > available_position_slots:
+                logger.info(f"🎯 Limiting {len(buy_signals_sorted)} buy signals to {available_position_slots} available slots")
+                logger.info(f"   Prioritizing by confidence: {[(s.symbol, f'{s.confidence:.2f}') for s in buy_signals_sorted[:available_position_slots]]}")
+                buy_signals_sorted = buy_signals_sorted[:available_position_slots]
+            
             # Calculate position sizes based on signal strength
-            for signal in buy_signals:
+            allocated_count = 0
+            for signal in buy_signals_sorted:
                 try:
                     # 🆕 CHECK IF WE ALREADY HOLD THIS POSITION
                     if signal.symbol in open_positions:
@@ -827,7 +857,15 @@ class PortfolioCoordinator:
                     # Reduce available cash for next allocation
                     available_cash -= target_position_value
                     
+                    # Track successful allocation
+                    allocated_count += 1
+                    
                     logger.debug(f"Allocated {signal.symbol}: {signal.strength.value} signal = {position_pct:.2f}% = ${target_position_value:,.2f}")
+                    
+                    # Check if we've reached the position limit
+                    if position_count + allocated_count >= self.config.max_concurrent_positions:
+                        logger.info(f"🛑 Reached max concurrent positions limit ({self.config.max_concurrent_positions}) - stopping allocations")
+                        break
                     
                 except Exception as e:
                     logger.error(f"Failed to calculate allocation for {signal.symbol}: {e}")

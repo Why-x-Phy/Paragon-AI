@@ -164,6 +164,12 @@ class LunarCrushAPI:
         Returns:
             List of data points with social metrics
         """
+        # Check if this is an excluded infrastructure token
+        excluded_symbols = {'USDC', 'SOL', 'WBTC', 'WETH'}
+        if symbol.upper() in excluded_symbols:
+            logger.warning(f"⚠️  {symbol} is an infrastructure token - skipping LunarCrush API call for performance")
+            return []
+            
         # For large timeframes, split into multiple requests to avoid overwhelming the API
         chunk_size = 20  # Reduced from 30 to better handle rate limits
         all_data = []

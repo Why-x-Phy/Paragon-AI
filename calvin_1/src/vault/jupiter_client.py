@@ -158,7 +158,23 @@ class JupiterV6Client:
         
             # Parse the JSON response
             response_text = stdout.decode().strip()
-            quote_data = json.loads(response_text)
+            stderr_text = stderr.decode().strip()
+            
+            # Debug logging for empty responses
+            if not response_text:
+                logger.error(f"❌ Empty response from Jupiter quote script")
+                if stderr_text:
+                    logger.error(f"❌ Quote script stderr: {stderr_text}")
+                return None
+            
+            try:
+                quote_data = json.loads(response_text)
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Invalid JSON from Jupiter quote script: {e}")
+                logger.error(f"❌ Raw response: {response_text}")
+                if stderr_text:
+                    logger.error(f"❌ Quote script stderr: {stderr_text}")
+                return None
             
             logger.debug(f"✅ Jupiter quote successful in {response_time:.1f}ms")
             return quote_data
@@ -202,6 +218,13 @@ class JupiterV6Client:
             if not all([input_mint, output_mint, amount]):
                 raise ValueError("Missing required trade parameters in quote response")
             
+            # Validate parameters before calling script
+            if not all([input_mint, output_mint, amount, payer_pubkey]):
+                logger.error(f"❌ Missing required parameters for Jupiter script")
+                return None
+            
+            logger.debug(f"🔄 Calling Jupiter script with: {input_mint[:8]}... → {output_mint[:8]}... amount={amount} slippage={slippage_bps}bps")
+            
             # Call Node.js script to generate full swap instruction
             result = await asyncio.create_subprocess_exec(
                 'node', self.script_path,
@@ -226,7 +249,25 @@ class JupiterV6Client:
             
             # Parse the JSON response containing the serialized instruction
             response_text = stdout.decode().strip()
-            instruction_data = json.loads(response_text)
+            stderr_text = stderr.decode().strip()
+            
+            # Debug logging for empty responses
+            if not response_text:
+                logger.error(f"❌ Empty response from Jupiter script")
+                if stderr_text:
+                    logger.error(f"❌ Script stderr: {stderr_text}")
+                return None
+            
+            logger.debug(f"Jupiter script response: {response_text[:200]}...")
+            
+            try:
+                instruction_data = json.loads(response_text)
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Invalid JSON from Jupiter script: {e}")
+                logger.error(f"❌ Raw response: {response_text}")
+                if stderr_text:
+                    logger.error(f"❌ Script stderr: {stderr_text}")
+                return None
             
             # Validate the instruction structure
             required_fields = ['programId', 'data', 'accounts']
@@ -239,6 +280,25 @@ class JupiterV6Client:
                 logger.error(f"❌ Unexpected program ID: {instruction_data['programId']}")
                 return None
             
+            # ✅ EXTRACT SLIPPAGE PROTECTION DATA
+            slippage_protection = instruction_data.get('slippageProtection', {})
+            route_info = instruction_data.get('routeInfo', {})
+            
+            # Extract critical slippage values
+            expected_amount_out = slippage_protection.get('expectedAmountOut', 0)
+            minimum_amount_out = slippage_protection.get('minimumAmountOut', 0)
+            slippage_bps_used = slippage_protection.get('slippageBps', slippage_bps)
+            max_slippage_percent = slippage_protection.get('maxSlippagePercent', slippage_bps / 100)
+            
+            logger.info(f"🔒 Slippage Protection Enabled:")
+            logger.info(f"  - Expected output: {expected_amount_out}")
+            logger.info(f"  - Minimum acceptable: {minimum_amount_out}")
+            logger.info(f"  - Max slippage: {max_slippage_percent}% ({slippage_bps_used} bps)")
+            
+            # Validate slippage protection data
+            if expected_amount_out == 0 or minimum_amount_out == 0:
+                logger.warning("⚠️ Slippage protection data missing - trade may be vulnerable!")
+            
             logger.debug(f"✅ Jupiter instruction generated successfully in {response_time:.1f}ms")
             logger.debug(f"  - Program ID: {instruction_data['programId']}")
             logger.debug(f"  - Accounts: {len(instruction_data['accounts'])}")
@@ -249,7 +309,15 @@ class JupiterV6Client:
                 'accounts': instruction_data['accounts'],
                 'data': instruction_data['data'],  # Base64 encoded - using 'data' key that vault client expects
                 'sdk_generated': True,
-                'generation_time_ms': response_time
+                'generation_time_ms': response_time,
+                # ✅ CRITICAL: Include slippage protection for trade validation
+                'slippage_protection': {
+                    'expected_amount_out': expected_amount_out,
+                    'minimum_amount_out': minimum_amount_out,
+                    'slippage_bps': slippage_bps_used,
+                    'max_slippage_percent': max_slippage_percent
+                },
+                'route_info': route_info
             }
             
         except asyncio.TimeoutError:
@@ -258,6 +326,62 @@ class JupiterV6Client:
         except Exception as e:
             logger.error(f"❌ Jupiter instruction generation error: {e}")
             return None
+
+    def validate_trade_output(self, actual_output: int, instruction_data: Dict) -> bool:
+        """
+        Validate that a trade's actual output meets slippage protection requirements
+        
+        Args:
+            actual_output: The actual amount received from the trade
+            instruction_data: The instruction data from get_swap_transaction()
+            
+        Returns:
+            True if trade meets slippage requirements, False otherwise
+        """
+        try:
+            slippage_protection = instruction_data.get('slippage_protection', {})
+            
+            if not slippage_protection:
+                logger.warning("⚠️ No slippage protection data found - cannot validate trade")
+                return True  # Don't fail trades when protection data is missing
+            
+            expected_amount_out = slippage_protection.get('expected_amount_out', 0)
+            minimum_amount_out = slippage_protection.get('minimum_amount_out', 0)
+            max_slippage_percent = slippage_protection.get('max_slippage_percent', 0)
+            
+            if minimum_amount_out == 0:
+                logger.warning("⚠️ Minimum amount out is 0 - cannot validate slippage")
+                return True
+            
+            # Check if actual output meets minimum requirement
+            meets_minimum = actual_output >= minimum_amount_out
+            
+            # Calculate actual slippage percentage
+            if expected_amount_out > 0:
+                actual_slippage = ((expected_amount_out - actual_output) / expected_amount_out) * 100
+            else:
+                actual_slippage = 0
+            
+            logger.info(f"🔍 Trade Validation:")
+            logger.info(f"  - Expected output: {expected_amount_out}")
+            logger.info(f"  - Actual output: {actual_output}")
+            logger.info(f"  - Minimum required: {minimum_amount_out}")
+            logger.info(f"  - Actual slippage: {actual_slippage:.2f}%")
+            logger.info(f"  - Max allowed slippage: {max_slippage_percent:.2f}%")
+            
+            if meets_minimum:
+                logger.info("✅ Trade output meets slippage protection requirements")
+                return True
+            else:
+                difference = minimum_amount_out - actual_output
+                logger.error(f"❌ Trade failed slippage protection!")
+                logger.error(f"  - Short by: {difference} tokens")
+                logger.error(f"  - Actual slippage: {actual_slippage:.2f}% > {max_slippage_percent:.2f}% max")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Error validating trade output: {e}")
+            return False
 
     async def close(self):
         """Close the client (no persistent connections to close)"""

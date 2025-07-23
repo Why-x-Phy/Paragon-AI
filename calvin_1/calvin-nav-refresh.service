@@ -1,0 +1,37 @@
+[Unit]
+Description=Calvin AI NAV Refresh Service
+Documentation=https://github.com/calvinai/vault
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/CalvinAI-2/calvin_1
+
+# Environment variables
+Environment="NODE_ENV=production"
+Environment="SOLANA_RPC_URL=https://api.mainnet-beta.solana.com"
+Environment="CALVIN_KEYPAIR_PATH=/home/ubuntu/CalvinAI-2/onchain/calvin-ai-authority.json"
+
+# Node.js execution
+ExecStart=/usr/bin/node /home/ubuntu/CalvinAI-2/calvin_1/nav_refresh_service.js
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=calvin-nav-refresh
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/ubuntu/CalvinAI-2
+
+[Install]
+WantedBy=multi-user.target 

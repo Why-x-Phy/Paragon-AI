@@ -20,7 +20,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 import time
 
-from ..data.websocket_feed import BirdEyeWebSocketFeed, ConnectionConfig, PriceSubscription, PriceUpdate, ConnectionState
 from ..trading.position_manager import PositionManager
 from ..trading.position_sync import auto_sync_on_startup
 from ..database.production_db import PositionData
@@ -28,6 +27,7 @@ from .vault_client import VaultClient
 from ..config.config import config
 from ..utils.logger import log
 from ..database.production_db import get_db_manager
+from ..pyth.pyth_sse_client import PythSSEClient, PriceUpdate as PythPriceUpdate, ConnectionState
 
 logger = log
 
@@ -36,6 +36,8 @@ class EmergencyType(Enum):
     """Types of emergency conditions"""
     INDIVIDUAL_STOP_LOSS = "individual_stop_loss"
     PORTFOLIO_STOP_LOSS = "portfolio_stop_loss"
+    INDIVIDUAL_TAKE_PROFIT = "individual_take_profit"
+    PORTFOLIO_TAKE_PROFIT = "portfolio_take_profit"
     VOLATILITY_SPIKE = "volatility_spike"
     DRAWDOWN_LIMIT = "drawdown_limit"
     MANUAL_TRIGGER = "manual_trigger"
@@ -47,6 +49,10 @@ class EmergencyThresholds:
     # Stop loss thresholds
     portfolio_stop_loss_pct: float = -15.0    # -15% portfolio loss
     individual_stop_loss_pct: float = -25.0   # -25% individual position loss
+    
+    # Take profit thresholds
+    portfolio_take_profit_pct: float = 25.0   # 25% portfolio profit (aggressive)
+    individual_take_profit_pct: float = 10.0  # 10% individual position profit (default)
     
     # Volatility thresholds
     volatility_stop_multiplier: float = 3.0   # 3x daily volatility
@@ -121,12 +127,25 @@ class EmergencyStopLossMonitor:
     """
     
     def __init__(self, thresholds: Optional[EmergencyThresholds] = None):
-        self.thresholds = thresholds or EmergencyThresholds()
+        # Load thresholds from environment if not provided
+        if not thresholds:
+            thresholds = EmergencyThresholds()
+            # Override with environment variables if available
+            if hasattr(config, 'TAKE_PROFIT_PCT'):
+                thresholds.individual_take_profit_pct = float(config.TAKE_PROFIT_PCT)
+            if hasattr(config, 'PORTFOLIO_TAKE_PROFIT_PCT'):
+                thresholds.portfolio_take_profit_pct = float(config.PORTFOLIO_TAKE_PROFIT_PCT)
+            if hasattr(config, 'STOP_LOSS_PCT'):
+                thresholds.individual_stop_loss_pct = -abs(float(config.STOP_LOSS_PCT))
+            if hasattr(config, 'PORTFOLIO_STOP_LOSS_PCT'):
+                thresholds.portfolio_stop_loss_pct = -abs(float(config.PORTFOLIO_STOP_LOSS_PCT))
+        
+        self.thresholds = thresholds
         
         # Core components
         self.position_manager = PositionManager()
         self.vault_client = None  # Will be initialized in initialize() method
-        self.websocket_feed: Optional[BirdEyeWebSocketFeed] = None
+        self.pyth_client: Optional[PythSSEClient] = None
         self.db_manager = None
         
         # Monitoring state
@@ -154,8 +173,9 @@ class EmergencyStopLossMonitor:
             'max_drawdown_today': 0.0
         }
         
-        logger.info("Emergency Stop Loss Monitor initialized")
-        logger.info(f"📊 Thresholds: Portfolio stop loss: {self.thresholds.portfolio_stop_loss_pct}%, Individual: {self.thresholds.individual_stop_loss_pct}%")
+        logger.info("Emergency Stop Loss & Take Profit Monitor initialized")
+        logger.info(f"📊 Stop Loss Thresholds: Portfolio: {self.thresholds.portfolio_stop_loss_pct}%, Individual: {self.thresholds.individual_stop_loss_pct}%")
+        logger.info(f"💰 Take Profit Thresholds: Portfolio: {self.thresholds.portfolio_take_profit_pct}%, Individual: {self.thresholds.individual_take_profit_pct}%")
 
     async def initialize(self):
         """Initialize emergency monitoring components"""
@@ -384,16 +404,16 @@ class EmergencyStopLossMonitor:
             except Exception as e:
                 issues.append(f"Vault client error: {e}")
             
-            # Check WebSocket feed
-            if self.websocket_feed:
+            # Check Pyth SSE client
+            if self.pyth_client:
                 try:
-                    connection_state = getattr(self.websocket_feed, 'connection_state', None)
+                    connection_state = getattr(self.pyth_client, 'connection_state', None)
                     if connection_state != ConnectionState.CONNECTED:
-                        issues.append(f"WebSocket not connected: {connection_state}")
+                        issues.append(f"Pyth SSE not connected: {connection_state}")
                 except Exception as e:
-                    issues.append(f"WebSocket state check error: {e}")
+                    issues.append(f"Pyth SSE state check error: {e}")
             else:
-                issues.append("WebSocket feed not available")
+                issues.append("Pyth SSE client not available")
                 
         except Exception as e:
             issues.append(f"Startup validation error: {e}")
@@ -439,9 +459,9 @@ class EmergencyStopLossMonitor:
             try:
                 await asyncio.sleep(self.thresholds.health_check_interval)
                 
-                # Check WebSocket connection health
-                if self.websocket_feed and self.websocket_feed.connection_state != ConnectionState.CONNECTED:
-                    logger.warning("⚠️ WebSocket connection not healthy - attempting reconnect")
+                # Check Pyth SSE connection health
+                if self.pyth_client and self.pyth_client.connection_state != ConnectionState.CONNECTED:
+                    logger.warning("⚠️ Pyth SSE connection not healthy - may need reconnection")
                 
                 # Check database connectivity
                 if self.db_manager:
@@ -487,26 +507,34 @@ class EmergencyStopLossMonitor:
                 logger.error(f"❌ Statistics update error: {e}")
                 await asyncio.sleep(60)  # Continue despite errors
 
-    async def _on_price_update(self, price_update: PriceUpdate):
-        """Handle incoming price updates from WebSocket"""
+    async def _on_price_update(self, price_update: PythPriceUpdate):
+        """Handle incoming price updates from Pyth SSE"""
         try:
             symbol = price_update.symbol
-            current_price = price_update.close_price
+            current_price = price_update.price
             
             # Update position monitor
             if symbol in self.position_monitors:
                 self.position_monitors[symbol].update_price(current_price)
                 
-                # Check individual position stop loss
+                # Check individual position stop loss and take profit
                 await self._check_individual_stop_loss(symbol)
                 
                 self.stats['price_updates_processed'] += 1
+                
+                # Log price updates periodically
+                if self.stats['price_updates_processed'] % 10 == 0:
+                    logger.info(f"💰 Emergency monitor processed {self.stats['price_updates_processed']} Pyth price updates")
             
         except Exception as e:
-            logger.error(f"❌ Error processing price update for {price_update.symbol}: {e}")
+            logger.error(f"❌ Error processing price update for {getattr(price_update, 'symbol', 'unknown')}: {e}")
+    
+    def _on_pyth_error(self, error: Exception):
+        """Handle Pyth SSE errors"""
+        logger.error(f"❌ Pyth SSE error in emergency monitoring: {error}")
 
     async def _check_individual_stop_loss(self, symbol: str):
-        """Check if individual position hits stop loss threshold"""
+        """Check if individual position hits stop loss or take profit threshold"""
         try:
             monitor = self.position_monitors.get(symbol)
             if not monitor:
@@ -529,6 +557,23 @@ class EmergencyStopLossMonitor:
                 # Execute emergency exit
                 await self._execute_emergency_exit(event, monitor)
                 
+            # Check take profit threshold
+            elif monitor.unrealized_pnl_pct >= self.thresholds.individual_take_profit_pct:
+                logger.critical(f"💰 INDIVIDUAL TAKE PROFIT TRIGGERED: {symbol} at {monitor.unrealized_pnl_pct:.2f}%")
+                
+                # Create take profit event
+                event = EmergencyEvent(
+                    timestamp=datetime.utcnow(),
+                    event_type=EmergencyType.INDIVIDUAL_TAKE_PROFIT,
+                    symbol=symbol,
+                    trigger_value=monitor.unrealized_pnl_pct,
+                    threshold_value=self.thresholds.individual_take_profit_pct,
+                    action_taken="take_profit_exit_requested"
+                )
+                
+                # Execute take profit exit (liquidate entire position)
+                await self._execute_emergency_exit(event, monitor)
+                
         except Exception as e:
             logger.error(f"❌ Individual stop loss check failed for {symbol}: {e}")
 
@@ -546,11 +591,12 @@ class EmergencyStopLossMonitor:
                 await asyncio.sleep(60)
 
     async def _check_portfolio_stop_loss(self):
-        """Check portfolio-level stop loss conditions"""
+        """Check portfolio-level stop loss and take profit conditions"""
         try:
             # Calculate current portfolio P&L
             portfolio_pnl = await self._calculate_portfolio_pnl()
             
+            # Check stop loss
             if portfolio_pnl <= self.thresholds.portfolio_stop_loss_pct:
                 logger.critical(f"🚨 PORTFOLIO EMERGENCY STOP LOSS: {portfolio_pnl:.2f}%")
                 
@@ -568,8 +614,26 @@ class EmergencyStopLossMonitor:
                 # Execute portfolio emergency exit
                 await self._execute_portfolio_emergency_exit(event)
                 
+            # Check take profit
+            elif portfolio_pnl >= self.thresholds.portfolio_take_profit_pct:
+                logger.critical(f"💰 PORTFOLIO TAKE PROFIT TRIGGERED: {portfolio_pnl:.2f}%")
+                
+                # Create take profit event
+                event = EmergencyEvent(
+                    timestamp=datetime.utcnow(),
+                    event_type=EmergencyType.PORTFOLIO_TAKE_PROFIT,
+                    symbol="PORTFOLIO",
+                    trigger_value=portfolio_pnl,
+                    threshold_value=self.thresholds.portfolio_take_profit_pct,
+                    action_taken="portfolio_take_profit_exit_requested",
+                    portfolio_impact=portfolio_pnl
+                )
+                
+                # Execute portfolio take profit exit (liquidate all positions)
+                await self._execute_portfolio_emergency_exit(event)
+                
         except Exception as e:
-            logger.error(f"❌ Portfolio stop loss check failed: {e}")
+            logger.error(f"❌ Portfolio stop loss/take profit check failed: {e}")
 
     async def _check_volatility_conditions(self):
         """Check for excessive volatility conditions"""
@@ -608,7 +672,9 @@ class EmergencyStopLossMonitor:
                 return
             
             # Execute emergency exit via vault client
-            logger.critical(f"🚨 Executing emergency exit for {event.symbol}...")
+            exit_type = "TAKE PROFIT" if "take_profit" in event.event_type.value else "STOP LOSS"
+            exit_emoji = "💰" if "take_profit" in event.event_type.value else "🚨"
+            logger.critical(f"{exit_emoji} Executing {exit_type} exit for {event.symbol}...")
             
             tx_sig = await self.vault_client.emergency_exit_position(
                 event.symbol, 
@@ -618,8 +684,8 @@ class EmergencyStopLossMonitor:
             if tx_sig:
                 self.emergency_exits_today += 1
                 event.transaction_signature = tx_sig
-                event.action_taken = "emergency_exit_executed"
-                logger.critical(f"✅ Emergency exit executed: {event.symbol} - {tx_sig}")
+                event.action_taken = f"{exit_type.lower()}_exit_executed"
+                logger.critical(f"✅ {exit_type} exit executed: {event.symbol} - {tx_sig}")
                 
                 # Remove from monitoring (position closed)
                 del self.position_monitors[event.symbol]
@@ -706,16 +772,34 @@ class EmergencyStopLossMonitor:
         logger.info(f"📊 Setup {len(self.position_monitors)} position monitors")
 
     async def _subscribe_to_position_prices(self):
-        """Subscribe to WebSocket price feeds for all positions"""
-        # ⚠️ DISABLED: WebSocket subscriptions are now handled centrally by DualWebSocketFeedManager
-        # The emergency monitor receives price updates via the main system's price relay
-        logger.info("📡 Emergency monitor using centralized WebSocket feeds (no individual subscriptions needed)")
-        
-        # Just mark all position symbols as "subscribed" since they get data via relay
-        for symbol in self.position_monitors.keys():
-            self.subscribed_tokens.add(symbol)
-        
-        logger.info(f"📡 Emergency monitor ready to receive price updates for {len(self.subscribed_tokens)} tokens")
+        """Subscribe to Pyth SSE price feeds for all positions"""
+        try:
+            logger.info("📡 Starting Pyth SSE price feeds for emergency monitoring...")
+            
+            # Initialize Pyth SSE client
+            self.pyth_client = PythSSEClient()
+            await self.pyth_client.initialize()
+            
+            # Subscribe to position symbols
+            symbols = list(self.position_monitors.keys())
+            if symbols:
+                await self.pyth_client.subscribe_to_symbols(symbols)
+                
+                # Add callbacks for price updates
+                self.pyth_client.add_price_callback(self._on_price_update)
+                self.pyth_client.add_error_callback(self._on_pyth_error)
+                
+                # Start streaming
+                await self.pyth_client.start()
+                
+                self.subscribed_tokens.update(symbols)
+                logger.info(f"📡 Emergency monitor subscribed to {len(symbols)} tokens via Pyth SSE")
+            else:
+                logger.warning("⚠️ No positions to monitor")
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to start Pyth SSE feeds: {e}")
+            # Continue without price feeds rather than failing completely
 
     async def _get_vault_positions(self) -> Dict[str, PositionData]:
         """Get current vault positions from position manager (synced with vault)"""
@@ -930,9 +1014,9 @@ class EmergencyStopLossMonitor:
             'is_monitoring': self.is_monitoring,
             'last_portfolio_check': self.last_portfolio_check.isoformat() if self.last_portfolio_check else None,
             'last_health_check': self.last_health_check.isoformat() if self.last_health_check else None,
-            'websocket_connected': (
-                self.websocket_feed.connection_state == ConnectionState.CONNECTED 
-                if self.websocket_feed else False
+            'pyth_sse_connected': (
+                self.pyth_client.connection_state == ConnectionState.CONNECTED 
+                if self.pyth_client else False
             )
         }
 
@@ -980,13 +1064,13 @@ class EmergencyStopLossMonitor:
         self.is_monitoring = False
         
         try:
-            # Stop WebSocket feed
-            if self.websocket_feed:
+            # Stop Pyth SSE client
+            if self.pyth_client:
                 try:
-                    await self.websocket_feed.stop()
-                    logger.info("✅ WebSocket feed stopped")
+                    await self.pyth_client.stop()
+                    logger.info("✅ Pyth SSE client stopped")
                 except Exception as e:
-                    logger.warning(f"Error stopping WebSocket feed: {e}")
+                    logger.warning(f"Error stopping Pyth SSE client: {e}")
             
             # Close database connections
             if self.db_manager:

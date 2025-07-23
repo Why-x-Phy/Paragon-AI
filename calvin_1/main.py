@@ -95,7 +95,7 @@ class CalvinVaultSystem:
             self.emergency_monitor = EmergencyStopLossMonitor()
             await self.emergency_monitor.initialize()
             # Note: WebSocket price updates will be relayed from main manager
-            logger.warning("⚠️ Emergency monitor running without WebSocket feeds (price monitoring disabled)")
+            logger.warning("⚠️ Emergency monitor initialized - Pyth SSE feeds will start when positions are detected")
             
             logger.info("✅ Emergency monitoring initialized")
             
@@ -217,16 +217,8 @@ class CalvinVaultSystem:
                     logger.info("⏳ Waiting for WebSocket manager to initialize...")
                     await asyncio.sleep(1)
                 
-                if self.websocket_manager:
-                    # Create wrapper to adapt the signature
-                    async def price_handler_wrapper(symbol: str, price_update):
-                        await self.emergency_monitor._on_price_update(price_update)
-                    
-                    # Register the handler
-                    self.websocket_manager.add_price_handler(price_handler_wrapper)
-                    logger.info("✅ Emergency monitor price handler registered with WebSocket feed")
-                else:
-                    logger.error("❌ WebSocket manager not available after 30s - emergency monitor will not receive price updates")
+                # DISABLED: Emergency monitor now uses Pyth SSE instead of WebSocket relay
+                logger.info("📡 Emergency monitor will use Pyth SSE for price updates (WebSocket relay disabled)")
                 
                 # Start monitoring
                 await self.emergency_monitor.start_monitoring()
@@ -234,13 +226,9 @@ class CalvinVaultSystem:
             logger.error(f"❌ Emergency monitoring startup failed: {e}")
 
     async def _relay_price_to_emergency_monitor(self, symbol: str, price_update):
-        """Relay price updates from websocket manager to emergency monitor"""
-        try:
-            if self.emergency_monitor and hasattr(self.emergency_monitor, '_on_price_update'):
-                # The emergency monitor expects a PriceUpdate object directly
-                await self.emergency_monitor._on_price_update(price_update)
-        except Exception as e:
-            logger.error(f"❌ Error relaying price update to emergency monitor: {e}")
+        """[DISABLED] Relay price updates from websocket manager to emergency monitor"""
+        # Emergency monitor now uses Pyth SSE directly
+        pass
 
     async def _comprehensive_health_check(self):
         """Enhanced system health check with all components"""
@@ -1223,7 +1211,6 @@ async def plot_price_comparison_cmd(args: Dict[str, Any]) -> None:
     ml_model.plot_price_comparison(y_test_orig, y_pred_orig, output_file)
     
     logger.info(f"Price comparison plot generated: {output_file}")
-
 
 def run_api_server(args: Dict[str, Any]) -> None:
     """Run the Calvin AI Trades API server for frontend integration"""

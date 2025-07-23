@@ -121,7 +121,7 @@ async def execute_liquidation(vault_client, jupiter_client, token_mint: str, tok
             input_mint=token_mint,
             output_mint=USDC_MINT,
             amount=token_amount_lamports,
-            slippage_bps=300,  # 3% slippage
+            slippage_bps=50,  # 3% slippage
             payer_pubkey=vault_authority_pda_str
         )
         
@@ -147,7 +147,7 @@ async def execute_liquidation(vault_client, jupiter_client, token_mint: str, tok
         swap_data = await jupiter_client.get_swap_transaction(
             quote_response=quote_response,
             payer_pubkey=vault_authority_pda_str,
-            slippage_bps=300
+            slippage_bps=50
         )
         
         if not swap_data:
@@ -174,6 +174,50 @@ async def execute_liquidation(vault_client, jupiter_client, token_mint: str, tok
         print(f"  - Transaction: {trade_result}")
         print(f"  - Sold: {token_balance_human:.6f} {token_info['symbol']}")
         print(f"  - Expected USDC: ${output_usdc:,.2f}")
+        
+        # Check and collect performance fees
+        print(f"\n💰 Processing performance fees...")
+        
+        # Force NAV calculation using the dedicated script
+        # It uses the same logic as the NAV service but forces an update
+        print(f"  📊 Calculating fresh NAV...")
+        
+        import subprocess
+        import os
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'force_nav_update.js')
+        
+        nav_process = subprocess.run(
+            ['node', script_path],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if nav_process.returncode == 0:
+            print(f"  ✅ NAV calculated successfully")
+            
+            # Now attempt to collect performance fees
+            print(f"  💸 Attempting to collect performance fees...")
+            fees_result = await vault_client.collect_performance_fees()
+            
+            if fees_result:
+                print(f"  ✅ Performance fees collected: {fees_result}")
+                
+                # Get vault info to show what happened
+                vault_account = await vault_client.get_vault_account()
+                if vault_account:
+                    nav = vault_account.get('cached_nav', 0) / 1_000_000
+                    hwm = vault_account.get('high_water_mark_nav', 0) / 1_000_000
+                    print(f"  📈 New NAV: ${nav:,.2f}")
+                    print(f"  📏 New HWM: ${hwm:,.2f}")
+            else:
+                print(f"  ℹ️ No performance fees collected (NAV may be below HWM)")
+        else:
+            print(f"  ❌ Failed to calculate NAV")
+            if nav_process.stderr:
+                print(f"  Error: {nav_process.stderr}")
+            if nav_process.stdout:
+                print(f"  Output: {nav_process.stdout}")
         
         return {
             'transaction_signature': trade_result,
@@ -243,7 +287,7 @@ Examples:
         from solders.keypair import Keypair
         import os
         
-        rpc_url = os.getenv('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
+        rpc_url = 'https://mainnet.helius-rpc.com/?api-key=acfda155-4d7f-4930-8ac4-ddd9eebfb70d'
         connection = AsyncClient(rpc_url)
         
         vault_program_id = os.getenv('CALVIN_VAULT_PROGRAM_ID')
@@ -340,7 +384,7 @@ Examples:
                             fee_usdc=0.0,  # Could calculate from price impact
                             tx_hash=result['transaction_signature'],
                             execution_time=datetime.utcnow(),
-                            slippage_bps=300,  # We used 3% slippage
+                            slippage_bps=50,  # We used 3% slippage
                             dex_name='jupiter',
                             processing_time_ms=result.get('execution_time_ms', 0),
                             

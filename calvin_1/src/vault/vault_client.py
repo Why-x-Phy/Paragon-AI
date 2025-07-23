@@ -349,6 +349,15 @@ class VaultClient:
             
             if signature:
                 logger.info(f"✅ Trade executed successfully: {signature}")
+                
+                # Check if we traded TO USDC (selling tokens for USDC)
+                # Performance fees are only collected on profitable USDC exits
+                if destination_mint == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v":  # USDC mint
+                    logger.info("💰 Trade resulted in USDC, checking performance fees...")
+                    
+                    # Force NAV calculation and collect fees
+                    await self._process_performance_fees_after_trade()
+                
                 return signature
             else:
                 raise Exception("Trade execution failed - no signature returned")
@@ -413,78 +422,18 @@ class VaultClient:
             # Build accounts dictionary in exact Trade struct order
             accounts = await self._build_anchor_accounts_dict(input_mint, output_mint)
             
-            # The vault expects remaining_accounts to contain oracle data for ALL whitelisted tokens,
-            # not just the two being traded. Since we don't know which tokens are whitelisted,
-            # The vault has oracle accounts in main instruction (sourcePriceAccount, destinationPriceAccount)
-            # which should be sufficient for the trade itself.
+            # Since oracle accounts have been removed from the Trade instruction,
+            # remaining_accounts now only contains Jupiter accounts
             
             remaining_accounts = []
             
             logger.info(f"📊 AnchorPy trade setup:")
             logger.info(f"  - Accounts: {len(accounts)} main instruction accounts")
-            logger.info(f"  - Oracle groups: {len(unique_oracle_tokens)} tokens × 3 = {len(unique_oracle_tokens) * 3} oracle accounts")
-            logger.info(f"  - Jupiter accounts: {min(len(jupiter_accounts), 10)} accounts")
-            logger.info(f"  - Total remaining: {len(remaining_accounts)} accounts")
+            logger.info(f"  - Jupiter accounts: {len(jupiter_accounts)} accounts")
             logger.info(f"  - Swap data: {len(swap_data)} bytes")
             
-            # Add oracle accounts for the tokens the vault holds (4 tokens based on logs showing 12 oracle accounts)
-            # We need to provide oracle data for the tokens the vault currently holds
-            vault_authority_pda = self._get_vault_authority_pda()
-            
-            # Based on the logs showing 12 oracle accounts (4 tokens × 3), let's provide oracle data for 4 common tokens
-            # Use tokens the vault actually holds, not SOL
-            oracle_tokens = [
-                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC (vault always holds this)
-                input_mint,   # Source token
-                output_mint,  # Destination token  
-                "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK (common vault holding)
-            ]
-            
-            # Remove duplicates while preserving order
-            unique_oracle_tokens = []
-            seen = set()
-            for token in oracle_tokens:
-                if token not in seen:
-                    unique_oracle_tokens.append(token)
-                    seen.add(token)
-            
-            # Add 4th token if we only have 3 unique tokens
-            if len(unique_oracle_tokens) == 3:
-                # Add a common token that the vault likely holds
-                common_tokens = [
-                    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-                    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",   # JUP
-                ]
-                for token in common_tokens:
-                    if token not in seen:
-                        unique_oracle_tokens.append(token)
-                        break
-            
-            # Build oracle account groups using modern pull oracle approach (3 accounts per token)
-            oracle_accounts_dict = await self.get_oracle_accounts_for_tokens(unique_oracle_tokens[:4])
-            
-            for token_mint in unique_oracle_tokens[:4]:  # Limit to 4 tokens
-                try:
-                    # Get token account, oracle, and mint for this token
-                    token_account = self._get_vault_token_account(token_mint, vault_authority_pda)
-                    oracle_account = oracle_accounts_dict.get(token_mint)
-                    mint_account = Pubkey.from_string(token_mint)
-                    
-                    if oracle_account:
-                        # Add the 3-account group
-                        remaining_accounts.extend([
-                            {"pubkey": token_account, "is_signer": False, "is_writable": False},
-                            {"pubkey": oracle_account, "is_signer": False, "is_writable": False},
-                            {"pubkey": mint_account, "is_signer": False, "is_writable": False},
-                        ])
-                    else:
-                        logger.warning(f"⚠️ No oracle account created for {token_mint}")
-                    
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to add oracle group for {token_mint[:8]}...: {e}")
-            
-            # Add Jupiter accounts after oracle accounts - DON'T LIMIT THEM
-            for acc in jupiter_accounts:  # Use ALL Jupiter accounts
+            # Add Jupiter accounts to remaining_accounts
+            for acc in jupiter_accounts:
                 if isinstance(acc, dict):
                     remaining_accounts.append({
                         "pubkey": Pubkey.from_string(acc.get('pubkey', '')),
@@ -492,12 +441,7 @@ class VaultClient:
                         "is_writable": acc.get('isWritable', False)
                     })
             
-            logger.info(f"📊 AnchorPy trade setup:")
-            logger.info(f"  - Accounts: {len(accounts)} main instruction accounts")
-            logger.info(f"  - Oracle groups: {len(unique_oracle_tokens)} tokens × 3 = {len(unique_oracle_tokens) * 3} oracle accounts")
-            logger.info(f"  - Jupiter accounts: {len(jupiter_accounts)} accounts (ALL included)")
-            logger.info(f"  - Total remaining: {len(remaining_accounts)} accounts")
-            logger.info(f"  - Swap data: {len(swap_data)} bytes")
+            logger.info(f"📊 Remaining accounts: {len(remaining_accounts)} Jupiter accounts")
             
             # Execute the trade using AnchorPy
             signature = await program.rpc["trade"](
@@ -545,15 +489,7 @@ class VaultClient:
             input_whitelist_pda = self._get_token_whitelist_pda(vault_pda, input_mint)
             output_whitelist_pda = self._get_token_whitelist_pda(vault_pda, output_mint)
             
-            # Get oracle accounts using modern pull oracle approach
-            oracle_accounts = await self.get_oracle_accounts_for_tokens([input_mint, output_mint])
-            input_oracle = oracle_accounts.get(input_mint)
-            output_oracle = oracle_accounts.get(output_mint)
-            
-            if not input_oracle or not output_oracle:
-                raise Exception(f"Failed to create oracle accounts for tokens: {input_mint}, {output_mint}")
-            
-            # Build accounts dict in exact Trade struct order
+            # Build accounts dict in exact Trade struct order (oracle accounts removed)
             accounts = {
                 "authority": self.authority_keypair.pubkey(),
                 "vault": vault_pda,
@@ -565,8 +501,6 @@ class VaultClient:
                 "vaultAuthority": vault_authority_pda,
                 "sourceTokenWhitelist": input_whitelist_pda,
                 "destinationTokenWhitelist": output_whitelist_pda,
-                "sourcePriceAccount": input_oracle,
-                "destinationPriceAccount": output_oracle,
                 "jupiterProgram": Pubkey.from_string("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"),
                 "tokenProgram": Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
                 "treasuryUsdcToken": treasury_usdc_account,
@@ -977,6 +911,45 @@ class VaultClient:
                 'bump': vault_bump  # Legacy field name
             }
             
+            # Try to read new NAV caching fields if present
+            # These were added after the initial struct, so they might not exist in older vaults
+            try:
+                # Skip emergency owners and CPI tracking to get to cached_nav
+                # emergency_owners: [Pubkey; 2] = 64 bytes
+                # emergency_owners_count: u8 = 1 byte
+                # required_signatures: u8 = 1 byte
+                # next_operation_id: u64 = 8 bytes
+                # cpi_call_counts: [CpiCallTracker; 2] = 152 bytes (76 * 2)
+                # cpi_trackers_count: u8 = 1 byte
+                # Total to skip = 64 + 1 + 1 + 8 + 152 + 1 = 227 bytes
+                
+                # Ensure we have enough data
+                if len(data) >= offset + 227 + 16:  # 227 to skip + 16 for cached_nav and nav_last_updated
+                    offset += 227  # Skip to cached_nav
+                    
+                    # u64: cached_nav (8 bytes, little-endian)
+                    cached_nav = struct.unpack('<Q', data[offset:offset+8])[0]
+                    offset += 8
+                    
+                    # i64: nav_last_updated (8 bytes, little-endian)
+                    nav_last_updated = struct.unpack('<q', data[offset:offset+8])[0]
+                    offset += 8
+                    
+                    decoded_data['cached_nav'] = cached_nav
+                    decoded_data['nav_last_updated'] = nav_last_updated
+                    
+                    logger.debug(f"✅ Read NAV cache fields: cached_nav={cached_nav}, nav_last_updated={nav_last_updated}")
+                else:
+                    # Use defaults for older vaults
+                    decoded_data['cached_nav'] = 0
+                    decoded_data['nav_last_updated'] = 0
+                    logger.debug("ℹ️ NAV cache fields not present (older vault version)")
+                    
+            except Exception as e:
+                logger.debug(f"Could not read NAV cache fields: {e}")
+                decoded_data['cached_nav'] = 0
+                decoded_data['nav_last_updated'] = 0
+            
             logger.debug(f"✅ Decoded vault data: shares={total_shares}, paused={paused}, trading_paused={trading_paused}")
             return decoded_data
             
@@ -1366,12 +1339,6 @@ class VaultClient:
             input_whitelist_pda = self._get_token_whitelist_pda(vault_pda, input_mint)
             output_whitelist_pda = self._get_token_whitelist_pda(vault_pda, output_mint)
             
-            # Get oracle accounts
-            input_oracle = await self._get_oracle_account(input_mint)
-            output_oracle = await self._get_oracle_account(output_mint)
-            
-            logger.debug(f"🔮 Using oracles: source={input_oracle}, dest={output_oracle}")
-            
             # **OPTIMIZATION: Reduce Jupiter transaction data size**
             # Handle Jupiter data - it might be a dict, string, or bytes
             if isinstance(jupiter_transaction_data, str):
@@ -1405,14 +1372,6 @@ class VaultClient:
             input_mint_pubkey = Pubkey.from_string(input_mint)
             output_mint_pubkey = Pubkey.from_string(output_mint)
             
-            # Check if oracles are the same (common for round-trip trades)
-            oracle_accounts_unique = []
-            if input_oracle != output_oracle:
-                oracle_accounts_unique = [input_oracle, output_oracle]
-            else:
-                oracle_accounts_unique = [input_oracle]  # De-duplicate same oracle
-                logger.debug("🔧 De-duplicated identical oracles")
-            
             # Check if whitelist PDAs are the same (shouldn't happen but check anyway)
             whitelist_accounts_unique = []
             if input_whitelist_pda != output_whitelist_pda:
@@ -1434,9 +1393,9 @@ class VaultClient:
             ]
             
             # **CRITICAL FIX**: Build accounts in EXACT order from Trade struct
-            # This follows the Anchor specification exactly as shown in the guidance
+            # This follows the Anchor specification exactly (oracle accounts removed)
             dynamic_vault_accounts = [
-                # EXACT Trade struct order (from the Anchor guidance):
+                # EXACT Trade struct order (updated after removing oracle accounts):
                 AccountMeta(pubkey=self.authority_keypair.pubkey(), is_signer=True, is_writable=True),   # authority
                 AccountMeta(pubkey=vault_pda, is_signer=False, is_writable=True),                        # vault  
                 AccountMeta(pubkey=vault_usdc_account, is_signer=False, is_writable=True),               # vault_usdc_token
@@ -1447,14 +1406,12 @@ class VaultClient:
                 AccountMeta(pubkey=vault_authority_pda, is_signer=False, is_writable=False),             # vault_authority
                 AccountMeta(pubkey=input_whitelist_pda, is_signer=False, is_writable=False),             # source_token_whitelist
                 AccountMeta(pubkey=output_whitelist_pda, is_signer=False, is_writable=False),            # destination_token_whitelist
-                AccountMeta(pubkey=input_oracle, is_signer=False, is_writable=False),                    # source_price_account
-                AccountMeta(pubkey=output_oracle, is_signer=False, is_writable=False),                   # destination_price_account
                 AccountMeta(pubkey=Pubkey.from_string("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"), is_signer=False, is_writable=False),  # jupiter_program
                 AccountMeta(pubkey=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), is_signer=False, is_writable=False),   # token_program
                 AccountMeta(pubkey=treasury_usdc_account, is_signer=False, is_writable=True),            # treasury_usdc_token
             ]
             
-            logger.info(f"✅ Built accounts in EXACT Trade struct order (15 accounts)")
+            logger.info(f"✅ Built accounts in EXACT Trade struct order (13 accounts)")
             
             logger.info(f"🚀 ALT OPTIMIZATION:")
             logger.info(f"   - Static accounts (ALT): {len(static_alt_accounts)} accounts = {len(static_alt_accounts) * 32} bytes saved")
@@ -1465,8 +1422,8 @@ class VaultClient:
             vault_accounts = dynamic_vault_accounts
             final_vault_accounts = vault_accounts  # Initialize for ALT optimization
             
-            logger.debug(f"🔧 OPTIMIZED: Reduced vault accounts from 15 to {len(vault_accounts)}")
-            logger.debug(f"   - Saved {(15 - len(vault_accounts)) * 32} bytes from account deduplication")
+            logger.debug(f"🔧 OPTIMIZED: Reduced vault accounts from 13 to {len(vault_accounts)}")
+            logger.debug(f"   - Saved {(13 - len(vault_accounts)) * 32} bytes from account deduplication")
             
             # **CRITICAL FIX: Jupiter needs ALL its accounts to function properly**
             # Don't truncate Jupiter accounts - the swap will fail without them
@@ -1483,74 +1440,11 @@ class VaultClient:
             # Convert essential Jupiter accounts to remaining_accounts format
             remaining_accounts = []
             
-            # **SIMPLE FIX**: Only include oracle accounts for the exact trading pair
-            # For USDC → TOKEN swap, we only need 2 tokens worth of oracle data
+            # Since oracle accounts have been removed from the Trade instruction,
+            # remaining_accounts now only contains Jupiter accounts
+            logger.info(f"📊 Building remaining_accounts with Jupiter accounts only")
             
-            oracle_tokens = []
-            
-            # Add source token (input_mint) 
-            oracle_tokens.append(input_mint)
-            
-            # Add destination token (output_mint) if different
-            if output_mint != input_mint:
-                oracle_tokens.append(output_mint)
-                
-            logger.info(f"📊 Oracle data for exact trading pair only: {len(oracle_tokens)} tokens")
-            logger.info(f"   - Source: {input_mint[:8]}... ")
-            logger.info(f"   - Destination: {output_mint[:8]}... ")
-            logger.info(f"   - Expected oracle accounts: {len(oracle_tokens) * 3} (instead of 12+)")
-            
-            # Build oracle account groups for the 2 trading tokens only
-            for token_mint in oracle_tokens:
-                try:
-                    # Verify the token account exists before adding to oracle accounts
-                    token_account = self._get_vault_token_account(token_mint, vault_authority_pda)
-                    
-                                         # Check if this ATA actually exists on-chain AND has proper token account data
-                    try:
-                         account_info = await self.client.get_account_info(token_account)
-                         if not account_info or not account_info.value or not account_info.value.data:
-                             logger.debug(f"⚠️ Token account doesn't exist for {token_mint[:8]}..., skipping oracle group")
-                             continue
-                         
-                         # Verify it's actually a token account (not just any account)
-                         account_data = account_info.value.data
-                         if len(account_data) < 165:  # Token accounts are 165 bytes
-                             logger.debug(f"⚠️ Account data too small for token account {token_mint[:8]}..., skipping")
-                             continue
-                             
-                         # Additional check: verify the account owner is the token program
-                         if account_info.value.owner != Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"):
-                             logger.debug(f"⚠️ Account not owned by token program for {token_mint[:8]}..., skipping")
-                             continue
-                             
-                    except Exception as e:
-                         logger.debug(f"⚠️ Failed to verify token account for {token_mint[:8]}...: {e}")
-                         continue
-                    
-                    # Get oracle using modern pull oracle approach
-                    oracle_accounts_dict = await self.get_oracle_accounts_for_tokens([token_mint])
-                    oracle_account = oracle_accounts_dict.get(token_mint)
-                    mint_account = Pubkey.from_string(token_mint)
-                    
-                    if not oracle_account:
-                        logger.warning(f"⚠️ Failed to create oracle account for {token_mint}")
-                        continue
-                    
-                    # Add the 3-account group
-                    remaining_accounts.extend([
-                        AccountMeta(pubkey=token_account, is_signer=False, is_writable=False),
-                        AccountMeta(pubkey=oracle_account, is_signer=False, is_writable=False), 
-                        AccountMeta(pubkey=mint_account, is_signer=False, is_writable=False),
-                    ])
-                    logger.debug(f"✅ Added oracle group for {token_mint[:8]}...")
-                    
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to add oracle group for {token_mint[:8]}...: {e}")
-            
-            logger.info(f"📊 Built oracle accounts: {len(remaining_accounts)} accounts for {len(oracle_tokens)} trading tokens only")
-            
-            # Add Jupiter accounts after oracle accounts
+            # Add Jupiter accounts
             for account in essential_jupiter_accounts:
                 try:
                     # Handle both dict and string formats
@@ -1599,15 +1493,13 @@ class VaultClient:
             if not vault_authority_in_remaining:
                 print(f"🔧 VAULT CLIENT PATCH: Adding vault authority PDA {vault_authority_key} to remaining accounts")
                 # Insert vault authority PDA into Jupiter accounts for CPI
-                # Find where Jupiter accounts start (after oracle accounts)
-                oracle_account_count = len(oracle_tokens) * 3
                 vault_authority_meta = AccountMeta(
                     pubkey=vault_authority_pda,
                     is_signer=False,  # PDA doesn't sign directly, uses CPI with seeds
                     is_writable=True  # Vault authority PDA is usually writable in Jupiter swaps
                 )
-                remaining_accounts.insert(oracle_account_count, vault_authority_meta)
-                print(f"✅ Vault authority PDA inserted at position {oracle_account_count} (after oracle accounts)")
+                remaining_accounts.insert(0, vault_authority_meta)
+                print(f"✅ Vault authority PDA inserted at position 0")
             else:
                 print(f"✅ Vault authority PDA {vault_authority_key} already present in remaining accounts")
             
@@ -1620,10 +1512,8 @@ class VaultClient:
             all_remaining_accounts = remaining_accounts
             
             logger.info(f"🔧 Final remaining accounts structure:")
-            logger.info(f"  - Oracle accounts: {len(oracle_tokens) * 3} ({len(oracle_tokens)} tokens × 3)")
-            logger.info(f"  - Jupiter accounts: {len(essential_jupiter_accounts)}")
-            logger.info(f"  - Total remaining: {len(all_remaining_accounts)}")
-            logger.info(f"📊 Vault will process oracle accounts for NAV, then pass Jupiter accounts for swap")
+            logger.info(f"  - Jupiter accounts: {len(all_remaining_accounts)}")
+            logger.info(f"📊 Vault will pass Jupiter accounts for swap execution")
             
             logger.info(f"📋 Account structure for vault trade:")
             logger.info(f"  - Main instruction accounts: {len(final_vault_accounts)} (includes oracle accounts)")
@@ -2699,3 +2589,271 @@ class VaultClient:
 
     # NOTE: _get_price_feed_id_for_token method removed
     # Switchboard oracles use permanent on-chain accounts instead of Pyth feed IDs
+
+    async def calculate_nav(self) -> Optional[str]:
+        """
+        Calculate and cache the vault's NAV using all token holdings
+        
+        Returns:
+            Transaction signature if successful, None otherwise
+        """
+        try:
+            logger.info("📊 Calculating vault NAV...")
+            
+            # Import required classes
+            from solders.pubkey import Pubkey as PublicKey
+            from solders.message import MessageV0
+            from solders.transaction import VersionedTransaction
+            
+            # Get vault PDA
+            vault_pda = self._get_vault_pda()
+            
+            # Get vault authority PDA
+            vault_authority_pda = self._get_vault_authority_pda()
+            
+            # Get vault USDC account
+            vault_usdc_account = self._get_vault_token_account(
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                vault_authority_pda
+            )
+            
+            # Get all token accounts owned by vault
+            token_accounts = await self.client.get_token_accounts_by_owner(
+                vault_authority_pda, 
+                opts=TokenAccountOpts(program_id=Pubkey.from_string(TOKEN_PROGRAM_ID))
+            )
+            
+            # Build oracle accounts only for tokens with balances
+            oracle_accounts = []
+            usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            
+            for account_info in token_accounts.value:
+                try:
+                    # Get token balance first
+                    balance_response = await self.client.get_token_account_balance(account_info.pubkey)
+                    if not balance_response or not balance_response.value:
+                        continue
+                        
+                    # Skip if zero balance
+                    balance = float(balance_response.value.ui_amount or 0)
+                    if balance <= 0:
+                        continue
+                    
+                    # Parse account data to get mint
+                    account_data = account_info.account.data
+                    mint_offset = 0  # Mint is first field in token account
+                    mint_bytes = account_data[mint_offset:mint_offset+32]
+                    mint = Pubkey(mint_bytes)
+                    mint_str = str(mint)
+                    
+                    # Skip USDC - we don't need oracle for it
+                    if mint_str == usdc_mint:
+                        logger.debug(f"Skipping USDC oracle (base currency)")
+                        continue
+                    
+                    logger.debug(f"Including oracle for {mint_str[:8]}... with balance {balance}")
+                    
+                    # Get oracle account for this token
+                    oracle_info = await self._get_oracle_account(mint_str)
+                    if oracle_info:
+                        # Add token account, oracle, and mint
+                        oracle_accounts.extend([
+                            AccountMeta(pubkey=account_info.pubkey, is_signer=False, is_writable=False),
+                            AccountMeta(pubkey=oracle_info, is_signer=False, is_writable=False),
+                            AccountMeta(pubkey=mint, is_signer=False, is_writable=False),
+                        ])
+                    else:
+                        logger.warning(f"No oracle found for {mint_str[:8]}...")
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to process token account: {e}")
+                    continue
+            
+            logger.info(f"📊 Including {len(oracle_accounts) // 3} token oracles in NAV calculation")
+            
+            # Build calculate NAV instruction
+            # Instruction discriminator for calculate_nav from IDL: [29, 35, 103, 15, 24, 139, 221, 36]
+            discriminator = bytes([29, 35, 103, 15, 24, 139, 221, 36])
+            
+            accounts = [
+                AccountMeta(pubkey=self.authority_keypair.pubkey(), is_signer=True, is_writable=True),
+                AccountMeta(pubkey=vault_pda, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=vault_usdc_account, is_signer=False, is_writable=False),
+            ]
+            
+            # Create instruction
+            instruction = Instruction(
+                program_id=PublicKey.from_string(self.vault_program_id),
+                accounts=accounts,
+                data=discriminator  # No additional args
+            )
+            
+            # Add oracle accounts to instruction if any
+            if oracle_accounts:
+                instruction = Instruction(
+                    program_id=instruction.program_id,
+                    accounts=instruction.accounts + oracle_accounts,
+                    data=instruction.data
+                )
+            
+            # Get recent blockhash
+            recent_blockhash = await self.client.get_latest_blockhash()
+            
+            # Build versioned transaction
+            message = MessageV0.try_compile(
+                payer=self.authority_keypair.pubkey(),
+                instructions=[instruction],
+                address_lookup_table_accounts=[],  # No ALT for now
+                recent_blockhash=recent_blockhash.value.blockhash,
+            )
+            
+            tx = VersionedTransaction(message, [self.authority_keypair])
+            
+            # Send transaction using the standard _send_transaction method
+            tx_sig = await self._send_transaction(tx)
+            
+            if tx_sig:
+                logger.info(f"✅ NAV calculated successfully: {tx_sig}")
+                return tx_sig
+            else:
+                logger.error("❌ Failed to calculate NAV")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ NAV calculation failed: {e}")
+            return None
+
+    async def _process_performance_fees_after_trade(self) -> None:
+        """
+        Process performance fees after a trade that resulted in USDC
+        
+        This method:
+        1. Forces a fresh NAV calculation using the JS service
+        2. Attempts to collect performance fees if NAV > HWM
+        """
+        try:
+            logger.info("💰 Processing performance fees after trade...")
+            
+            # Force NAV calculation using the JavaScript service
+            # This ensures we get fresh prices with proper Pyth oracle handling
+            import subprocess
+            import os
+            
+            script_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), 
+                '..', '..', 'force_nav_update.js'
+            )
+            
+            logger.info("📊 Forcing NAV calculation...")
+            nav_process = subprocess.run(
+                ['node', script_path],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if nav_process.returncode == 0:
+                logger.info("✅ NAV calculated successfully")
+                
+                # Attempt to collect performance fees
+                logger.info("💸 Attempting to collect performance fees...")
+                fees_result = await self.collect_performance_fees()
+                
+                if fees_result:
+                    logger.info(f"✅ Performance fees collected: {fees_result}")
+                    
+                    # Get vault info to log what happened
+                    vault_state = await self.get_vault_state()
+                    if vault_state:
+                        nav = vault_state.get('total_nav_usdc', 0)
+                        hwm = vault_state.get('high_water_mark_nav', 0) / 1_000_000
+                        logger.info(f"📈 New NAV: ${nav:,.2f}, New HWM: ${hwm:,.2f}")
+                else:
+                    logger.info("ℹ️ No performance fees collected (NAV may be below HWM)")
+            else:
+                logger.error("❌ Failed to calculate NAV for performance fees")
+                if nav_process.stderr:
+                    logger.error(f"Error: {nav_process.stderr}")
+                    
+        except Exception as e:
+            # Don't fail the trade if fee collection fails
+            logger.error(f"❌ Performance fee processing failed: {e}")
+            logger.error("Trade was successful but fee collection failed")
+
+    async def collect_performance_fees(self) -> Optional[str]:
+        """
+        Collect performance fees if NAV is above high water mark
+        
+        Returns:
+            Transaction signature if successful, None otherwise
+        """
+        try:
+            logger.info("💰 Checking for performance fees...")
+            
+            # Ensure client is initialized
+            if not self.client:
+                await self.initialize()
+            
+            # Get vault PDA
+            vault_pda = self._get_vault_pda()
+            
+            # Get vault authority PDA
+            vault_authority_pda = self._get_vault_authority_pda()
+            
+            # Get vault USDC account
+            vault_usdc_account = self._get_vault_token_account(
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                vault_authority_pda
+            )
+            
+            # Get treasury USDC account
+            treasury_usdc_account = self._get_treasury_token_account(
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
+            )
+            
+            # Build collect performance fees instruction
+            # Instruction discriminator from IDL: [254, 236, 230, 154, 245, 122, 50, 156]
+            discriminator = bytes([254, 236, 230, 154, 245, 122, 50, 156])
+            
+            accounts = [
+                AccountMeta(pubkey=self.authority_keypair.pubkey(), is_signer=True, is_writable=True),
+                AccountMeta(pubkey=vault_pda, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=vault_usdc_account, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=treasury_usdc_account, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=vault_authority_pda, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=Pubkey.from_string(TOKEN_PROGRAM_ID), is_signer=False, is_writable=False),
+            ]
+            
+            # Create instruction
+            instruction = Instruction(
+                program_id=Pubkey.from_string(self.vault_program_id),
+                accounts=accounts,
+                data=discriminator  # No additional args
+            )
+            
+            # Get recent blockhash
+            recent_blockhash = await self.client.get_latest_blockhash()
+            
+            # Build versioned transaction
+            message = MessageV0.try_compile(
+                payer=self.authority_keypair.pubkey(),
+                instructions=[instruction],
+                address_lookup_table_accounts=[],  # No ALT needed for simple fee collection
+                recent_blockhash=recent_blockhash.value.blockhash,
+            )
+            
+            tx = VersionedTransaction(message, [self.authority_keypair])
+            
+            # Send transaction
+            tx_sig = await self._send_transaction(tx)
+            
+            if tx_sig:
+                logger.info(f"✅ Performance fees collected: {tx_sig}")
+                return tx_sig
+            else:
+                logger.info("ℹ️ No performance fees to collect or collection failed")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Performance fee collection failed: {e}")
+            return None

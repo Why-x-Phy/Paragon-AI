@@ -194,6 +194,12 @@ class DataProcessor:
         Returns:
             DataFrame containing social metrics compatible with existing feature engineering
         """
+        # Check if this is an excluded infrastructure token
+        excluded_symbols = {'USDC', 'SOL', 'WBTC', 'WETH'}
+        if symbol.upper() in excluded_symbols:
+            logger.info(f"⚠️  {symbol} is an infrastructure token - skipping social data fetch for performance")
+            return pd.DataFrame()
+            
         logger.info(f"Fetching social data from TimescaleDB for {symbol} ({days} days)")
         
         # Use provided db_manager or create a new one
@@ -253,6 +259,12 @@ class DataProcessor:
         Returns:
             DataFrame containing social metrics compatible with existing feature engineering
         """
+        # Check if this is an excluded infrastructure token
+        excluded_symbols = {'USDC', 'SOL', 'WBTC', 'WETH'}
+        if symbol.upper() in excluded_symbols:
+            logger.info(f"⚠️  {symbol} is an infrastructure token - skipping social data fetch for performance")
+            return pd.DataFrame()
+            
         logger.info(f"Fetching social data for {symbol} using TimescaleDB backend")
         
         try:

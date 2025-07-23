@@ -203,6 +203,26 @@ class InferenceDataProcessor:
     async def _get_token_info(self, token_address: str) -> Optional[Dict[str, Any]]:
         """Get token information from database"""
         try:
+            # Check if we're in a valid event loop context
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self.logger.debug(f"No running event loop - cannot fetch token info for {token_address}")
+                return None
+            
+            # Try cache first
+            if hasattr(self.db_manager, 'get_token_by_address'):
+                token_info = self.db_manager.get_token_by_address(token_address)
+                if token_info:
+                    return {
+                        'token_id': token_info.token_id,
+                        'address': token_info.address,
+                        'symbol': token_info.symbol,
+                        'name': token_info.name
+                    }
+            
+            # Fall back to database query
             query = "SELECT token_id, address, symbol, name FROM tokens WHERE address = $1"
             
             async with self.db_manager.pg_pool.acquire() as conn:
@@ -213,7 +233,13 @@ class InferenceDataProcessor:
             return None
             
         except Exception as e:
-            self.logger.error(f"Error fetching token info for {token_address}: {e}")
+            # Don't log event loop closed errors as errors - they're expected during shutdown
+            if "Event loop is closed" in str(e) or "connection was closed" in str(e):
+                self.logger.debug(f"Database connection closed for token {token_address}")
+                # Also print to console so we can see it in logs
+                print(f"Token {token_address} not found in database")
+            else:
+                self.logger.error(f"Error fetching token info for {token_address}: {e}")
             return None
     
     async def _get_token_symbol(self, token_address: str) -> Optional[str]:
@@ -228,6 +254,12 @@ class InferenceDataProcessor:
     async def _fetch_social_data(self, symbol: str, price_df: pd.DataFrame) -> pd.DataFrame:
         """Fetch social data for the same time period as price data"""
         try:
+            # Check if this is an excluded infrastructure token
+            excluded_symbols = {'USDC', 'SOL', 'WBTC', 'WETH'}
+            if symbol.upper() in excluded_symbols:
+                self.logger.info(f"⚠️  {symbol} is an infrastructure token - skipping social data fetch for performance")
+                return pd.DataFrame()
+                
             # Get the time range from price data
             if price_df.empty or 'timestamp' not in price_df.columns:
                 return pd.DataFrame()

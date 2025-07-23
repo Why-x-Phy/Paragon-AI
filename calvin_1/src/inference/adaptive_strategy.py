@@ -25,7 +25,7 @@ from collections import defaultdict, deque
 # Local imports
 from ..config.config import config
 from ..utils.logger import log
-from .strategy_engine import SimpleStrategyEngine, TradingSignal, SignalType, SignalStrength
+from .strategy_engine import StrategyEngine, TradingSignal, SignalType, SignalStrength
 from .portfolio_coordinator import PortfolioCoordinator, get_portfolio_coordinator
 from ..database.production_db import get_db_manager
 import redis
@@ -64,7 +64,7 @@ class StrategyParameters:
     buy_threshold: float = 0.01     # 1.0% default - balanced for crypto hourly moves
     sell_threshold: float = 0.015   # 1.5% default - balanced for crypto hourly moves
     confidence_threshold: float = 0.10  # Minimal threshold - strategy thresholds are primary
-    position_size_pct: float = 10.0     # Position size as % of portfolio
+    position_size_pct: float = 2.0     # Position size as % of portfolio
     
     # Regime-aware thresholds (for LightGBM models)
     high_vol_buy_threshold: float = 0.02    # 2.0% for high volatility periods
@@ -114,6 +114,7 @@ class MarketConditions:
 class AdaptationConfig:
     """Configuration for adaptive strategy system"""
     # Adaptation settings
+    enable_adaptation: bool = True  # Master switch to enable/disable adaptation
     adaptation_method: AdaptationMethod = AdaptationMethod.HYBRID
     adaptation_frequency_minutes: int = 60  # How often to adapt parameters
     min_signals_for_adaptation: int = 10    # Minimum signals before adapting
@@ -188,6 +189,7 @@ class AdaptiveStrategyEngine:
     def _load_config_from_env(self) -> AdaptationConfig:
         """Load adaptive strategy configuration from environment variables"""
         return AdaptationConfig(
+            enable_adaptation=os.getenv('ENABLE_ADAPTATION', 'true').lower() == 'true',
             adaptation_method=AdaptationMethod(os.getenv('ADAPTATION_METHOD', 'hybrid')),
             adaptation_frequency_minutes=int(os.getenv('ADAPTATION_FREQUENCY_MINUTES', 60)),
             min_signals_for_adaptation=int(os.getenv('MIN_SIGNALS_FOR_ADAPTATION', 10)),
@@ -595,6 +597,11 @@ class AdaptiveStrategyEngine:
     async def adapt_strategy_parameters(self, symbol: str) -> bool:
         """Adapt strategy parameters for a token based on market conditions and performance"""
         try:
+            # Check if adaptation is disabled globally
+            if not self.config.enable_adaptation:
+                logger.debug(f"Adaptation disabled for {symbol} - using default thresholds")
+                return False  # No adaptation performed
+            
             # FIXED: Normalize symbol to uppercase for consistent handling
             normalized_symbol = symbol.upper()
             

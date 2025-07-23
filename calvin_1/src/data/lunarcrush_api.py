@@ -150,6 +150,12 @@ class LunarCrushAPI:
         Returns:
             DataFrame with historical metrics
         """
+        # Check if this is an excluded infrastructure token
+        excluded_symbols = {'USDC', 'SOL', 'WBTC', 'WETH'}
+        if symbol.upper() in excluded_symbols:
+            logger.info(f"⚠️  {symbol} is an infrastructure token - skipping LunarCrush API call for performance")
+            return pd.DataFrame()
+            
         endpoint = "assets"
         params = {
             "symbol": symbol,
@@ -187,6 +193,12 @@ class LunarCrushAPI:
         Returns:
             DataFrame with social sentiment metrics
         """
+        # Check if this is an excluded infrastructure token
+        excluded_symbols = {'USDC', 'SOL', 'WBTC', 'WETH'}
+        if symbol.upper() in excluded_symbols:
+            logger.info(f"⚠️  {symbol} is an infrastructure token - skipping social data API call for performance")
+            return pd.DataFrame()
+            
         df = self.get_historical_metrics(symbol, "1d", days)
         
         # Select only sentiment-related columns

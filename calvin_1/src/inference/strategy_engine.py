@@ -102,7 +102,7 @@ class StrategyConfig:
     default_buy_threshold: float = 0.01  # 1%
     default_sell_threshold: float = 0.015  # 1.5%
     default_confidence_threshold: float = None  # Will use config.MIN_PREDICTION_CONFIDENCE
-    position_size_pct: float = 0.10  # 10% of available cash
+    position_size_pct: float = 0.02  # 10% of available cash
     transaction_cost_pct: float = 0.001  # 0.1% fee
     
     # Feature processing
@@ -119,7 +119,8 @@ class StrategyEngine:
     Real-time strategy engine supporting both LSTM and Regime-Aware LightGBM models
     """
     
-    def __init__(self, config: Optional[StrategyConfig] = None, backtest_mode: bool = False):
+    def __init__(self, config: Optional[StrategyConfig] = None, backtest_mode: bool = False, 
+                 db_manager: Optional['ProductionDBManager'] = None):
         """Initialize the strategy engine with support for both model types"""
         # Initialize configuration with proper defaults
         if config is None:
@@ -141,8 +142,9 @@ class StrategyEngine:
         self.prediction_times = []
         
         # Initialize async components (will be set on first use)
-        self.db_manager = None
+        self.db_manager = db_manager  # Use provided db_manager if available
         self.inference_processor = None
+        self._external_db_manager = db_manager is not None  # Track if db_manager was provided externally
         
         # Initialize Redis connection
         self._init_redis()
@@ -207,6 +209,16 @@ class StrategyEngine:
             except Exception as e:
                 logger.error(f"Failed to initialize database manager: {e}")
                 raise
+        else:
+            # If we have an external db_manager, verify it's still valid for current event loop
+            if self._external_db_manager:
+                import asyncio
+                try:
+                    current_loop = asyncio.get_running_loop()
+                    if hasattr(self.db_manager, '_loop') and self.db_manager._loop != current_loop:
+                        logger.warning("External database manager is from different event loop, but continuing to use it")
+                except RuntimeError:
+                    logger.debug("No running event loop, continuing with external database manager")
 
     async def _ensure_inference_processor(self):
         """Ensure inference data processor is initialized"""
@@ -471,6 +483,14 @@ class StrategyEngine:
     async def _get_current_price(self, symbol: str, simulation_time: Optional[datetime] = None) -> Optional[float]:
         """Get current price from database or cache"""
         try:
+            # Check if we're in a valid event loop context
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                logger.warning(f"No running event loop - cannot fetch price for {symbol}")
+                return None
+            
             # Ensure database manager is initialized
             await self._ensure_db_manager()
             
@@ -481,11 +501,17 @@ class StrategyEngine:
                 if cached_price:
                     return float(cached_price)
             
-            # Get token info first
-            token_info = await self.db_manager.get_token_by_symbol(symbol)
-            if not token_info:
-                logger.warning(f"Token {symbol} not found in database")
-                return None
+            # Get token info first - handle event loop closed errors
+            try:
+                token_info = await self.db_manager.get_token_by_symbol(symbol)
+                if not token_info:
+                    logger.warning(f"Token {symbol} not found in database")
+                    return None
+            except Exception as e:
+                if "Event loop is closed" in str(e) or "connection was closed" in str(e):
+                    logger.warning(f"Database connection closed while fetching token info for {symbol}")
+                    return None
+                raise
             
             # Handle both dictionary and object returns from get_token_by_symbol
             if hasattr(token_info, 'token_id'):
@@ -895,9 +921,13 @@ class StrategyEngine:
                 # For regime-aware models, the raw_prediction is the return prediction
                 predicted_change_pct = raw_prediction * 100
             
-            # Get strategy parameters
-            buy_threshold = strategy_params.get('buy_threshold', self.config.default_buy_threshold)
-            sell_threshold = strategy_params.get('sell_threshold', self.config.default_sell_threshold)
+            # Get strategy parameters and convert to percentage for comparison
+            buy_threshold_decimal = strategy_params.get('buy_threshold', self.config.default_buy_threshold)
+            sell_threshold_decimal = strategy_params.get('sell_threshold', self.config.default_sell_threshold)
+            
+            # Convert thresholds to percentage for consistent comparison
+            buy_threshold = buy_threshold_decimal * 100  # Convert 0.01 to 1.0%
+            sell_threshold = sell_threshold_decimal * 100  # Convert 0.015 to 1.5%
             
             # Use configurable confidence threshold
             from ..config.config import config
@@ -931,6 +961,13 @@ class StrategyEngine:
             else:
                 signal_type = SignalType.HOLD
                 strength = SignalStrength.WEAK
+            
+            # Log the comparison for debugging
+            logger.debug(f"Strategy decision for {symbol}: "
+                        f"predicted={predicted_change_pct:.3f}%, "
+                        f"buy_threshold={buy_threshold:.3f}%, "
+                        f"sell_threshold={sell_threshold:.3f}%, "
+                        f"signal={signal_type.value}")
             
             return {
                 'type': signal_type,
@@ -1061,6 +1098,24 @@ class StrategyEngine:
         self._prediction_cache.clear()
         logger.info("Strategy engine caches cleared")
 
+    async def cleanup(self):
+        """Clean up resources when done with strategy engine"""
+        try:
+            # Only close the database manager if we created it internally
+            if self.db_manager and not self._external_db_manager:
+                logger.debug("Cleaning up internal database manager")
+                await self.db_manager.close()
+                self.db_manager = None
+            
+            # Clear caches
+            self._feature_cache.clear()
+            self._prediction_cache.clear()
+            
+            logger.debug("Strategy engine cleanup completed")
+            
+        except Exception as e:
+            logger.error(f"Error during strategy engine cleanup: {e}")
+
     def _log_initialization(self):
         """Log strategy engine initialization details"""
         logger.info(f"Strategy Engine initialized (supports LSTM + LightGBM, backtest_mode={self.backtest_mode})")
@@ -1081,9 +1136,15 @@ class StrategyEngine:
 # Convenience functions for easy integration
 _strategy_engine_instance: Optional[StrategyEngine] = None
 
-def get_strategy_engine(backtest_mode: bool = False) -> StrategyEngine:
+def get_strategy_engine(backtest_mode: bool = False, db_manager: Optional['ProductionDBManager'] = None) -> StrategyEngine:
     """Get or create the global strategy engine instance"""
     global _strategy_engine_instance
+    
+    # If db_manager is provided, always create a new instance to use it
+    if db_manager is not None:
+        return StrategyEngine(backtest_mode=backtest_mode, db_manager=db_manager)
+    
+    # Otherwise use singleton pattern
     if _strategy_engine_instance is None or (backtest_mode and not getattr(_strategy_engine_instance, 'backtest_mode', False)):
         _strategy_engine_instance = StrategyEngine(backtest_mode=backtest_mode)
     return _strategy_engine_instance

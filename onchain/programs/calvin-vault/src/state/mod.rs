@@ -74,6 +74,12 @@ pub struct Vault {
     pub cpi_call_counts: [CpiCallTracker; 2], // Track up to 2 programs (Jupiter, Staking)
     pub cpi_trackers_count: u8,               // Actual number of trackers (0-2)
     
+    /// Cached NAV value to avoid recalculating in every transaction
+    pub cached_nav: u64,
+    
+    /// Timestamp when NAV was last calculated
+    pub nav_last_updated: i64,
+    
     // Note: Pending operations moved to separate accounts for stack size optimization
 }
 
@@ -107,7 +113,10 @@ impl Vault {
         8 + // next_operation_id
         // 🔒 CPI Rate Limiting fields
         (76 * 2) + // cpi_call_counts (CpiCallTracker * 2)
-        1; // cpi_trackers_count
+        1 + // cpi_trackers_count
+        // Cached NAV fields
+        8 + // cached_nav
+        8; // nav_last_updated
         // 0; // reserved (removed for stack size)
 }
 

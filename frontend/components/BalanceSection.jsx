@@ -3,6 +3,7 @@
 import { useWallet } from '@solana/wallet-adapter-react';
 import BalanceCard from './BalanceCard';
 import { useVault } from '@/hooks/useVault';
+import { toast } from 'sonner';
 
 export default function BalanceSection() {
   const { connected } = useWallet();
@@ -13,7 +14,9 @@ export default function BalanceSection() {
     vaultStats,
     loading,
     refreshing,
-    error
+    error,
+    vaultClient,
+    refreshData
   } = useVault();
 
   if (!connected) {
@@ -47,6 +50,13 @@ export default function BalanceSection() {
       </div>
     );
   }
+
+  // Calculate NAV age for display
+  const formatNavAge = (seconds) => {
+    if (seconds < 60) return `${seconds}s ago`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+    return `${Math.floor(seconds / 3600)}h ago`;
+  };
 
   // Prepare vault balance data
   const vaultBalanceData = {
@@ -119,6 +129,47 @@ export default function BalanceSection() {
         <div className="text-center text-white/60 py-2">
           <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-[#B73E15] mx-auto"></div>
           <p className="text-xs mt-1">Refreshing data...</p>
+        </div>
+      )}
+
+      {/* NAV Status Indicator */}
+      {vaultStats && (
+        <div className="flex items-center justify-center gap-2 text-sm">
+          <div className={`flex items-center gap-2 px-3 py-1 rounded-full ${
+            vaultStats.navIsStale 
+              ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30' 
+              : 'bg-green-500/20 text-green-400 border border-green-500/30'
+          }`}>
+            <div className={`w-2 h-2 rounded-full ${
+              vaultStats.navIsStale ? 'bg-yellow-400' : 'bg-green-400'
+            } animate-pulse`}></div>
+            <span>
+              NAV: {vaultStats.navIsStale ? 'Stale' : 'Fresh'} 
+              ({formatNavAge(vaultStats.navAge)})
+            </span>
+          </div>
+          {vaultStats.navIsStale && (
+            <div className="flex items-center gap-2">
+              <p className="text-yellow-400 text-xs">
+                Auto-updates on deposit/withdraw
+              </p>
+              <button
+                onClick={async () => {
+                  try {
+                    await vaultClient?.refreshNav();
+                    await refreshData();
+                    toast.success('NAV refreshed!');
+                  } catch (error) {
+                    toast.error('Failed to refresh NAV');
+                  }
+                }}
+                className="text-xs px-2 py-0.5 bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-400 rounded transition-colors"
+                title="Manually refresh NAV (costs transaction fees)"
+              >
+                Refresh Now
+              </button>
+            </div>
+          )}
         </div>
       )}
 

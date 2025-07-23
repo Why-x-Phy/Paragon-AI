@@ -72,14 +72,17 @@ pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()> {
     let user_position = &mut ctx.accounts.user_position;
     let user = &ctx.accounts.user;
     
-        // Get current NAV (for calculating withdrawal amount)
-    // nav_accounts format: groups of 3 [token_account, price_account, mint_account, ...]
+    // Use cached NAV instead of recalculating
+    // Check if cached NAV is fresh enough
+    let current_time = Clock::get()?.unix_timestamp;
+    let nav_age = current_time.saturating_sub(vault.nav_last_updated);
     
-    let vault_nav = utils::current_nav_usdc(
-        vault,
-        &ctx.accounts.vault_usdc_token,
-        &ctx.remaining_accounts,
-    )?;
+    if nav_age > crate::constants::MAX_NAV_STALENESS_SECONDS {
+        msg!("⚠️ Cached NAV is stale ({} seconds old). Please call calculate_nav first.", nav_age);
+        return Err(error!(ErrorCode::StaleNav));
+    }
+    
+    let vault_nav = vault.cached_nav;
     
     // Calculate USDC amount to withdraw
     let usdc_amount = utils::calculate_usdc_to_withdraw(shares, vault.total_shares, vault_nav)?;

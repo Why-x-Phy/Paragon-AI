@@ -26,6 +26,7 @@ pub const PENDING_OPERATION_PDA_SEED: &[u8] = b"pending_operation";
 // Oracle and liquidity constants
 pub const LIQUIDITY_BUFFER_BPS: u64 = 1000; // 10% minimum USDC liquidity buffer
 pub const MAX_PRICE_STALENESS_SECONDS: i64 = 60; // Max staleness for price oracle (60 seconds)
+pub const MAX_NAV_STALENESS_SECONDS: i64 = 300; // Max staleness for cached NAV (5 minutes)
 
 // 🔒 ENHANCED SECURITY CONSTANTS
 

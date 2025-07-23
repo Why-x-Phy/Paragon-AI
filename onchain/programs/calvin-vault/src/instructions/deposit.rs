@@ -155,22 +155,18 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         }
     };
     
-    // Get current NAV (for calculating shares)
-    // remaining_accounts format: [0] stake_config, [1] user_stake, [2+] vault token accounts, price accounts, mint accounts
-    // Skip staking accounts (first 2) and pass the rest to utility function for parsing
-    let nav_parsing_accounts = &ctx.remaining_accounts[2..];
+    // Use cached NAV instead of recalculating
+    // Check if cached NAV is fresh enough
+    let current_time = Clock::get()?.unix_timestamp;
+    let nav_age = current_time.saturating_sub(vault.nav_last_updated);
     
-    let vault_nav = match utils::current_nav_usdc(
-        vault,
-        &ctx.accounts.vault_usdc_token,
-        nav_parsing_accounts,
-    ) {
-        Ok(nav) => nav,
-        Err(e) => {
-            vault.reentrancy_guard = false;
-            return Err(e);
-        }
-    };
+    if nav_age > MAX_NAV_STALENESS_SECONDS {
+        vault.reentrancy_guard = false;
+        msg!("⚠️ Cached NAV is stale ({} seconds old). Please call calculate_nav first.", nav_age);
+        return Err(error!(ErrorCode::StaleNav));
+    }
+    
+    let vault_nav = vault.cached_nav;
     
     // 🔒 VALIDATE NAV BOUNDS
     if vault_nav > MAX_TOTAL_NAV {
@@ -359,22 +355,14 @@ pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
     }
     
     // 🎯 UPDATE HWM IF DEPOSIT PUSHES NAV ABOVE HWM
-    // Recalculate FULL NAV after deposit including all token positions
-    let nav_after_deposit = match utils::current_nav_usdc(
-        vault,
-        &ctx.accounts.vault_usdc_token,
-        nav_parsing_accounts,
-    ) {
-        Ok(nav) => nav,
-        Err(e) => {
-            vault.reentrancy_guard = false;
-            return Err(e);
-        }
-    };
+    // Since we're using cached NAV, we need to estimate the new NAV after deposit
+    // New NAV ≈ old NAV + deposit amount (since deposit is in USDC)
+    let estimated_nav_after_deposit = vault_nav
+        .saturating_add(amount_after_fee);
     
     // Deposits shouldn't trigger performance fees, so adjust HWM upward
-    if nav_after_deposit > vault.high_water_mark_nav {
-        vault.high_water_mark_nav = nav_after_deposit;
+    if estimated_nav_after_deposit > vault.high_water_mark_nav {
+        vault.high_water_mark_nav = estimated_nav_after_deposit;
     }
     
     // Update vault state

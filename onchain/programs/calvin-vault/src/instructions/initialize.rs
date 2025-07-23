@@ -91,6 +91,10 @@ pub fn initialize(
     vault.paused = false;
     vault.jupiter_program_id = jupiter_program_id;
     
+    // Initialize cached NAV fields
+    vault.cached_nav = 0;
+    vault.nav_last_updated = Clock::get()?.unix_timestamp;
+    
     // Store bumps for PDAs
     vault.vault_bump = ctx.bumps.vault;
     vault.shares_mint_bump = ctx.bumps.shares_mint;

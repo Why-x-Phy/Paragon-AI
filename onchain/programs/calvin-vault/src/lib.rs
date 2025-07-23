@@ -72,6 +72,27 @@ pub mod vault {
         instructions::set_pause_status(ctx, paused)
     }
 
+    /// Calculate and cache the vault's NAV
+    pub fn calculate_nav(
+        ctx: Context<CalculateNav>,
+    ) -> Result<()> {
+        instructions::calculate_nav(ctx)
+    }
+
+    /// Refresh the vault's NAV (permissionless - anyone can call)
+    pub fn refresh_nav(
+        ctx: Context<RefreshNav>,
+    ) -> Result<()> {
+        instructions::refresh_nav(ctx)
+    }
+
+    /// Collect performance fees if NAV is above high water mark
+    pub fn collect_performance_fees(
+        ctx: Context<CollectPerformanceFees>,
+    ) -> Result<()> {
+        instructions::collect_performance_fees(ctx)
+    }
+
     /// Update vault configuration
     pub fn update_config(
         ctx: Context<UpdateConfig>,
@@ -178,5 +199,14 @@ pub mod vault {
         ctx: Context<PauseAll>,
     ) -> Result<()> {
         instructions::pause_all(ctx)
+    }
+
+    /// Admin function to mint shares directly to a user for compensation
+    pub fn admin_mint_shares(
+        ctx: Context<AdminMintShares>,
+        shares_to_mint: u64,
+        reason: String,
+    ) -> Result<()> {
+        instructions::admin_mint_shares(ctx, shares_to_mint, reason)
     }
 } 

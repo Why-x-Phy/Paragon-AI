@@ -30,7 +30,8 @@ import {
   getStakeConfigPDA,
   getUserStakePDA,
   getVaultPDA,
-  getUserPositionPDA
+  getUserPositionPDA,
+  getVaultAuthorityPDA
 } from './anchor-program';
 
 // ================ ORACLE CONFIGURATION ================
@@ -107,6 +108,9 @@ export class VaultClient {
       "https://hermes.pyth.network/",
       {}
     );
+    
+    // Timer for automatic NAV refresh
+    this.navRefreshInterval = null;
     this.pythSolanaReceiver = null; // Will be initialized properly later
     
     // Price caching for accurate and efficient share price calculations
@@ -371,14 +375,8 @@ export class VaultClient {
         // Keep defaults
       }
       
-      // Get vault authority PDA
-      const [vaultAuthorityPDA] = PublicKey.findProgramAddressSync(
-        [Buffer.from("vault_authority")],
-        this.vaultProgram.programId
-      );
-      
-      // Calculate USDC value of shares using proper NAV
-      const vaultNav = await this.calculateVaultNAV(vault, vaultAuthorityPDA);
+      // Calculate USDC value of shares using cached NAV
+      const vaultNav = vault.cachedNav;
       const sharePrice = this.calculateSharePrice(vaultNav, vault.totalShares);
       const usdcValue = shares.mul(sharePrice).div(new BN(1000000)); // Convert back to USDC amount
       
@@ -494,15 +492,14 @@ export class VaultClient {
       try {
         const vault = await this.vaultProgram.account.vault.fetch(vaultPDA);
         
-        // Get vault authority PDA
-        const [vaultAuthorityPDA] = PublicKey.findProgramAddressSync(
-          [Buffer.from("vault_authority")],
-          this.vaultProgram.programId
-        );
-        
-        // Calculate proper NAV including all token holdings
-        const nav = await this.calculateVaultNAV(vault, vaultAuthorityPDA);
+        // Use cached NAV from vault state
+        const nav = vault.cachedNav;
         const sharePrice = this.calculateSharePrice(nav, vault.totalShares);
+        
+        // Check NAV staleness
+        const currentTime = Math.floor(Date.now() / 1000);
+        const navAge = currentTime - vault.navLastUpdated.toNumber();
+        const isStale = navAge > 300; // 5 minutes
         
         return {
           totalUsdc: nav.toString(),
@@ -512,7 +509,10 @@ export class VaultClient {
           sharePrice: sharePrice.toString(),
           sharePriceFormatted: this.formatTokenAmount(sharePrice, 6),
           calvinAuthority: vault.calvinAuthority.toString(),
-          pda: vaultPDA.toString()
+          pda: vaultPDA.toString(),
+          navLastUpdated: vault.navLastUpdated.toString(),
+          navAge: navAge,
+          navIsStale: isStale
         };
       } catch (fetchError) {
         // Vault account doesn't exist yet - return default values
@@ -525,7 +525,10 @@ export class VaultClient {
           sharePrice: '1000000', // 1.0 with 6 decimals
           sharePriceFormatted: '1.0',
           calvinAuthority: 'Not Set',
-          pda: vaultPDA.toString()
+          pda: vaultPDA.toString(),
+          navLastUpdated: '0',
+          navAge: 0,
+          navIsStale: false
         };
       }
     } catch (error) {
@@ -953,7 +956,7 @@ export class VaultClient {
   }
 
   /**
-   * Deposit USDC to vault
+   * Deposit USDC to the vault
    */
   async depositUsdc(amount) {
     try {
@@ -1008,6 +1011,20 @@ export class VaultClient {
         throw new Error(`Vault account not found or not initialized: ${error.message}`);
       }
 
+      // Check if NAV is stale (older than 5 minutes)
+      const currentTime = Math.floor(Date.now() / 1000);
+      const navAge = currentTime - vault.navLastUpdated.toNumber();
+      
+      if (navAge > 300) { // 5 minutes
+        console.log(`⚠️ NAV is stale (${navAge} seconds old). Calculating fresh NAV...`);
+        await this.calculateNav();
+        
+        // Refetch vault to get updated NAV
+        vault = await this.vaultProgram.account.vault.fetch(vaultPDA);
+      } else {
+        console.log(`✅ NAV is fresh (${navAge} seconds old)`);
+      }
+
       // Get vault authority PDA
       const [vaultAuthorityPDA] = PublicKey.findProgramAddressSync(
         [Buffer.from("vault_authority")],
@@ -1024,437 +1041,56 @@ export class VaultClient {
       console.log('📍 Treasury USDC Account:', treasuryUsdcAccount.toBase58());
       console.log('📍 User Shares Account:', userSharesAccount.toBase58());
 
-      // Load deposit ALT directly from chain
-      let depositAlt = null;
-      let depositAltAccount = null;
-      try {
-        // The ALT address we created
-        const altAddress = new PublicKey('BeRMCAr83956NxtmQiKbpPC4QAvATzzmur4idRzuy1yZ');
-        
-        // Fetch the ALT account to verify it exists and get its data
-        const altAccountInfo = await this.connection.getAccountInfo(altAddress);
-        if (altAccountInfo) {
-          // Parse the ALT account data to get the addresses
-          // ALT accounts have a specific format - we need to deserialize it
-          const altData = altAccountInfo.data;
-          
-          // Create ALT account object for Pyth SDK
-          depositAltAccount = {
-            key: altAddress,
-            state: {
-              // The ALT state includes the addresses it contains
-              // For now, we'll just use the address and let Pyth SDK handle the rest
-              addresses: []
-            }
-          };
-          
-          depositAlt = altAddress;
-          console.log('✅ Deposit ALT loaded from chain:', altAddress.toString());
-        } else {
-          console.log('⚠️ Deposit ALT not found on chain');
-        }
-      } catch (error) {
-        console.log('ℹ️ Could not fetch deposit ALT:', error.message);
-      }
-
-      // Get oracle data for vault NAV calculation
-      console.log('🔍 Preparing Pyth oracle data for vault transaction...');
-      await this.getOracleAccountsForDeposit(vaultAuthorityPDA);
-
-      // Check if we have the required Pyth data
-      if (!this._priceUpdates || !this._priceFeeds || !this._tokenData) {
-        console.warn('⚠️ No Pyth price updates needed - vault may only hold USDC');
-        // Continue with empty oracle data
-        this._priceUpdates = [];
-        this._priceFeeds = [];
-        this._tokenData = [];
-      }
-
-      // Build instructions array
-      const instructions = [];
+      // Get staking accounts for tier verification
+      const [stakeConfigPDA] = getStakeConfigPDA();
+      const [userStakePDA] = getUserStakePDA(this.wallet.publicKey);
       
-      // Add compute budget instructions
-      instructions.push(
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 1400000 }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 })
+      // Build the deposit instruction - NO ORACLE ACCOUNTS NEEDED
+      const depositInstruction = await this.vaultProgram.methods
+        .deposit(amountBN)
+        .accounts({
+          user: this.wallet.publicKey,
+          vault: vaultPDA,
+          userPosition: userPositionPDA,
+          userUsdcToken: userUsdcAccount,
+          vaultUsdcToken: vaultUsdcAccount,
+          treasuryUsdcToken: treasuryUsdcAccount,
+          sharesMint: vault.sharesMint,
+          userSharesToken: userSharesAccount,
+          vaultAuthority: vaultAuthorityPDA,
+          stakingProgram: this.stakingProgram.programId,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          rent: SYSVAR_RENT_PUBKEY,
+        })
+        .remainingAccounts([
+          // Only staking accounts needed for tier verification
+          { pubkey: stakeConfigPDA, isWritable: false, isSigner: false },
+          { pubkey: userStakePDA, isWritable: false, isSigner: false },
+        ])
+        .instruction();
+      
+      // Build simple transaction
+      const tx = new Transaction();
+      tx.add(
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 400000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }),
+        depositInstruction
       );
-
-      // Create Pyth price update instructions if needed
-      if (this._priceUpdates.length > 0) {
-        console.log('🏗️ Creating Pyth price update instructions...');
-        
-        // Post price updates following official documentation pattern
-        // IMPORTANT: We need to ensure price update accounts aren't closed before deposit
-        const transactionBuilder = this.pythSolanaReceiver.newTransactionBuilder({
-          closeUpdateAccounts: false, // Keep accounts open for deposit instruction
-        });
-
-        // Add price updates to the transaction builder
-        await transactionBuilder.addPostPriceUpdates(this._priceUpdates);
-        
-        // Build the deposit instruction to add to the builder
-        await transactionBuilder.addPriceConsumerInstructions(
-          async (getPriceUpdateAccount) => {
-            // Build oracle remaining accounts using the price update accounts
-            const oracleRemainingAccounts = [];
-            
-            for (let i = 0; i < this._tokenData.length; i++) {
-              const token = this._tokenData[i];
-              const feedId = this._priceFeeds[i];
-              const priceUpdateAccount = getPriceUpdateAccount(feedId);
-              
-              // Add oracle group: [token_account, price_oracle, mint]
-              oracleRemainingAccounts.push(
-                { pubkey: token.tokenAccount, isWritable: false, isSigner: false },
-                { pubkey: priceUpdateAccount, isWritable: false, isSigner: false },
-                { pubkey: token.mint, isWritable: false, isSigner: false }
-              );
-            }
-            
-            // Get staking accounts for remaining accounts
-            const [stakeConfigPDA] = getStakeConfigPDA();
-            const [userStakePDA] = getUserStakePDA(this.wallet.publicKey);
-            
-            // Build the deposit instruction
-            const depositInstruction = await this.vaultProgram.methods
-              .deposit(amountBN)
-              .accounts({
-                user: this.wallet.publicKey,
-                vault: vaultPDA,
-                userPosition: userPositionPDA,
-                userUsdcToken: userUsdcAccount,
-                vaultUsdcToken: vaultUsdcAccount,
-                treasuryUsdcToken: treasuryUsdcAccount,
-                sharesMint: vault.sharesMint,
-                userSharesToken: userSharesAccount,
-                vaultAuthority: vaultAuthorityPDA,
-                stakingProgram: this.stakingProgram.programId,
-                systemProgram: SystemProgram.programId,
-                tokenProgram: TOKEN_PROGRAM_ID,
-                associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-                rent: SYSVAR_RENT_PUBKEY,
-              })
-              .remainingAccounts([
-                // Staking accounts (required for tier verification)
-                { pubkey: stakeConfigPDA, isWritable: false, isSigner: false },
-                { pubkey: userStakePDA, isWritable: false, isSigner: false },
-                // Oracle accounts
-                ...oracleRemainingAccounts
-              ])
-              .instruction();
-            
-            // Return instruction for Pyth to include
-            return [{ instruction: depositInstruction, signers: [] }];
-          }
-        );
-        
-        // Build versioned transactions with ALT support
-        let versionedTransactions;
-        try {
-          versionedTransactions = await transactionBuilder.buildVersionedTransactions({
-            computeUnitPriceMicroLamports: 50000,
-            computeUnitLimit: 1400000,
-            // Pass the ALT address directly - Pyth SDK will fetch and use it
-            addressLookupTableAddresses: depositAlt ? [depositAlt] : [],
-          });
-        } catch (buildError) {
-          console.error('❌ Failed to build versioned transactions:', buildError);
-          // If ALT fails, try without it
-          console.log('🔄 Retrying without ALT...');
-          versionedTransactions = await transactionBuilder.buildVersionedTransactions({
-            computeUnitPriceMicroLamports: 50000,
-            computeUnitLimit: 1400000,
-            addressLookupTableAddresses: [],
-          });
-        }
-        
-        console.log(`📊 Built ${versionedTransactions.length} versioned transactions`);
-        
-        // Check if deposit instruction was included
-        let depositInstructionFound = false;
-        for (let i = 0; i < versionedTransactions.length; i++) {
-          const tx = versionedTransactions[i];
-          if (tx && tx.tx && tx.tx.message) {
-            const message = tx.tx.message;
-            const staticAccountKeys = message.staticAccountKeys || [];
-            
-            // Check if vault program is in this transaction
-            for (const key of staticAccountKeys) {
-              if (key.toString() === this.vaultProgram.programId.toString()) {
-                depositInstructionFound = true;
-                console.log(`✅ Deposit instruction found in transaction ${i + 1}`);
-                break;
-              }
-            }
-          }
-        }
-        
-        if (!depositInstructionFound) {
-          console.warn('⚠️ Deposit instruction not found in any Pyth transaction!');
-          console.log('🔧 Attempting to manually add deposit instruction...');
-          
-          // Get the last transaction and try to add our deposit instruction to it
-          const lastTx = versionedTransactions[versionedTransactions.length - 1];
-          if (lastTx && lastTx.tx) {
-            try {
-              // This is a workaround - we'll send the deposit in a separate transaction
-              // after all the Pyth transactions complete
-              console.log('📝 Will send deposit instruction separately after Pyth transactions');
-            } catch (e) {
-              console.error('Failed to modify transaction:', e);
-            }
-          }
-        }
-        
-        // Send the Pyth transactions first
-        const pythSignatures = await this.pythSolanaReceiver.provider.sendAll(
-          versionedTransactions,
-          { skipPreflight: true }
-        );
-        
-        console.log('✅ Pyth transactions sent!', pythSignatures.length, 'signatures');
-        
-        // If deposit wasn't included, send it separately
-        if (!depositInstructionFound) {
-          console.log('📤 Sending separate deposit transaction...');
-          
-          // Wait a moment for Pyth transactions to confirm
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          
-          // Build oracle remaining accounts using the price update accounts that were just created
-          const oracleRemainingAccounts = [];
-          
-          for (let i = 0; i < this._tokenData.length; i++) {
-            const token = this._tokenData[i];
-            const feedId = this._priceFeeds[i];
-            
-            // Derive the price update account address that Pyth just created
-            const [priceUpdateAccount] = PublicKey.findProgramAddressSync(
-              [
-                Buffer.from("PythPriceUpdateV2"),
-                Buffer.from(feedId, 'hex')
-              ],
-              this.pythSolanaReceiver.receiver.programId
-            );
-            
-            // Add oracle group: [token_account, price_oracle, mint]
-            oracleRemainingAccounts.push(
-              { pubkey: token.tokenAccount, isWritable: false, isSigner: false },
-              { pubkey: priceUpdateAccount, isWritable: false, isSigner: false },
-              { pubkey: token.mint, isWritable: false, isSigner: false }
-            );
-          }
-          
-          // Get staking accounts
-          const [stakeConfigPDA] = getStakeConfigPDA();
-          const [userStakePDA] = getUserStakePDA(this.wallet.publicKey);
-          
-          // Build the deposit instruction
-          const depositInstruction = await this.vaultProgram.methods
-            .deposit(amountBN)
-            .accounts({
-              user: this.wallet.publicKey,
-              vault: vaultPDA,
-              userPosition: userPositionPDA,
-              userUsdcToken: userUsdcAccount,
-              vaultUsdcToken: vaultUsdcAccount,
-              treasuryUsdcToken: treasuryUsdcAccount,
-              sharesMint: vault.sharesMint,
-              userSharesToken: userSharesAccount,
-              vaultAuthority: vaultAuthorityPDA,
-              stakingProgram: this.stakingProgram.programId,
-              systemProgram: SystemProgram.programId,
-              tokenProgram: TOKEN_PROGRAM_ID,
-              associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-              rent: SYSVAR_RENT_PUBKEY,
-            })
-            .remainingAccounts([
-              { pubkey: stakeConfigPDA, isWritable: false, isSigner: false },
-              { pubkey: userStakePDA, isWritable: false, isSigner: false },
-              ...oracleRemainingAccounts
-            ])
-            .instruction();
-          
-          // Send deposit with ALT
-          if (depositAlt) {
-            try {
-              const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
-              
-              // Fetch the ALT account data properly using the web3.js method
-              const lookupTableAccount = await this.connection
-                .getAddressLookupTable(depositAlt)
-                .then((res) => res.value);
-              
-              if (!lookupTableAccount) {
-                throw new Error('ALT account not found on chain');
-              }
-              
-              console.log('📋 ALT loaded with', lookupTableAccount.state.addresses.length, 'addresses');
-              
-              const messageV0 = new TransactionMessage({
-                payerKey: this.wallet.publicKey,
-                recentBlockhash: blockhash,
-                instructions: [
-                  ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 }),
-                  ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }),
-                  depositInstruction
-                ],
-              }).compileToV0Message([lookupTableAccount]);
-              
-              const transaction = new VersionedTransaction(messageV0);
-              
-              const depositSig = await this.wallet.sendTransaction(transaction, this.connection, {
-                skipPreflight: false,
-                maxRetries: 3,
-                preflightCommitment: 'processed',
-              });
-              
-              console.log('📝 Deposit transaction signature:', depositSig);
-              
-              await this.connection.confirmTransaction({
-                signature: depositSig,
-                blockhash,
-                lastValidBlockHeight
-              }, 'confirmed');
-              
-              console.log('✅ Deposit transaction confirmed!');
-              return depositSig;
-            } catch (altError) {
-              console.error('❌ Failed to send with ALT:', altError);
-              console.log('🔄 Falling back to legacy transaction...');
-              // Fallback without ALT
-              const tx = new Transaction();
-              tx.add(
-                ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 }),
-                ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }),
-                depositInstruction
-              );
-              return await this.sendTransaction(tx);
-            }
-          } else {
-            // Fallback without ALT
-            const tx = new Transaction();
-            tx.add(
-              ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 }),
-              ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }),
-              depositInstruction
-            );
-            return await this.sendTransaction(tx);
-          }
-        }
-        
-        return pythSignatures[0];
-
-      } else {
-        // No price updates needed - simple deposit
-        console.log('💡 No price updates needed - using simple transaction');
-        
-        // Get staking accounts
-        const [stakeConfigPDA] = getStakeConfigPDA();
-        const [userStakePDA] = getUserStakePDA(this.wallet.publicKey);
-        
-        // Build the deposit instruction
-        const depositInstruction = await this.vaultProgram.methods
-          .deposit(amountBN)
-          .accounts({
-            user: this.wallet.publicKey,
-            vault: vaultPDA,
-            userPosition: userPositionPDA,
-            userUsdcToken: userUsdcAccount,
-            vaultUsdcToken: vaultUsdcAccount,
-            treasuryUsdcToken: treasuryUsdcAccount,
-            sharesMint: vault.sharesMint,
-            userSharesToken: userSharesAccount,
-            vaultAuthority: vaultAuthorityPDA,
-            stakingProgram: this.stakingProgram.programId,
-            systemProgram: SystemProgram.programId,
-            tokenProgram: TOKEN_PROGRAM_ID,
-            associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-            rent: SYSVAR_RENT_PUBKEY,
-          })
-          .remainingAccounts([
-            // Staking accounts (required for tier verification)
-            { pubkey: stakeConfigPDA, isWritable: false, isSigner: false },
-            { pubkey: userStakePDA, isWritable: false, isSigner: false },
-          ])
-          .instruction();
-        
-        if (depositAlt) {
-          console.log('🚀 Using versioned transaction with deposit ALT...');
-          
-          try {
-            // Create versioned transaction with ALT
-            const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
-            
-            // Fetch the ALT account properly
-            const lookupTableAccount = await this.connection
-              .getAddressLookupTable(depositAlt)
-              .then((res) => res.value);
-            
-            if (!lookupTableAccount) {
-              throw new Error('ALT account not found on chain');
-            }
-            
-            console.log('📋 ALT loaded with', lookupTableAccount.state.addresses.length, 'addresses');
-            
-            const messageV0 = new TransactionMessage({
-              payerKey: this.wallet.publicKey,
-              recentBlockhash: blockhash,
-              instructions: [
-                ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 }),
-                ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }),
-                depositInstruction
-              ],
-            }).compileToV0Message([lookupTableAccount]);
-            
-            const transaction = new VersionedTransaction(messageV0);
-            
-            // Send versioned transaction
-            const signature = await this.wallet.sendTransaction(transaction, this.connection, {
-              skipPreflight: false,
-              maxRetries: 3,
-              preflightCommitment: 'processed',
-            });
-            
-            console.log('📝 Transaction signature:', signature);
-            
-            // Wait for confirmation
-            const confirmation = await this.connection.confirmTransaction({
-              signature,
-              blockhash,
-              lastValidBlockHeight
-            }, 'confirmed');
-            
-            if (confirmation.value.err) {
-              throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
-            }
-            
-            console.log('✅ Deposit transaction confirmed!');
-            return signature;
-          } catch (altError) {
-            console.error('❌ Failed with ALT:', altError);
-            console.log('🔄 Falling back to legacy transaction...');
-            // Fall through to legacy transaction below
-          }
-        }
-        
-        // Fallback to legacy transaction (used when no ALT or ALT fails)
-        const transaction = new Transaction();
-        transaction.add(
-          ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 }),
-          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }),
-          depositInstruction
-        );
-        
-        return await this.sendTransaction(transaction);
-      }
-
-    } catch (error) {
-      console.error('❌ Error depositing USDC:', error);
       
-      // Enhanced error handling for common issues
-      if (error.message && error.message.includes('Transaction version')) {
-        throw new Error('Your wallet does not support versioned transactions. Please try updating your wallet or using a different wallet like Phantom or Solflare.');
+      // Send transaction
+      const signature = await this.sendTransaction(tx);
+      console.log('✅ Deposit successful!', signature);
+      
+      return signature;
+      
+    } catch (error) {
+      console.error('❌ Deposit failed:', error);
+      
+      // Check for specific error messages
+      if (error.message?.includes('stale') || error.message?.includes('NAV')) {
+        throw new Error('NAV data is outdated. Please try again in a moment.');
       }
       
       throw error;
@@ -1462,7 +1098,7 @@ export class VaultClient {
   }
 
   /**
-   * Withdraw USDC from vault
+   * Withdraw USDC from the vault
    */
   async withdrawUsdc(shares) {
     try {
@@ -1484,11 +1120,22 @@ export class VaultClient {
       const vault = await this.vaultProgram.account.vault.fetch(vaultPDA);
       console.log('🏦 Vault fetched, shares mint:', vault.sharesMint.toString());
       
-      // Get vault authority PDA
-      const [vaultAuthorityPDA] = PublicKey.findProgramAddressSync(
-        [Buffer.from("vault_authority")],
-        this.vaultProgram.programId
-      );
+      // Check if NAV is stale (older than 5 minutes)
+      const currentTime = Math.floor(Date.now() / 1000);
+      const navAge = currentTime - vault.navLastUpdated.toNumber();
+      
+      if (navAge > 300) { // 5 minutes
+        console.log(`⚠️ NAV is stale (${navAge} seconds old). Calculating fresh NAV...`);
+        await this.calculateNav();
+        
+        // Refetch vault to get updated NAV
+        vault = await this.vaultProgram.account.vault.fetch(vaultPDA);
+      } else {
+        console.log(`✅ NAV is fresh (${navAge} seconds old)`);
+      }
+      
+      // Get vault authority PDA  
+      const [vaultAuthorityPDA] = getVaultAuthorityPDA(vaultPDA);
       
       // Get token accounts
       const userUsdcAccount = await getAssociatedTokenAddress(this.usdcMint, this.wallet.publicKey);
@@ -1501,10 +1148,7 @@ export class VaultClient {
       console.log('  - Vault USDC:', vaultUsdcAccount.toString());
       console.log('  - Vault Authority:', vaultAuthorityPDA.toString());
 
-      // 🔄 Pyth oracle updates are handled automatically
-      console.log('🔄 Pyth oracle accounts are handled automatically for withdrawal...');
-
-      // Build the vault withdrawal instruction
+      // Build the vault withdrawal instruction - NO ORACLE ACCOUNTS NEEDED
       const withdrawInstruction = await this.vaultProgram.methods
         .withdraw(sharesBN)
         .accounts({
@@ -1518,18 +1162,31 @@ export class VaultClient {
           vaultAuthority: vaultAuthorityPDA,
           tokenProgram: TOKEN_PROGRAM_ID,
         })
+        .remainingAccounts([])  // No oracle accounts needed anymore
         .instruction();
 
-      // 🔄 Build transaction with Pyth oracle accounts
+      // Create simple transaction
       const tx = new Transaction();
+      tx.add(
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 400000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }),
+        withdrawInstruction
+      );
       
-      // Add the vault withdrawal instruction
-      tx.add(withdrawInstruction);
-        
-      console.log('✅ Withdraw transaction built successfully with Pyth!');
-      return await this.sendTransaction(tx);
+      // Send transaction
+      const signature = await this.sendTransaction(tx);
+      console.log('✅ Withdrawal successful!', signature);
+      
+      return { signature, success: true };
+      
     } catch (error) {
-      console.error('❌ Error withdrawing USDC:', error);
+      console.error('❌ Withdrawal failed:', error);
+      
+      // Check for specific error messages
+      if (error.message?.includes('stale') || error.message?.includes('NAV')) {
+        throw new Error('NAV data is outdated. Please try again in a moment.');
+      }
+      
       throw error;
     }
   }
@@ -1778,6 +1435,86 @@ export class VaultClient {
   }
 
   /**
+   * Get oracle accounts for ALL vault holdings (critical for NAV calculation during withdraw)
+   */
+  async getVaultOracleAccounts(vaultAuthorityPDA) {
+    console.log('🔮 Building oracle accounts for all vault holdings...');
+    
+    const oracleAccounts = [];
+    
+    try {
+      // Get all token accounts owned by vault authority
+      const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+        vaultAuthorityPDA,
+        { programId: TOKEN_PROGRAM_ID }
+      );
+
+      console.log(`🪙 Found ${tokenAccounts.value.length} vault token accounts`);
+
+      // Process each token account
+      for (const tokenAccount of tokenAccounts.value) {
+        try {
+          const accountInfo = tokenAccount.account.data.parsed.info;
+          const tokenMint = accountInfo.mint;
+          const tokenBalance = parseFloat(accountInfo.tokenAmount.uiAmount || 0);
+
+          // Skip tokens with zero balance
+          if (tokenBalance === 0) {
+            console.log(`⏭️ Skipping ${tokenMint.slice(0,8)}... (zero balance)`);
+            continue;
+          }
+
+          // Check if we have a Pyth feed for this token
+          const pythFeedId = PYTH_PRICE_FEEDS[tokenMint];
+          if (!pythFeedId) {
+            console.log(`⚠️ No Pyth feed for ${tokenMint.slice(0,8)}... (${tokenBalance} balance) - skipping`);
+            continue;
+          }
+
+          const tokenSymbol = TOKEN_MINT_TO_SYMBOL[tokenMint] || 'UNKNOWN';
+          console.log(`✅ Adding oracle accounts for ${tokenSymbol}: ${tokenBalance} tokens`);
+
+          // Create oracle account group: [token_account, price_account, mint_account]
+          const priceAccountPubkey = new PublicKey(Buffer.from(pythFeedId.slice(2), 'hex'));
+          
+          // Add the three accounts for this token (matching smart contract expectation)
+          oracleAccounts.push(
+            {
+              pubkey: tokenAccount.pubkey, // Token account
+              isWritable: false,
+              isSigner: false,
+            },
+            {
+              pubkey: priceAccountPubkey, // Price oracle account  
+              isWritable: false,
+              isSigner: false,
+            },
+            {
+              pubkey: new PublicKey(tokenMint), // Token mint
+              isWritable: false,
+              isSigner: false,
+            }
+          );
+
+        } catch (error) {
+          console.warn(`⚠️ Failed to process token account ${tokenAccount.pubkey.toString()}:`, error);
+          continue;
+        }
+      }
+
+      console.log(`🎯 Oracle accounts prepared: ${oracleAccounts.length} accounts (${oracleAccounts.length / 3} token groups)`);
+      
+      return oracleAccounts;
+
+    } catch (error) {
+      console.error('❌ Failed to get vault oracle accounts:', error);
+      // Return empty array rather than throwing - withdrawal can still work with just USDC
+             console.warn('⚠️ Proceeding with withdrawal without oracle accounts (may result in incomplete NAV)');
+       return [];
+     }
+   }
+
+  /**
    * Get token value in USDC using price feeds
    * Uses real Pyth oracles with Switchboard fallback
    */
@@ -1924,5 +1661,391 @@ export class VaultClient {
     console.log(`💰 Token ${tokenMint.toString()}: ${tokenBalance.toString()} tokens * $${priceUsd} (mock) = ${tokenValue.toString()} micro-USDC`);
     
     return tokenValue;
+  }
+
+  /**
+   * Calculate and cache NAV for the vault
+   * This should be called before deposits/withdrawals if NAV is stale
+   */
+  async calculateNav() {
+    try {
+      console.log('📊 Calculating NAV for vault...');
+      await this.initialize();
+      
+      const [vaultPDA] = getVaultPDA(this.usdcMint);
+      const vault = await this.vaultProgram.account.vault.fetch(vaultPDA);
+      
+      // Check if NAV is already fresh (less than 5 minutes old)
+      const currentTime = Math.floor(Date.now() / 1000);
+      const navAge = currentTime - vault.navLastUpdated.toNumber();
+      
+      if (navAge < 300) { // 5 minutes
+        console.log(`✅ NAV is fresh (${navAge} seconds old), skipping calculation`);
+        return null;
+      }
+      
+      // Get vault authority PDA
+      const [vaultAuthorityPDA] = PublicKey.findProgramAddressSync(
+        [Buffer.from("vault_authority")],
+        this.vaultProgram.programId
+      );
+      
+      // Get vault USDC account
+      const vaultUsdcAccount = await getAssociatedTokenAddress(this.usdcMint, vaultAuthorityPDA, true);
+      
+      // Get oracle accounts for all vault holdings
+      console.log('🔍 Preparing Pyth oracle data for NAV calculation...');
+      await this.getOracleAccountsForDeposit(vaultAuthorityPDA);
+      
+      // Build oracle remaining accounts
+      const oracleRemainingAccounts = [];
+      
+      if (this._priceUpdates && this._priceUpdates.length > 0) {
+        console.log('🏗️ Creating Pyth price update instructions...');
+        
+        // Create transaction builder
+        const transactionBuilder = this.pythSolanaReceiver.newTransactionBuilder({
+          closeUpdateAccounts: true, // We can close after NAV calculation
+        });
+        
+        // Add price updates
+        await transactionBuilder.addPostPriceUpdates(this._priceUpdates);
+        
+        // Add NAV calculation instruction
+        await transactionBuilder.addPriceConsumerInstructions(
+          async (getPriceUpdateAccount) => {
+            // Build oracle remaining accounts
+            const remainingAccounts = [];
+            
+            for (let i = 0; i < this._tokenData.length; i++) {
+              const token = this._tokenData[i];
+              const feedId = this._priceFeeds[i];
+              const priceUpdateAccount = getPriceUpdateAccount(feedId);
+              
+              // Add oracle group: [token_account, price_oracle, mint]
+              remainingAccounts.push(
+                { pubkey: token.tokenAccount, isWritable: false, isSigner: false },
+                { pubkey: priceUpdateAccount, isWritable: false, isSigner: false },
+                { pubkey: token.mint, isWritable: false, isSigner: false }
+              );
+            }
+            
+            // Build calculate NAV instruction
+            const calculateNavIx = await this.vaultProgram.methods
+              .calculateNav()
+              .accounts({
+                authority: this.wallet.publicKey,
+                vault: vaultPDA,
+                vaultUsdcToken: vaultUsdcAccount,
+              })
+              .remainingAccounts(remainingAccounts)
+              .instruction();
+            
+            return [{ instruction: calculateNavIx, signers: [] }];
+          }
+        );
+        
+        // Build and send transactions
+        const versionedTransactions = await transactionBuilder.buildVersionedTransactions({
+          computeUnitPriceMicroLamports: 50000,
+          computeUnitLimit: 600000,
+        });
+        
+        console.log(`📊 Sending ${versionedTransactions.length} transaction(s) for NAV calculation`);
+        
+        const signatures = await this.pythSolanaReceiver.provider.sendAll(
+          versionedTransactions,
+          { skipPreflight: true }
+        );
+        
+        console.log('✅ NAV calculated successfully!', signatures[0]);
+        return signatures[0];
+        
+      } else {
+        // No oracle data needed - vault only holds USDC
+        console.log('💡 No price updates needed - calculating NAV with USDC only');
+        
+        const tx = new Transaction();
+        tx.add(
+          ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 }),
+          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 })
+        );
+        
+        const calculateNavIx = await this.vaultProgram.methods
+          .calculateNav()
+          .accounts({
+            authority: this.wallet.publicKey,
+            vault: vaultPDA,
+            vaultUsdcToken: vaultUsdcAccount,
+          })
+          .remainingAccounts([])
+          .instruction();
+        
+        tx.add(calculateNavIx);
+        
+        const signature = await this.sendTransaction(tx);
+        console.log('✅ NAV calculated successfully!', signature);
+        return signature;
+      }
+      
+    } catch (error) {
+      console.error('❌ Failed to calculate NAV:', error);
+      throw error;
+    }
+  }
+  
+  /**
+   * Refresh NAV (permissionless - anyone can call)
+   * This is a public method that doesn't require special authority
+   */
+  async refreshNav() {
+    try {
+      console.log('🔄 Refreshing NAV (permissionless)...');
+      await this.initialize();
+      
+      const [vaultPDA] = getVaultPDA(this.usdcMint);
+      const vault = await this.vaultProgram.account.vault.fetch(vaultPDA);
+      
+      // Check if NAV was updated recently (prevent spam)
+      const currentTime = Math.floor(Date.now() / 1000);
+      const navAge = currentTime - vault.navLastUpdated.toNumber();
+      
+      if (navAge < 30) { // 30 seconds minimum interval
+        console.log(`⏳ NAV was updated ${navAge} seconds ago, minimum interval is 30 seconds`);
+        return null;
+      }
+      
+      // Get vault authority PDA
+      const [vaultAuthorityPDA] = PublicKey.findProgramAddressSync(
+        [Buffer.from("vault_authority")],
+        this.vaultProgram.programId
+      );
+      
+      // Get vault USDC account
+      const vaultUsdcAccount = await getAssociatedTokenAddress(this.usdcMint, vaultAuthorityPDA, true);
+      
+      // Get oracle accounts for all vault holdings
+      console.log('🔍 Preparing Pyth oracle data for NAV refresh...');
+      await this.getOracleAccountsForDeposit(vaultAuthorityPDA);
+      
+      if (this._priceUpdates && this._priceUpdates.length > 0) {
+        console.log('🏗️ Creating Pyth price update instructions...');
+        
+        // Create transaction builder
+        const transactionBuilder = this.pythSolanaReceiver.newTransactionBuilder({
+          closeUpdateAccounts: true,
+        });
+        
+        // Add price updates
+        await transactionBuilder.addPostPriceUpdates(this._priceUpdates);
+        
+        // Add refresh NAV instruction
+        await transactionBuilder.addPriceConsumerInstructions(
+          async (getPriceUpdateAccount) => {
+            // Build oracle remaining accounts
+            const remainingAccounts = [];
+            
+            for (let i = 0; i < this._tokenData.length; i++) {
+              const token = this._tokenData[i];
+              const feedId = this._priceFeeds[i];
+              const priceUpdateAccount = getPriceUpdateAccount(feedId);
+              
+              // Add oracle group: [token_account, price_oracle, mint]
+              remainingAccounts.push(
+                { pubkey: token.tokenAccount, isWritable: false, isSigner: false },
+                { pubkey: priceUpdateAccount, isWritable: false, isSigner: false },
+                { pubkey: token.mint, isWritable: false, isSigner: false }
+              );
+            }
+            
+            // Build refresh NAV instruction (permissionless)
+            const refreshNavIx = await this.vaultProgram.methods
+              .refreshNav()
+              .accounts({
+                payer: this.wallet.publicKey,
+                vault: vaultPDA,
+                vaultUsdcToken: vaultUsdcAccount,
+                systemProgram: SystemProgram.programId,
+              })
+              .remainingAccounts(remainingAccounts)
+              .instruction();
+            
+            return [{ instruction: refreshNavIx, signers: [] }];
+          }
+        );
+        
+        // Build and send transactions
+        const versionedTransactions = await transactionBuilder.buildVersionedTransactions({
+          computeUnitPriceMicroLamports: 50000,
+          computeUnitLimit: 600000,
+        });
+        
+        console.log(`📊 Sending ${versionedTransactions.length} transaction(s) for NAV refresh`);
+        
+        const signatures = await this.pythSolanaReceiver.provider.sendAll(
+          versionedTransactions,
+          { skipPreflight: true }
+        );
+        
+        console.log('✅ NAV refreshed successfully!', signatures[0]);
+        return signatures[0];
+        
+      } else {
+        // No oracle data needed - vault only holds USDC
+        console.log('💡 No price updates needed - refreshing NAV with USDC only');
+        
+        const tx = new Transaction();
+        tx.add(
+          ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 }),
+          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 })
+        );
+        
+        const refreshNavIx = await this.vaultProgram.methods
+          .refreshNav()
+          .accounts({
+            payer: this.wallet.publicKey,
+            vault: vaultPDA,
+            vaultUsdcToken: vaultUsdcAccount,
+            systemProgram: SystemProgram.programId,
+          })
+          .remainingAccounts([])
+          .instruction();
+        
+        tx.add(refreshNavIx);
+        
+        const sig = await sendAndConfirmTransaction(this.connection, tx, [this.wallet.payer], {
+          skipPreflight: true,
+          commitment: 'confirmed',
+        });
+        
+        console.log('✅ NAV refreshed successfully!', sig);
+        return sig;
+      }
+      
+    } catch (error) {
+      console.error('❌ NAV refresh failed:', error);
+      if (error.message?.includes('NAV was updated too recently')) {
+        console.log('⏳ NAV is still fresh, no update needed');
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Collect performance fees if NAV is above high water mark
+   */
+  async collectPerformanceFees() {
+    try {
+      console.log('💰 Checking for performance fees...');
+      await this.initialize();
+      
+      const [vaultPDA] = getVaultPDA(this.usdcMint);
+      const vault = await this.vaultProgram.account.vault.fetch(vaultPDA);
+      
+      // Check if fees can be collected
+      if (vault.cachedNav.lte(vault.highWaterMarkNav)) {
+        console.log('ℹ️ No performance fees to collect - NAV below high water mark');
+        return null;
+      }
+      
+      // Get vault authority PDA
+      const [vaultAuthorityPDA] = PublicKey.findProgramAddressSync(
+        [Buffer.from("vault_authority")],
+        this.vaultProgram.programId
+      );
+      
+      // Get required accounts
+      const vaultUsdcAccount = await getAssociatedTokenAddress(this.usdcMint, vaultAuthorityPDA, true);
+      const treasuryUsdcAccount = await getAssociatedTokenAddress(this.usdcMint, vault.treasury, false);
+      
+      // Build and send transaction
+      const tx = new Transaction();
+      tx.add(
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 })
+      );
+      
+      const collectFeesIx = await this.vaultProgram.methods
+        .collectPerformanceFees()
+        .accounts({
+          authority: this.wallet.publicKey,
+          vault: vaultPDA,
+          vaultUsdcToken: vaultUsdcAccount,
+          treasuryUsdcToken: treasuryUsdcAccount,
+          vaultAuthority: vaultAuthorityPDA,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .instruction();
+      
+      tx.add(collectFeesIx);
+      
+      const signature = await this.sendTransaction(tx);
+      console.log('✅ Performance fees collected!', signature);
+      return signature;
+      
+    } catch (error) {
+      console.error('❌ Failed to collect performance fees:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Start automatic NAV refresh timer
+   * @param {number} intervalMs - Refresh interval in milliseconds (default: 5 minutes)
+   */
+  startAutoRefreshNav(intervalMs = 5 * 60 * 1000) {
+    // Stop any existing interval
+    this.stopAutoRefreshNav();
+    
+    console.log(`🔄 Starting automatic NAV refresh every ${intervalMs / 1000} seconds`);
+    
+    // Do an immediate refresh
+    this.refreshNav().catch(error => {
+      console.error('❌ Initial NAV refresh failed:', error);
+    });
+    
+    // Set up interval
+    this.navRefreshInterval = setInterval(async () => {
+      try {
+        console.log('⏰ Auto-refreshing NAV...');
+        await this.refreshNav();
+      } catch (error) {
+        console.error('❌ Auto NAV refresh failed:', error);
+        // Continue running the interval even if one refresh fails
+      }
+    }, intervalMs);
+  }
+
+  /**
+   * Stop automatic NAV refresh timer
+   */
+  stopAutoRefreshNav() {
+    if (this.navRefreshInterval) {
+      clearInterval(this.navRefreshInterval);
+      this.navRefreshInterval = null;
+      console.log('🛑 Stopped automatic NAV refresh');
+    }
+  }
+
+  /**
+   * Check if NAV needs refresh (useful for manual checks)
+   * @returns {Promise<boolean>} True if NAV is stale and needs refresh
+   */
+  async isNavStale() {
+    try {
+      await this.initialize();
+      const [vaultPDA] = getVaultPDA(this.usdcMint);
+      const vault = await this.vaultProgram.account.vault.fetch(vaultPDA);
+      
+      const currentTime = Math.floor(Date.now() / 1000);
+      const navAge = currentTime - vault.navLastUpdated.toNumber();
+      
+      // Consider stale if older than 5 minutes
+      return navAge > 300;
+    } catch (error) {
+      console.error('Failed to check NAV staleness:', error);
+      return true; // Assume stale on error
+    }
   }
 }

@@ -45,6 +45,13 @@ export const getVaultPDA = (usdcMint) => {
   );
 };
 
+export const getVaultAuthorityPDA = (vaultPDA) => {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("vault_authority")],
+    new PublicKey(CONTRACTS.CALVIN_VAULT_PROGRAM)
+  );
+};
+
 export const getUserPositionPDA = (vaultPDA, userPublicKey) => {
   return PublicKey.findProgramAddressSync(
     [Buffer.from("user_position"), userPublicKey.toBuffer(), vaultPDA.toBuffer()],

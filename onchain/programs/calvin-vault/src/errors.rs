@@ -27,6 +27,12 @@ pub enum VaultError {
     #[msg("Price data too stale")]
     PriceTooStale,
 
+    #[msg("Cached NAV is stale - please call calculate_nav first")]
+    StaleNav,
+
+    #[msg("NAV was updated too recently - please wait before refreshing")]
+    NavTooFresh,
+
     #[msg("Vault is currently paused")]
     VaultPaused,
 

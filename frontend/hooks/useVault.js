@@ -301,6 +301,9 @@ export const useVault = () => {
       fetchUserData();
       fetchVaultStats();
       fetchTotalStakedCalvin();
+      
+      // Don't auto-refresh NAV - users would have to pay fees
+      // Instead, NAV will be refreshed automatically when needed (on deposits/withdrawals)
     }
   }, [wallet.connected, vaultClient, fetchUserData, fetchVaultStats, fetchTotalStakedCalvin]);
 

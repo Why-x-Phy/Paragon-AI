@@ -1161,6 +1161,32 @@ class HourlyInferenceScheduler:
                 timing_data['trade_execution_start'] = datetime.utcnow()
                 self.logger.info(f"💰 Executing vault trades ({len(portfolio_signals.buy_signals)} buy, {len(portfolio_signals.sell_signals)} sell)...")
                 
+                # Pre-trade NAV refresh using Node script to ensure fresh NAV before any transactions
+                try:
+                    import subprocess
+                    import os
+                    js_service_path = os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                        "force_nav_update.js"
+                    )
+                    self.logger.info("📊 Refreshing NAV before trade execution via JavaScript service...")
+                    result = subprocess.run(
+                        ["node", js_service_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=90
+                    )
+                    if result.returncode == 0:
+                        self.logger.info("✅ Pre-trade NAV refreshed successfully")
+                    else:
+                        stderr = (result.stderr or '').strip()
+                        stdout = (result.stdout or '').strip()
+                        self.logger.warning(f"⚠️ NAV refresh returned non-zero exit ({result.returncode}). stderr: {stderr or stdout}")
+                except subprocess.TimeoutExpired:
+                    self.logger.warning("⚠️ NAV refresh service timed out (90s), continuing with trades...")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Failed to run NAV refresh service: {e}, continuing with trades...")
+                
                 try:
                     from ..vault.trade_executor import VaultTradeExecutor
                     from ..vault.trade_executor_fix import create_thread_safe_executor

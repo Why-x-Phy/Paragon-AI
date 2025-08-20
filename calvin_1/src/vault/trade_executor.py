@@ -29,6 +29,9 @@ from ..config.config import config
 from ..utils.logger import log
 from ..database.production_db import get_db_manager
 
+# ⚠️ TEMPORARY MODIFICATION: Block buy transactions, only allow sells
+SELL_ONLY_MODE = False
+
 # Constants
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
@@ -259,68 +262,73 @@ class VaultTradeExecutor:
             
             # Execute BUY signals after sells (to use freed up capital)
             if portfolio_signal.buy_signals:
-                logger.info(f"🚀 Executing {len(portfolio_signal.buy_signals)} BUY signals")
+                # ⚠️ TEMPORARY MODIFICATION: Check if buy transactions are blocked
+                if SELL_ONLY_MODE:
+                    logger.warning(f"🚫 SELL_ONLY_MODE ENABLED: Blocking {len(portfolio_signal.buy_signals)} BUY signals")
+                    logger.warning("⚠️ Only SELL transactions will be executed - BUY transactions are temporarily disabled")
+                else:
+                    logger.info(f"🚀 Executing {len(portfolio_signal.buy_signals)} BUY signals")
                 
-                for i, buy_signal in enumerate(portfolio_signal.buy_signals):
-                    try:
-                        # Get allocation for this signal
-                        allocation = portfolio_signal.asset_allocations.get(buy_signal.symbol)
-                        if not allocation:
-                            logger.warning(f"⚠️ No allocation found for {buy_signal.symbol}")
-                            continue
-                        
-                        # NEW: Prevent buying if already holding the token (above dust threshold)
-                        token_mint = await self._get_token_mint(buy_signal.symbol)
-                        if not token_mint:
-                            logger.warning(f"⚠️ Token mint not found for {buy_signal.symbol}")
-                            continue
-                        token_balance = await self.vault_client.get_token_balance(token_mint) if self.vault_client else 0
-                        if token_balance > DUST_THRESHOLD_TOKENS:
-                            logger.warning(f"🚫 Skipping BUY for {buy_signal.symbol}: already holding {token_balance} tokens in vault")
-                            continue
-                        elif token_balance > 0:
-                            logger.info(f"💨 Ignoring dust balance for {buy_signal.symbol} ({token_balance} tokens < {DUST_THRESHOLD_TOKENS} threshold)")
-                        
-                        # Trade size managed by portfolio coordinator - no artificial validation needed
-                        trade_size = allocation.position_value_usdc
-                        
-                        # Execute individual trade
-                        logger.info(f"🚀 Executing BUY {i+1}/{len(portfolio_signal.buy_signals)}: {buy_signal.symbol}")
-                        tx_sig = await self.execute_single_trade(buy_signal, allocation, trade_type='buy')
-                        
-                        if tx_sig:
-                            # Verify transaction immediately (for real transactions) BEFORE recording
-                            if self.trade_verifier and not tx_sig.startswith('SIM_'):
-                                verification_result = await self._verify_trade_immediately(None, tx_sig)
-                                if verification_result.final_status == "confirmed":
-                                    # Only record in database AFTER verification passes
-                                    trade_id = await self._record_trade_execution(buy_signal, allocation, tx_sig, "confirmed", trade_type='buy')
-                                    if trade_id:
-                                        # Update the verification result with the correct trade_id
-                                        await self._update_verification_trade_id(verification_result, trade_id)
-                                    results.append(tx_sig)
-                                    logger.info(f"✅ BUY confirmed: {buy_signal.symbol} - {tx_sig[:12]}...")
-                                else:
-                                    logger.error(f"❌ BUY verification failed: {buy_signal.symbol} - {verification_result.execution_error}")
-                                    # Don't record failed trades in database
-                            elif tx_sig.startswith('SIM_'):
-                                # For simulations, record immediately since no verification needed
-                                trade_id = await self._record_trade_execution(buy_signal, allocation, tx_sig, "confirmed", trade_type='buy')
-                                results.append(tx_sig)
-                                logger.info(f"📝 BUY simulation completed: {buy_signal.symbol}")
-                            else:
-                                # No verifier available, record as pending (legacy behavior)
-                                trade_id = await self._record_trade_execution(buy_signal, allocation, tx_sig, "pending", trade_type='buy')
-                                results.append(tx_sig)
-                                logger.info(f"📤 BUY submitted (no verification): {buy_signal.symbol} - {tx_sig[:12]}...")
-                        else:
-                            # Don't record failed trades in database - just log the failure
-                            logger.warning(f"❌ BUY failed: {buy_signal.symbol}")
+                    for i, buy_signal in enumerate(portfolio_signal.buy_signals):
+                        try:
+                            # Get allocation for this signal
+                            allocation = portfolio_signal.asset_allocations.get(buy_signal.symbol)
+                            if not allocation:
+                                logger.warning(f"⚠️ No allocation found for {buy_signal.symbol}")
+                                continue
                             
-                    except Exception as e:
-                        logger.error(f"❌ Failed to execute BUY for {buy_signal.symbol}: {e}")
-                        # Don't record failed trades in database - just log the failure
-                        logger.debug(f"BUY execution details: {str(e)}")
+                            # NEW: Prevent buying if already holding the token (above dust threshold)
+                            token_mint = await self._get_token_mint(buy_signal.symbol)
+                            if not token_mint:
+                                logger.warning(f"⚠️ Token mint not found for {buy_signal.symbol}")
+                                continue
+                            token_balance = await self.vault_client.get_token_balance(token_mint) if self.vault_client else 0
+                            if token_balance > DUST_THRESHOLD_TOKENS:
+                                logger.warning(f"🚫 Skipping BUY for {buy_signal.symbol}: already holding {token_balance} tokens in vault")
+                                continue
+                            elif token_balance > 0:
+                                logger.info(f"💨 Ignoring dust balance for {buy_signal.symbol} ({token_balance} tokens < {DUST_THRESHOLD_TOKENS} threshold)")
+                            
+                            # Trade size managed by portfolio coordinator - no artificial validation needed
+                            trade_size = allocation.position_value_usdc
+                            
+                            # Execute individual trade
+                            logger.info(f"🚀 Executing BUY {i+1}/{len(portfolio_signal.buy_signals)}: {buy_signal.symbol}")
+                            tx_sig = await self.execute_single_trade(buy_signal, allocation, trade_type='buy')
+                            
+                            if tx_sig:
+                                # Verify transaction immediately (for real transactions) BEFORE recording
+                                if self.trade_verifier and not tx_sig.startswith('SIM_'):
+                                    verification_result = await self._verify_trade_immediately(None, tx_sig)
+                                    if verification_result.final_status == "confirmed":
+                                        # Only record in database AFTER verification passes
+                                        trade_id = await self._record_trade_execution(buy_signal, allocation, tx_sig, "confirmed", trade_type='buy')
+                                        if trade_id:
+                                            # Update the verification result with the correct trade_id
+                                            await self._update_verification_trade_id(verification_result, trade_id)
+                                        results.append(tx_sig)
+                                        logger.info(f"✅ BUY confirmed: {buy_signal.symbol} - {tx_sig[:12]}...")
+                                    else:
+                                        logger.error(f"❌ BUY verification failed: {buy_signal.symbol} - {verification_result.execution_error}")
+                                        # Don't record failed trades in database
+                                elif tx_sig.startswith('SIM_'):
+                                    # For simulations, record immediately since no verification needed
+                                    trade_id = await self._record_trade_execution(buy_signal, allocation, tx_sig, "confirmed", trade_type='buy')
+                                    results.append(tx_sig)
+                                    logger.info(f"📝 BUY simulation completed: {buy_signal.symbol}")
+                                else:
+                                    # No verifier available, record as pending (legacy behavior)
+                                    trade_id = await self._record_trade_execution(buy_signal, allocation, tx_sig, "pending", trade_type='buy')
+                                    results.append(tx_sig)
+                                    logger.info(f"📤 BUY submitted (no verification): {buy_signal.symbol} - {tx_sig[:12]}...")
+                            else:
+                                # Don't record failed trades in database - just log the failure
+                                logger.warning(f"❌ BUY failed: {buy_signal.symbol}")
+                                
+                        except Exception as e:
+                            logger.error(f"❌ Failed to execute BUY for {buy_signal.symbol}: {e}")
+                            # Don't record failed trades in database - just log the failure
+                            logger.debug(f"BUY execution details: {str(e)}")
             
             # Final summary
             success_rate = len(results) / total_signals if total_signals > 0 else 0

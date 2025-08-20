@@ -12,7 +12,7 @@ async function getQuote(inputMint, outputMint, amount, slippageBps = 50) {
             slippageBps: slippageBps.toString(),
             onlyDirectRoutes: 'true',  // ✅ OPTIMIZATION: Force direct routes for fewer accounts
             restrictIntermediateTokens: 'true', // ✅ MEV PROTECTION: Avoid multi-hop routes
-            excludeDexes: 'Meteora DLMM', // ✅ AVOID PROBLEMATIC DEXs with poor slippage protection
+            excludeDexes: 'Meteora DLMM, Orca V2, Orca V1, Whirlpool', // ✅ AVOID PROBLEMATIC DEXs with poor slippage protection
             // ✅ CRITICAL: Don't use asLegacyTransaction to get proper versioned transaction format
             asLegacyTransaction: 'false'
         });

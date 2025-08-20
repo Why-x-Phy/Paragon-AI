@@ -78,14 +78,14 @@ const PerformanceBox = () => {
           <div className="flex flex-row gap-1 sm:gap-3 text-white w-full">
             <div className='flex flex-col items-center border-1 border-white/10 p-3 gap-2 rounded-[4px] flex-1'>
               <div className="text-[16px] text-gray-400 border-b-1 border-white/10">24 H</div>
-              <div className={`${performance["24h"] >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                {performance["24h"] >= 0 ? '+' : ''}{performance["24h"]}%
+              <div className="text-yellow-400 text-xs">
+                under maintenance
               </div>
             </div>
             <div className='flex flex-col items-center border-1 border-white/10 p-3 gap-2 rounded-[4px] flex-1'>
               <div className="text-[16px] text-gray-400 border-b-1 border-white/10">7 Days</div>
-              <div className={`${performance["7d"] >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                {performance["7d"] >= 0 ? '+' : ''}{performance["7d"]}%
+              <div className="text-yellow-400 text-xs">
+                under maintenance
               </div>
             </div>
             <div className='flex flex-col items-center border-1 border-white/10 p-3 gap-2 rounded-[4px] flex-[3]'>
@@ -98,14 +98,14 @@ const PerformanceBox = () => {
           <div className="flex flex-row gap-1 sm:gap-3 text-white w-full">
             <div className='flex flex-col items-center border-1 border-white/10 p-3 gap-2 rounded-[4px] flex-1'>
               <div className="text-[16px] text-gray-400 border-b-1 border-white/10">Month</div>
-              <div className={`${performance["30d"] >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                {performance["30d"] >= 0 ? '+' : ''}{performance["30d"]}%
+              <div className="text-yellow-400 text-xs">
+                under maintenance
               </div>
             </div>
             <div className='flex flex-col items-center border-1 border-white/10 p-3 gap-2 rounded-[4px] flex-1'>
               <div className="text-[16px] text-gray-400 border-b-1 border-white/10">YTD</div>
-              <div className={`${performance["ytd"] >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                {performance["ytd"] >= 0 ? '+' : ''}{performance["ytd"]}%
+              <div className="text-yellow-400 text-xs">
+                under maintenance
               </div>
             </div>
             <div className='flex flex-col items-center border-1 border-white/10 p-3 gap-2 rounded-[4px] flex-[3]'>

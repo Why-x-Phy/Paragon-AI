@@ -34,6 +34,18 @@ class DataLoader:
             'BONK': 'BONK-USD',
         }
 
+        # Base/quote mapping for new CoinAPI-based orderbook (exchange/market/base/quote)
+        # Default exchange/market if not specified: BINANCE/SPOT
+        # Default quote: USDT for majors, otherwise USDC where appropriate
+        self.base_quote_mapping = {
+            'BTC': ('BTC', 'USDT'),
+            'ETH': ('ETH', 'USDT'),
+            'SOL': ('SOL', 'USDC'),
+            'JUP': ('JUP', 'USDC'),
+            'BONK': ('BONK', 'USDC'),
+            'FARTCOIN': ('FARTCOIN', 'USDC'),
+        }
+
     @property
     def engine(self):
         """Get SQLAlchemy engine"""
@@ -44,6 +56,15 @@ class DataLoader:
     def get_orderbook_symbol(self, symbol: str) -> str:
         """Get orderbook symbol name (may differ from ohlcv symbol)"""
         return self.symbol_mapping.get(symbol, symbol)
+
+    def get_orderbook_keys(self, symbol: str):
+        """
+        Get (exchange, market_type, base, quote) for querying ob_* views.
+        Defaults to (BINANCE, SPOT, SYMBOL, USDT/USDC) if not mapped.
+        """
+        sym = (symbol or "").upper()
+        base, quote = self.base_quote_mapping.get(sym, (sym, 'USDT'))
+        return 'BINANCE', 'SPOT', base, quote
 
     def load_candles(self,
                      symbol: str,
@@ -106,68 +127,46 @@ class DataLoader:
         return df
 
     def load_top_of_book(self,
-                        symbol: str,
-                        start_ts: Optional[str] = None,
-                        end_ts: Optional[str] = None,
-                        freq: str = '1S',
-                        use_symbol_mapping: bool = True) -> pd.DataFrame:
+                         symbol: str,
+                         start_ts: Optional[str] = None,
+                         end_ts: Optional[str] = None,
+                         freq: str = '1S') -> pd.DataFrame:
         """
-        Load top-of-book data from tob_1s materialized view
-
-        Args:
-            symbol: Token symbol
-            start_ts: Start timestamp string
-            end_ts: End timestamp string
-            freq: Resampling frequency if needed
-            use_symbol_mapping: Whether to map symbol name for orderbook tables
-
-        Returns:
-            DataFrame with best_bid, best_ask indexed by timestamp
+        Load top-of-book data from ob_tob_1s materialized view (new pipeline).
         """
         start_ts = start_ts or self.config.default_start_ts
         end_ts = end_ts or self.config.default_end_ts
 
-        # Use symbol mapping for orderbook tables if requested
-        query_symbol = self.get_orderbook_symbol(symbol) if use_symbol_mapping else symbol
+        exchange, market_type, base, quote = self.get_orderbook_keys(symbol)
 
-        query = f"""
+        query = """
         SELECT
-            {self.config.features.tob_time_col} as timestamp,
-            {self.config.features.best_bid_col} as best_bid,
-            {self.config.features.best_ask_col} as best_ask,
-            {self.config.features.tob_symbol_col} as symbol
-        FROM {self.config.features.tob_table}
-        WHERE {self.config.features.tob_symbol_col} = %s
-          AND {self.config.features.tob_time_col} >= %s
-          AND {self.config.features.tob_time_col} < %s
-        ORDER BY {self.config.features.tob_time_col}
+          bucket AS timestamp,
+          best_bid,
+          best_ask
+        FROM ob_tob_1s
+        WHERE exchange = %s AND base = %s AND quote = %s
+          AND bucket >= %s AND bucket < %s
+        ORDER BY bucket
         """
 
-        # Use raw psycopg2 connection to avoid SQLAlchemy parameter issues
-        conn = self.config.get_db_connection()
-        try:
-            df = pd.read_sql_query(
-                query,
-                conn,
-                params=(query_symbol, start_ts, end_ts)
-            )
-        finally:
-            conn.close()
+        df = pd.read_sql_query(
+            query,
+            self.engine,
+            params=(exchange, base, quote, start_ts, end_ts)
+        )
 
         if df.empty:
-            logger.warning(f"No top-of-book data found for {symbol} between {start_ts} and {end_ts}")
+            logger.warning(f"No top-of-book data found for {symbol} {exchange}/{base}-{quote} between {start_ts} and {end_ts}")
             return pd.DataFrame()
 
-        # Set timestamp as index
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df = df.set_index('timestamp').sort_index()
 
-        # Resample if requested frequency is different from 1S
-        if freq != '1S':
+        if freq and freq != '1S':
             df = df.resample(freq).agg({
                 'best_bid': 'last',
                 'best_ask': 'last',
-                'symbol': 'last'
             }).dropna()
 
         logger.info(f"Loaded {len(df)} top-of-book records for {symbol}")
@@ -178,7 +177,7 @@ class DataLoader:
                                      start_ts: Optional[str] = None,
                                      end_ts: Optional[str] = None) -> pd.DataFrame:
         """
-        Load orderbook microstructure data from lbu_1m materialized view
+        Load orderbook microstructure data from ob_depth_1m_k20 materialized view (new pipeline).
 
         Args:
             symbol: Token symbol
@@ -191,36 +190,31 @@ class DataLoader:
         start_ts = start_ts or self.config.default_start_ts
         end_ts = end_ts or self.config.default_end_ts
 
-        query = f"""
+        exchange, market_type, base, quote = self.get_orderbook_keys(symbol)
+
+        query = """
         SELECT
-            {self.config.features.lbu_time_col} as timestamp,
-            {self.config.features.lbu_best_bid_col} as lb_best_bid,
-            {self.config.features.lbu_best_ask_col} as lb_best_ask,
-            {self.config.features.lbu_imbalance_col} as lb_imbalance,
-            {self.config.features.lbu_spread_bps_col} as lb_spread_bps,
-            {self.config.features.lbu_buy_vol_col} as lb_buy_vol,
-            {self.config.features.lbu_sell_vol_col} as lb_sell_vol,
-            {self.config.features.lbu_symbol_col} as symbol
-        FROM {self.config.features.lbu_table}
-        WHERE {self.config.features.lbu_symbol_col} = %s
-          AND {self.config.features.lbu_time_col} >= %s
-          AND {self.config.features.lbu_time_col} < %s
-        ORDER BY {self.config.features.lbu_time_col}
+          bucket AS timestamp,
+          med_bid_px    AS lb_best_bid,
+          med_ask_px    AS lb_best_ask,
+          imbalance_k   AS lb_imbalance,
+          spread_bps    AS lb_spread_bps,
+          bid_vol_k     AS lb_buy_vol,
+          ask_vol_k     AS lb_sell_vol
+        FROM ob_depth_1m_k20
+        WHERE exchange = %s AND base = %s AND quote = %s
+          AND bucket >= %s AND bucket < %s
+        ORDER BY bucket
         """
 
-        # Use raw psycopg2 connection to avoid SQLAlchemy parameter issues
-        conn = self.config.get_db_connection()
-        try:
-            df = pd.read_sql_query(
-                query,
-                conn,
-                params=(symbol, start_ts, end_ts)
-            )
-        finally:
-            conn.close()
+        df = pd.read_sql_query(
+            query,
+            self.engine,
+            params=(exchange, base, quote, start_ts, end_ts)
+        )
 
         if df.empty:
-            logger.warning(f"No orderbook microstructure data found for {symbol} between {start_ts} and {end_ts}")
+            logger.warning(f"No orderbook microstructure data found for {symbol} {exchange}/{base}-{quote} between {start_ts} and {end_ts}")
             return pd.DataFrame()
 
         # Set timestamp as index
@@ -235,10 +229,9 @@ class DataLoader:
                                start_ts: Optional[str] = None,
                                end_ts: Optional[str] = None) -> pd.DataFrame:
         """
-        Load orderbook data from lbu_1m microstructure table
+        Load orderbook snapshot and microstructure (minute-level) from ob_depth_1m_k20 view.
 
         This provides orderbook state at each minute boundary for alignment with candles.
-        Uses lbu_1m since tob_1s appears to be empty.
 
         Args:
             symbol: Token symbol (ohlcv symbol, will be mapped to orderbook symbol)
@@ -248,19 +241,15 @@ class DataLoader:
         Returns:
             DataFrame with orderbook state per minute, indexed by timestamp
         """
-        # Map symbol to orderbook naming convention
-        orderbook_symbol = self.get_orderbook_symbol(symbol)
-        logger.debug(f"Loading orderbook data for {symbol} -> {orderbook_symbol}")
-
-        # Load from lbu_1m microstructure data
-        lbu_df = self.load_orderbook_microstructure(orderbook_symbol, start_ts, end_ts)
+        logger.debug(f"Loading orderbook data for {symbol}")
+        lbu_df = self.load_orderbook_microstructure(symbol, start_ts, end_ts)
 
         if lbu_df.empty:
-            logger.warning(f"No orderbook microstructure data found for {symbol} ({orderbook_symbol})")
+            logger.warning(f"No orderbook microstructure data found for {symbol}")
             return pd.DataFrame()
 
         # Extract top-of-book prices from microstructure data
-        # lbu_1m has lb_best_bid and lb_best_ask columns
+        # ob_depth_1m_k20 has lb_best_bid and lb_best_ask columns (mapped)
         tob_df = lbu_df[['lb_best_bid', 'lb_best_ask']].copy()
 
         # Rename columns for consistency
@@ -276,6 +265,87 @@ class DataLoader:
                 tob_df[col] = lbu_df[col]
 
         return tob_df
+
+    def load_orderbook_levels_snapshots(self,
+                                        symbol: str,
+                                        date: str) -> pd.DataFrame:
+        """
+        Load full per-snapshot L1..L20 bids/asks for a single day from orderbook_levels.
+
+        Returns a DataFrame indexed by timestamp (ts) with columns:
+        bid_px_1..20, bid_sz_1..20, ask_px_1..20, ask_sz_1..20
+        """
+        exchange, market_type, base, quote = self.get_orderbook_keys(symbol)
+        start_ts = f"{date}T00:00:00Z"
+        end_dt = pd.to_datetime(date) + pd.Timedelta(days=1)
+        end_ts = f"{end_dt.strftime('%Y-%m-%d')}T00:00:00Z"
+
+        query = """
+        SELECT ts, side, level, price, size
+        FROM orderbook_levels
+        WHERE exchange = %s AND base = %s AND quote = %s
+          AND ts >= %s AND ts < %s
+        ORDER BY ts
+        """
+
+        df = pd.read_sql_query(
+            query,
+            self.engine,
+            params=(exchange, base, quote, start_ts, end_ts)
+        )
+
+        if df.empty:
+            logger.warning(f"No orderbook_levels data for {symbol} {exchange}/{base}-{quote} on {date}")
+            return pd.DataFrame()
+
+        df['ts'] = pd.to_datetime(df['ts'])
+
+        bids = df[df['side'] == True]
+        asks = df[df['side'] == False]
+
+        bid_px = bids.pivot(index='ts', columns='level', values='price')
+        bid_px = bid_px.rename(columns=lambda k: f"bid_px_{int(k)}")
+        bid_sz = bids.pivot(index='ts', columns='level', values='size')
+        bid_sz = bid_sz.rename(columns=lambda k: f"bid_sz_{int(k)}")
+
+        ask_px = asks.pivot(index='ts', columns='level', values='price')
+        ask_px = ask_px.rename(columns=lambda k: f"ask_px_{int(k)}")
+        ask_sz = asks.pivot(index='ts', columns='level', values='size')
+        ask_sz = ask_sz.rename(columns=lambda k: f"ask_sz_{int(k)}")
+
+        snap = pd.concat([bid_px, bid_sz, ask_px, ask_sz], axis=1).sort_index()
+        snap = snap.dropna(how='all')
+        return snap
+
+    def load_tob_mid_1s(self,
+                        symbol: str,
+                        start_ts: str,
+                        end_ts: str) -> pd.DataFrame:
+        """
+        Load per-second mid price from ob_tob_1s for a time range.
+        """
+        exchange, market_type, base, quote = self.get_orderbook_keys(symbol)
+
+        query = """
+        SELECT bucket AS timestamp, best_bid, best_ask
+        FROM ob_tob_1s
+        WHERE exchange = %s AND base = %s AND quote = %s
+          AND bucket >= %s AND bucket < %s
+        ORDER BY bucket
+        """
+
+        df = pd.read_sql_query(
+            query,
+            self.engine,
+            params=(exchange, base, quote, start_ts, end_ts)
+        )
+
+        if df.empty:
+            return pd.DataFrame()
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.set_index('timestamp').sort_index()
+        df['mid'] = (df['best_bid'] + df['best_ask']) / 2.0
+        return df[['mid']]
 
     def load_combined_data(self,
                           symbol: str,

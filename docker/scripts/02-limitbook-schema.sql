@@ -154,3 +154,125 @@ CREATE INDEX IF NOT EXISTS idx_lbu_1m_symbol_time ON lbu_1m(symbol, bucket DESC)
 CREATE INDEX IF NOT EXISTS idx_lbu_1m_exchange_time ON lbu_1m(exchange, bucket DESC);
 
 -- To refresh historical data, use the refresh_lbu_1m.py script
+
+-- =========================================
+-- Orderbook levels from CoinAPI snapshots
+-- =========================================
+
+-- Row-per-level snapshot storage optimized for ML microstructure features
+CREATE TABLE IF NOT EXISTS orderbook_levels (
+  ts timestamptz NOT NULL,                 -- authoritative time (from time_coinapi, fallback time_exchange)
+  exchange text NOT NULL,                  -- e.g., BINANCE
+  market_type text NOT NULL,               -- e.g., SPOT
+  base text NOT NULL,                      -- e.g., BTC
+  quote text NOT NULL,                     -- e.g., USDT
+  side boolean NOT NULL,                   -- true = bid, false = ask
+  level smallint NOT NULL,                 -- 1..20 from top of book
+  price double precision NOT NULL,
+  size double precision NOT NULL,
+  amount double precision NOT NULL,        -- price * size
+  CONSTRAINT orderbook_levels_uq UNIQUE (ts, exchange, market_type, base, quote, side, level)
+);
+
+-- Hypertable over ts with 6h chunks (align with existing policy)
+SELECT create_hypertable(
+  'orderbook_levels','ts',
+  chunk_time_interval => interval '6 hours',
+  partitioning_column => 'base',
+  number_partitions  => 8,
+  if_not_exists => TRUE
+);
+
+-- Indexes for common query patterns
+CREATE INDEX IF NOT EXISTS idx_obl_base_quote_time_desc
+  ON orderbook_levels (base, quote, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_obl_exchange_base_quote_time_desc
+  ON orderbook_levels (exchange, base, quote, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_obl_time_desc
+  ON orderbook_levels (ts DESC);
+
+-- Compression settings mirroring existing tables
+ALTER TABLE orderbook_levels SET (
+  timescaledb.compress = true,
+  timescaledb.compress_orderby = 'ts',
+  timescaledb.compress_segmentby = 'exchange,base,quote,side'
+);
+SELECT add_compression_policy('orderbook_levels', interval '2 hours', if_not_exists => TRUE);
+
+-- -----------------------------------------
+-- Per-second top-of-book from orderbook_levels
+-- -----------------------------------------
+CREATE MATERIALIZED VIEW IF NOT EXISTS ob_tob_1s
+WITH (timescaledb.continuous) AS
+SELECT
+  time_bucket('1s', ts) AS bucket,
+  exchange,
+  base,
+  quote,
+  MAX(price) FILTER (WHERE side = true)      AS best_bid, -- bids
+  MIN(price) FILTER (WHERE side = false)     AS best_ask, -- asks
+  CASE
+    WHEN (MIN(price) FILTER (WHERE side = false)) IS NOT NULL
+     AND (MAX(price) FILTER (WHERE side = true))  IS NOT NULL
+     AND ((MIN(price) FILTER (WHERE side = false))
+        + (MAX(price) FILTER (WHERE side = true))) > 0
+    THEN ((MIN(price) FILTER (WHERE side = false))
+         - (MAX(price) FILTER (WHERE side = true)))
+         / (((MIN(price) FILTER (WHERE side = false))
+            + (MAX(price) FILTER (WHERE side = true)))/2.0) * 1e4
+    ELSE NULL
+  END AS spread_bps
+FROM orderbook_levels
+GROUP BY bucket, exchange, base, quote;
+
+SELECT add_continuous_aggregate_policy(
+  'ob_tob_1s',
+  start_offset => INTERVAL '1 day',
+  end_offset   => INTERVAL '5 minutes',
+  schedule_interval => INTERVAL '5 minutes',
+  if_not_exists => TRUE
+);
+
+-- -----------------------------------------
+-- Per-minute depth metrics (top 20 levels)
+-- -----------------------------------------
+CREATE MATERIALIZED VIEW IF NOT EXISTS ob_depth_1m_k20
+WITH (timescaledb.continuous) AS
+SELECT
+  time_bucket('1 minute', ts) AS bucket,
+  exchange,
+  base,
+  quote,
+  SUM(size) FILTER (WHERE side = true)  AS bid_vol_k,  -- sum across top-20 bid levels
+  SUM(size) FILTER (WHERE side = false) AS ask_vol_k,  -- sum across top-20 ask levels
+  CASE
+    WHEN (SUM(size) FILTER (WHERE side = true)
+        + SUM(size) FILTER (WHERE side = false)) > 0
+    THEN (SUM(size) FILTER (WHERE side = true)
+         - SUM(size) FILTER (WHERE side = false))
+       / NULLIF((SUM(size) FILTER (WHERE side = true)
+               + SUM(size) FILTER (WHERE side = false)),0)::numeric
+    ELSE NULL
+  END AS imbalance_k,
+  -- Median prices per side within minute as robust TOB approximations
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE side = true)  AS med_bid_px,
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE side = false) AS med_ask_px,
+  CASE
+    WHEN (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE side = false) >
+          PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE side = true))
+    THEN (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE side = false)
+        - PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE side = true))
+       / ((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE side = false)
+         + PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE side = true))/2.0) * 1e4
+    ELSE 0
+  END AS spread_bps
+FROM orderbook_levels
+GROUP BY bucket, exchange, base, quote;
+
+SELECT add_continuous_aggregate_policy(
+  'ob_depth_1m_k20',
+  start_offset => INTERVAL '3 days',
+  end_offset   => INTERVAL '5 minutes',
+  schedule_interval => INTERVAL '5 minutes',
+  if_not_exists => TRUE
+);

@@ -8,7 +8,6 @@ The best production stack for crypto trading:
 3. Low-Vol Regressor - Specialized for calm markets
 4. Optional Direction Classifier - Final up/down decision
 
-This outperforms complex LSTM stacks while being faster and more maintainable.
 """
 
 import os
@@ -34,7 +33,6 @@ from src.data.data_processor import DataProcessor
 from src.config.config import config
 
 class RegimeAwareLGBTrainer:
-    """Train regime-aware LightGBM models for crypto trading"""
     
     def __init__(self, symbol: str, token_address: str):
         self.symbol = symbol
@@ -104,7 +102,6 @@ class RegimeAwareLGBTrainer:
         """Load data and prepare features"""
         print(f"\n📊 Loading {days} days of data...")
         
-        # Load data using existing pipeline
         df = self.data_processor.process_pipeline(
             self.token_address,
             self.symbol,

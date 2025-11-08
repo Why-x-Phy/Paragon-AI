@@ -121,6 +121,14 @@ setup_dev() {
     
     log_success "Development environment started successfully"
     
+    # Initialize database schema (tables, indexes, aggregates)
+    log_info "Initializing database schema..."
+    db_init_all || {
+        log_error "Database schema initialization failed"
+        exit 1
+    }
+    log_success "Database schema initialized"
+    
     # Initialize tokens
     log_info "Initializing tokens..."
     initialize_tokens
@@ -260,6 +268,36 @@ redis_status() {
     docker exec calvin-redis-dev redis-cli dbsize
 }
 
+# Initialize database schema: core + orderbook levels
+db_init_all() {
+    log_info "Initializing database schema (core + orderbook levels)"
+    load_environment
+
+    local container="calvin-timescaledb-dev"
+    local db_user="${DB_USER:-calvin_dev}"
+    local db_name="${DB_NAME:-calvin_trading_dev}"
+
+    local core_sql="$PROJECT_ROOT/docker/db/init/01-init-timescaledb.sql"
+    local ob_sql="$PROJECT_ROOT/docker/scripts/02-limitbook-schema.sql"
+
+    if [[ ! -f "$core_sql" ]]; then
+        log_error "Core schema file not found: $core_sql"
+        return 1
+    fi
+    if [[ ! -f "$ob_sql" ]]; then
+        log_error "Orderbook schema file not found: $ob_sql"
+        return 1
+    fi
+
+    log_info "Applying core schema..."
+    docker exec -i "$container" psql -U "$db_user" -d "$db_name" -v ON_ERROR_STOP=1 < "$core_sql" || return 1
+    log_success "Core schema applied"
+
+    log_info "Applying orderbook schema..."
+    docker exec -i "$container" psql -U "$db_user" -d "$db_name" -v ON_ERROR_STOP=1 < "$ob_sql" || return 1
+    log_success "Orderbook schema applied"
+}
+
 # Show usage information
 usage() {
     echo "Calvin AI Development Setup Script"
@@ -277,6 +315,7 @@ usage() {
     echo "  db-status    - Show database status"
     echo "  redis-shell  - Open Redis shell"
     echo "  redis-status - Show Redis status"
+    echo "  db-init      - Initialize database schema (tables, indexes, aggregates)"
     echo ""
     echo "Examples:"
     echo "  $0 setup                 # Full environment setup"
@@ -320,6 +359,9 @@ main() {
             ;;
         "redis-status")
             redis_status
+            ;;
+        "db-init")
+            db_init_all
             ;;
         *)
             usage

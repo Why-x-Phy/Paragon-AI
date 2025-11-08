@@ -1531,6 +1531,62 @@ class ProductionDBManager:
         except Exception as e:
             self.logger.error(f"Failed to insert market events: {e}")
             raise DatabaseOperationError(f"Failed to insert market events: {e}")
+
+    # =========================================================================
+    # DEX SWAP OPERATIONS
+    # =========================================================================
+
+    async def insert_dex_swaps(self, rows: List[Dict[str, Any]]) -> int:
+        """Insert rows into dex_swaps hypertable in batches."""
+        if not rows:
+            return 0
+        try:
+            async with self.pg_pool.acquire() as conn:
+                query = """
+                    INSERT INTO dex_swaps (
+                        event_time,
+                        from_token_id, to_token_id,
+                        tx_hash, ins_index, inner_ins_index, block_unix_time, block_number,
+                        volume_usd, price_pair,
+                        from_amount, from_ui_amount, from_price_usd, from_decimals,
+                        to_amount, to_ui_amount, to_price_usd, to_decimals,
+                        owner, signers, source, side, tx_type, pool_id
+                    ) VALUES (
+                        $1,$2,$3,
+                        $4,$5,$6,$7,$8,
+                        $9,$10,
+                        $11,$12,$13,$14,
+                        $15,$16,$17,$18,
+                        $19,$20,$21,$22,$23,$24
+                    )
+                    ON CONFLICT (event_time, tx_hash, ins_index, inner_ins_index) DO NOTHING
+                """
+
+                total_inserted = 0
+                chunk_size = 100
+                for i in range(0, len(rows), chunk_size):
+                    chunk = rows[i:i+chunk_size]
+                    batch = []
+                    for r in chunk:
+                        batch.append((
+                            r.get('event_time'),
+                            r.get('from_token_id'), r.get('to_token_id'),
+                            r.get('tx_hash'), r.get('ins_index'), r.get('inner_ins_index'), r.get('block_unix_time'), r.get('block_number'),
+                            r.get('volume_usd'), r.get('price_pair'),
+                            r.get('from_amount'), r.get('from_ui_amount'), r.get('from_price_usd'), r.get('from_decimals'),
+                            r.get('to_amount'), r.get('to_ui_amount'), r.get('to_price_usd'), r.get('to_decimals'),
+                            r.get('owner'), r.get('signers'), r.get('source'), r.get('side'), r.get('tx_type'), r.get('pool_id')
+                        ))
+                    try:
+                        await conn.executemany(query, batch)
+                        total_inserted += len(batch)
+                    except Exception as e:
+                        self.logger.error(f"Failed inserting dex_swaps chunk: {e}")
+                        continue
+                return total_inserted
+        except Exception as e:
+            self.logger.error(f"Failed to insert dex_swaps: {e}")
+            raise DatabaseOperationError(f"Failed to insert dex_swaps: {e}")
     
     async def save_market_event(self, event: MarketEventData) -> bool:
         """Save market event to database"""

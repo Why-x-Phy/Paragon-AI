@@ -174,6 +174,28 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Validate from_token_id reference (for dual-token tables)
+CREATE OR REPLACE FUNCTION validate_from_token_reference()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM tokens WHERE token_id = NEW.from_token_id AND is_active = true) THEN
+        RAISE EXCEPTION 'From token ID % does not exist or is inactive', NEW.from_token_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Validate to_token_id reference (for dual-token tables)
+CREATE OR REPLACE FUNCTION validate_to_token_reference()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM tokens WHERE token_id = NEW.to_token_id AND is_active = true) THEN
+        RAISE EXCEPTION 'To token ID % does not exist or is inactive', NEW.to_token_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 -- ===========================================================================
 -- OHLCV TIME-SERIES TABLE (Hypertable)
 -- ===========================================================================
@@ -492,6 +514,112 @@ ALTER TABLE market_events SET (
 SELECT add_compression_policy('market_events', INTERVAL '1 day', if_not_exists => TRUE);
 
 -- ===========================================================================
+-- DEX SWAPS TABLE (External DEX swap feed)
+-- ==========================================================================='
+
+CREATE TABLE IF NOT EXISTS dex_swaps (
+    event_time TIMESTAMPTZ NOT NULL,               -- Block time (partitioning column)
+    
+    -- Token legs
+    from_token_id INTEGER NOT NULL,                -- Foreign key to tokens (sold token)
+    to_token_id INTEGER NOT NULL,                  -- Foreign key to tokens (bought token)
+    
+    -- Chain identifiers
+    tx_hash VARCHAR(88) NOT NULL,                  -- Transaction signature
+    ins_index INTEGER,                             -- Instruction index
+    inner_ins_index INTEGER,                       -- Inner instruction index
+    block_unix_time BIGINT,                        -- Raw block unix time
+    block_number BIGINT,                           -- Block number
+    
+    -- Amounts & pricing
+    volume_usd DECIMAL(20,8),                      -- Total USD volume of the swap
+    price_pair DECIMAL(30,8),                      -- Price ratio between pair (as provided)
+    
+    -- From leg details
+    from_amount BIGINT,                            -- Raw amount (base units)
+    from_ui_amount DECIMAL(24,12),                 -- UI amount
+    from_price_usd DECIMAL(20,8),                  -- USD price for from token
+    from_decimals SMALLINT,                        -- Decimals
+    
+    -- To leg details
+    to_amount BIGINT,                              -- Raw amount (base units)
+    to_ui_amount DECIMAL(24,12),                   -- UI amount
+    to_price_usd DECIMAL(20,8),                    -- USD price for to token
+    to_decimals SMALLINT,                          -- Decimals
+    
+    -- Participants & routing
+    owner VARCHAR(44),                             -- Initiator/owner address
+    signers TEXT[],                                -- Signers list
+    source VARCHAR(30),                            -- DEX/aggregator source (e.g., raydium)
+    side VARCHAR(10),                              -- 'buy' or 'sell' (as provided)
+    tx_type VARCHAR(20),                           -- Transaction type (e.g., buy/sell)
+    pool_id VARCHAR(64),                           -- Liquidity pool identifier
+    
+    -- Metadata
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    -- Constraints
+    CONSTRAINT fk_dex_swaps_from_token FOREIGN KEY (from_token_id) REFERENCES tokens(token_id),
+    CONSTRAINT fk_dex_swaps_to_token FOREIGN KEY (to_token_id) REFERENCES tokens(token_id),
+    CONSTRAINT check_side_valid CHECK (side IS NULL OR side IN ('buy','sell')),
+    CONSTRAINT check_tx_type_valid CHECK (tx_type IS NULL OR tx_type IN ('buy','sell')),
+    -- TimescaleDB requires unique indexes/constraints to include the partition key
+    CONSTRAINT unique_tx_component UNIQUE (event_time, tx_hash, ins_index, inner_ins_index)
+);
+
+-- If an older unique constraint exists without the partition key, drop it
+DO $$
+DECLARE
+    conname text;
+BEGIN
+    SELECT c.conname INTO conname
+    FROM pg_constraint c
+    JOIN pg_class t ON t.oid = c.conrelid
+    WHERE t.relname = 'dex_swaps'
+      AND c.contype = 'u'
+      AND NOT EXISTS (
+          SELECT 1
+          FROM unnest(c.conkey) ck
+          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ck
+          WHERE a.attname = 'event_time'
+      );
+    IF conname IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE dex_swaps DROP CONSTRAINT %I', conname);
+    END IF;
+END $$;
+
+-- Ensure correct uniqueness (includes partition key)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint 
+        WHERE conname = 'dex_swaps_unique_tx_component'
+    ) THEN
+        ALTER TABLE dex_swaps 
+        ADD CONSTRAINT dex_swaps_unique_tx_component 
+        UNIQUE (event_time, tx_hash, ins_index, inner_ins_index);
+    END IF;
+END $$;
+
+-- Convert to hypertable for scalability
+SELECT create_hypertable('dex_swaps', 'event_time', chunk_time_interval => INTERVAL '1 hour', if_not_exists => TRUE);
+
+-- Indexes for common query patterns
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_from_token_time ON dex_swaps(from_token_id, event_time DESC);
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_to_token_time ON dex_swaps(to_token_id, event_time DESC);
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_tx_hash ON dex_swaps(tx_hash);
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_source_time ON dex_swaps(source, event_time DESC);
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_pool_time ON dex_swaps(pool_id, event_time DESC);
+
+-- Enable compression for older swap data
+ALTER TABLE dex_swaps SET (
+    timescaledb.compress = true,
+    timescaledb.compress_segmentby = 'from_token_id,to_token_id,source',
+    timescaledb.compress_orderby = 'event_time DESC'
+);
+SELECT add_compression_policy('dex_swaps', INTERVAL '1 day', if_not_exists => TRUE);
+
+-- ===========================================================================
 -- SYSTEM HEALTH TABLE
 -- ===========================================================================
 
@@ -755,6 +883,15 @@ CREATE TRIGGER validate_social_data_token
 CREATE TRIGGER validate_emergency_events_token 
     BEFORE INSERT OR UPDATE ON emergency_events
     FOR EACH ROW EXECUTE FUNCTION validate_token_reference();
+
+-- Validation triggers for dex_swaps dual-token references
+CREATE TRIGGER validate_dex_swaps_from_token
+    BEFORE INSERT OR UPDATE ON dex_swaps
+    FOR EACH ROW EXECUTE FUNCTION validate_from_token_reference();
+
+CREATE TRIGGER validate_dex_swaps_to_token
+    BEFORE INSERT OR UPDATE ON dex_swaps
+    FOR EACH ROW EXECUTE FUNCTION validate_to_token_reference();
 
 -- ===========================================================================
 -- CONTINUOUS AGGREGATES (Materialized Views)
@@ -1240,11 +1377,11 @@ INSERT INTO system_health (check_time, component, status, details) VALUES (
     'healthy', 
     jsonb_build_object(
         'message', 'Calvin AI database initialized successfully with vault trading enhancements (Phase 3.2)',
-        'tables_created', 12,
+        'tables_created', 13,
         'views_created', 9,
-        'functions_created', 9,
-        'triggers_created', 7,
-        'hypertables', ARRAY['ohlcv', 'social_data', 'market_events', 'system_health', 'portfolio_cycles', 'jupiter_operations', 'emergency_events'],
+        'functions_created', 11,
+        'triggers_created', 9,
+        'hypertables', ARRAY['ohlcv', 'social_data', 'market_events', 'dex_swaps', 'system_health', 'portfolio_cycles', 'jupiter_operations', 'emergency_events'],
         'vault_enhancements', jsonb_build_object(
             'trades_table_enhanced', 'Added 6 vault-specific columns for signal tracking',
             'portfolio_cycles', 'Complete hourly trading cycle tracking with performance metrics',

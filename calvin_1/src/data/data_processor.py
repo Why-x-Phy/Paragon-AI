@@ -36,8 +36,6 @@ class DataProcessor:
         os.makedirs(self.data_dir, exist_ok=True)
         
         # Scalers for normalization
-        # Use RobustScaler for percentage changes - handles outliers better across different tokens
-        # RobustScaler uses median/IQR instead of mean/std, making it more stable for crypto volatility
         self.price_scaler = RobustScaler()
         self.feature_scaler = StandardScaler()
         
@@ -389,9 +387,6 @@ class DataProcessor:
     
     async def _store_social_data_to_db(self, social_df: pd.DataFrame, token_id: int):
         """Helper to store social data to database"""
-        # Implementation would convert DataFrame to MarketEventData objects
-        # and store via db_manager.insert_market_events() 
-        # For now, we'll skip this to avoid complexity
         pass
     
     def _create_empty_social_dataframe(self) -> pd.DataFrame:
@@ -553,7 +548,6 @@ class DataProcessor:
                     
                     # Volume
                     {"kind": "obv"},             # On Balance Volume
-                    # VWAP needs DatetimeIndex - apply separately with explicit check
                     
                     # Volatility
                     {"kind": "atr"},             # Average True Range
@@ -683,8 +677,6 @@ class DataProcessor:
             
             # Find significant swing highs and lows
             try:
-                # FIXED: Only look at past data to avoid look-ahead bias
-                # Check if current point is a local extreme compared to PAST values only
                 df['swing_high'] = df['high'].rolling(window=window, center=False).apply(
                     lambda x: x.iloc[-1] == x.max() if len(x) == window else False, raw=False
                 ).astype(bool)
@@ -1069,7 +1061,7 @@ class DataProcessor:
         df['log_return'] = np.log(df['close'] / df['close'].shift(1))
         
         # Step 2: Compute realized volatility using standard deviation of log returns
-        df['realized_vol'] = df['log_return'].rolling(window=window).std() * np.sqrt(252)  # Annualized
+        df['realized_vol'] = df['log_return'].rolling(window=window).std() * np.sqrt(365)  # Annualized
         
         # Step 3: Calculate volatility of volatility as the standard deviation of the realized volatility
         df['vov'] = df['realized_vol'].rolling(window=vov_window).std()
@@ -1289,14 +1281,14 @@ class DataProcessor:
             return df
         
         # Constants for annualization and scaling
-        sqrt_252 = np.sqrt(252)  # Annualization factor (trading days in a year)
+        sqrt_365 = np.sqrt(365)  # Annualization factor (trading days in a year)
         
         # 1. Calculate Parkinson volatility estimator
         # Parkinson volatility uses high-low range and is more efficient than close-to-close
         # Formula: σ² = 1/(4*ln(2)) * Σ(ln(high/low))²
         hlr = np.log(df['high'] / df['low'])
         df['parkinson_vol'] = hlr.rolling(window=window).apply(
-            lambda x: np.sqrt(np.sum(x**2) / (4 * np.log(2) * window)) * sqrt_252, 
+            lambda x: np.sqrt(np.sum(x**2) / (4 * np.log(2) * window)) * sqrt_365, 
             raw=True
         )
         
@@ -1315,7 +1307,7 @@ class DataProcessor:
         
         # Calculate rolling volatility
         df['garman_klass_vol'] = df['gk_term'].rolling(window=window).apply(
-            lambda x: np.sqrt(np.sum(x) / window) * sqrt_252,
+            lambda x: np.sqrt(np.sum(x) / window) * sqrt_365,
             raw=True
         )
         
@@ -1331,7 +1323,7 @@ class DataProcessor:
         df['rs_term'] = hc*ho + lc*lo
         
         df['rogers_satchell_vol'] = df['rs_term'].rolling(window=window).apply(
-            lambda x: np.sqrt(np.sum(x) / window) * sqrt_252,
+            lambda x: np.sqrt(np.sum(x) / window) * sqrt_365,
             raw=True
         )
         
@@ -1366,13 +1358,13 @@ class DataProcessor:
         # Calculate Yang-Zhang volatility
         df['yang_zhang_vol'] = np.sqrt(
             df['overnight_var'] + k * df['open_close_var'] + (1 - k) * df['rs_var']
-        ) * sqrt_252
+        ) * sqrt_365
         
         # 5. Calculate volatility ratios (useful for regime detection)
         
         # 5.1 Ratio of range-based vol to standard vol (efficiency measure)
         # First calculate close-to-close volatility
-        df['close_to_close_vol'] = np.log(df['close'] / df['close'].shift(1)).rolling(window=window).std() * sqrt_252
+        df['close_to_close_vol'] = np.log(df['close'] / df['close'].shift(1)).rolling(window=window).std() * sqrt_365
         
         # Calculate ratio
         df['vol_efficiency'] = df['yang_zhang_vol'] / df['close_to_close_vol']
@@ -4026,9 +4018,6 @@ class DataProcessor:
         
         scalers_dir = os.path.join(self.data_dir, "scalers")
         
-        # Try different file naming patterns to handle the double symbol issue
-        # Pattern 1: {symbol}_{symbol}_lstm_improved_{version}_{timestamp}_*_scaler.pkl (most common)
-        # Pattern 2: {symbol}_{model_version}_*_scaler.pkl (original pattern)
         
         price_scaler_loaded = False
         feature_scaler_loaded = False

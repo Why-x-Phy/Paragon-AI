@@ -154,6 +154,7 @@ test_*.json
 scratch_*.py
 temp_*.py
 experimental_*.py
+old/
 
 # Test output files
 test_output/
@@ -162,7 +163,6 @@ test_results/
 debug_results/
 *_test_output.*
 *_debug_output.*
-**/z_experimental/*
 
 # Jupyter notebook test files
 *_test.ipynb

@@ -1,0 +1,26 @@
+# Remaining Work Tracker
+
+This file tracks major gaps to reach the full institutional target.
+
+## Data & Engines
+- [x] Real Coinglass integration baseline shipped: funding + OI + liquidation endpoints with retry/ratelimit degradation.
+- [x] Real economic calendar hardening shipped: multi-source coverage scoring, relevance filtering, and low-coverage degradation notes.
+- [x] Replaced event policy stub with real calendar provider connector and degraded fallback signals.
+- [x] Multi-timeframe candle feature builder extended with alignment ratio and trend-bias context (1m/5m/15m/1h/4h/1d).
+- [x] Pattern validation depth upgraded with MTF alignment and VWAP-slope confirmation signals.
+- [x] Volume profile / anchored VWAP depth expanded (value acceptance + VWAP slope context).
+- [x] Orderflow/depth analytics upgraded with orderbook imbalance and depth-thinness signals.
+
+## Paper & Execution
+- [x] Realistic paper fill model (spread, slippage, fees, partial fills) baseline implemented.
+- [x] Signed Pionex client baseline now includes verification endpoint for connectivity + reconciliation diagnostics.
+- [x] Risk kill-switch policy checks with persisted breach events implemented.
+
+## Security & Ops
+- [x] TLS hardening complemented with backend write-token identity gate for mutating API routes.
+- [x] Secret management + key rotation playbook documented; runtime `*_FILE` secret loading baseline shipped.
+- [x] Structured request logs + metrics + deep health probes baseline implemented (external dashboards pending).
+
+## Frontend
+- [x] Frontend advanced chart depth shipped with additional market-structure overlays and replay continuity controls.
+- [x] Dedicated panels for derivatives, macro, event risk timeline (baseline static dashboard).

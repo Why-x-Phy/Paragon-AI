@@ -1,0 +1,85 @@
+CREATE TABLE IF NOT EXISTS cases (
+  id BIGSERIAL PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  symbol TEXT NOT NULL,
+  timeframe_set TEXT NOT NULL,
+  regime TEXT NOT NULL,
+  regime_confidence NUMERIC(5,4) NOT NULL,
+  data_degraded BOOLEAN NOT NULL DEFAULT FALSE,
+  feature_version TEXT NOT NULL,
+  model_version TEXT NOT NULL
+);
+
+
+CREATE TABLE IF NOT EXISTS raw_snapshots (
+  id BIGSERIAL PRIMARY KEY,
+  source TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  data_degraded BOOLEAN NOT NULL DEFAULT FALSE,
+  notes JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS features (
+  id BIGSERIAL PRIMARY KEY,
+  case_id BIGINT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+  feature_key TEXT NOT NULL,
+  feature_value JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS scenarios (
+  id BIGSERIAL PRIMARY KEY,
+  case_id BIGINT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+  scenario_name TEXT NOT NULL,
+  bias TEXT NOT NULL,
+  probability NUMERIC(6,5) NOT NULL,
+  trigger_text TEXT NOT NULL,
+  invalidation_text TEXT NOT NULL,
+  targets JSONB NOT NULL,
+  risk_notes JSONB NOT NULL,
+  reason_codes JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS scores (
+  id BIGSERIAL PRIMARY KEY,
+  case_id BIGINT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+  total_score INTEGER NOT NULL,
+  bull_prob NUMERIC(6,5) NOT NULL,
+  bear_prob NUMERIC(6,5) NOT NULL,
+  subscores JSONB NOT NULL,
+  penalties JSONB NOT NULL,
+  reason_codes JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alerts (
+  id BIGSERIAL PRIMARY KEY,
+  case_id BIGINT REFERENCES cases(id) ON DELETE SET NULL,
+  alert_type TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  acknowledged BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE TABLE IF NOT EXISTS outcomes (
+  id BIGSERIAL PRIMARY KEY,
+  case_id BIGINT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+  chosen_scenario TEXT NOT NULL,
+  horizon TEXT NOT NULL,
+  pnl_pct NUMERIC(8,4) NOT NULL,
+  mfe_pct NUMERIC(8,4) NOT NULL,
+  mae_pct NUMERIC(8,4) NOT NULL,
+  outcome_label TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+CREATE TABLE IF NOT EXISTS risk_events (
+  id BIGSERIAL PRIMARY KEY,
+  event_type TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

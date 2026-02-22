@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BTC Institutional Dashboard</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin:0; font-family: Inter, Arial, sans-serif; background:#0b1220; color:#e5ecff; }
+    .wrap { max-width:1200px; margin:0 auto; padding:20px; }
+    h1 { font-size:22px; margin:0 0 12px; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(260px,1fr)); gap:12px; }
+    .card { background:#111a2d; border:1px solid #243250; border-radius:10px; padding:12px; }
+    .label { color:#9fb2d9; font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
+    .value { font-size:20px; margin-top:6px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; }
+    button { background:#2d4df7; color:white; border:none; border-radius:8px; padding:8px 12px; cursor:pointer; }
+    button:hover { opacity:.9; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { border-bottom:1px solid #243250; padding:8px 6px; text-align:left; }
+    .pill { padding:3px 8px; border-radius:999px; font-size:11px; }
+    .ok { background:#1b5e3f; }
+    .warn { background:#664200; }
+    .bad { background:#6d1a1a; }
+    pre { background:#0d1527; border:1px solid #243250; border-radius:8px; padding:8px; overflow:auto; }
+    input[type="range"] { width:100%; }
+    canvas { width:100%; border:1px solid #243250; border-radius:8px; background:#0d1527; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>BTC Institutional Dashboard (Phase 1)</h1>
+  <div class="row">
+    <button id="btnRefresh">Refresh</button>
+    <button id="btnIngest">Ingest Snapshot</button>
+    <button id="btnReplayLatest">Replay Latest</button>
+    <button id="btnSetToken">Set Write Token</button>
+  </div>
+
+  <div class="grid" style="margin-top:12px">
+    <div class="card"><div class="label">Regime</div><div id="regime" class="value">-</div></div>
+    <div class="card"><div class="label">Total Score</div><div id="score" class="value">-</div></div>
+    <div class="card"><div class="label">Bull / Bear Prob</div><div id="probs" class="value">-</div></div>
+    <div class="card"><div class="label">Execution Gate</div><div id="gate" class="value">-</div></div>
+    <div class="card"><div class="label">API Health</div><div id="health" class="value">-</div></div>
+    <div class="card"><div class="label">Macro Context</div><div id="macro" class="value">-</div></div>
+    <div class="card"><div class="label">Event Risk</div><div id="event" class="value">-</div></div>
+    <div class="card"><div class="label">Execution Reconcile</div><div id="reconcile" class="value">-</div></div>
+    <div class="card"><div class="label">Execution Verify</div><div id="verify" class="value">-</div></div>
+    <div class="card"><div class="label">Derivatives Context</div><div id="derivatives" class="value">-</div></div>
+  </div>
+
+  <div class="grid" style="margin-top:12px">
+    <div class="card">
+      <div class="label">Replay Mode</div>
+      <div class="row"><span id="replayInfo">No case selected</span></div>
+      <input id="replaySlider" type="range" min="0" max="0" value="0" />
+      <div class="row"><small>Slide through recent cases to replay prior states.</small></div>
+    </div>
+    <div class="card">
+      <div class="label">Chart Overlay (Score/Bull/Bear + Replay Depth)</div>
+      <canvas id="overlayChart" width="560" height="180"></canvas>
+    </div>
+  </div>
+
+  <div class="grid" style="margin-top:12px">
+    <div class="card">
+      <div class="label">Scenarios</div>
+      <div id="scenarios"></div>
+    </div>
+    <div class="card">
+      <div class="label">Reason Codes</div>
+      <pre id="reasons">[]</pre>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <div class="label">Recent Alerts</div>
+    <table><thead><tr><th>ID</th><th>Type</th><th>Severity</th><th>Ack</th></tr></thead><tbody id="alerts"></tbody></table>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <div class="label">Recent Raw Snapshots</div>
+    <table><thead><tr><th>ID</th><th>Source</th><th>Symbol</th><th>Degraded</th><th>Notes</th></tr></thead><tbody id="snapshots"></tbody></table>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <div class="label">Event Timeline</div>
+    <table><thead><tr><th>Snapshot</th><th>Severity</th><th>Time</th></tr></thead><tbody id="timeline"></tbody></table>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <div class="label">Recent Cases</div>
+    <table><thead><tr><th>ID</th><th>Symbol</th><th>Regime</th><th>Score</th><th>Bull</th><th>Bear</th></tr></thead><tbody id="cases"></tbody></table>
+  </div>
+</div>
+<script>
+const api = '/api/v1';
+let stateCases = [];
+
+async function jsonFetch(url, options={}) {
+  const opts = { ...options, headers: { ...(options.headers||{}) } };
+  const token = localStorage.getItem("apiWriteToken") || "";
+  if (token && ["POST","PUT","PATCH","DELETE"].includes((opts.method||"GET").toUpperCase())) {
+    opts.headers["X-Write-Token"] = token;
+  }
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+function sevClass(sev){ return sev==='high'?'bad':sev==='medium'?'warn':'ok'; }
+
+function drawOverlay(cases){
+  const canvas = document.getElementById('overlayChart');
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#0d1527';
+  ctx.fillRect(0, 0, w, h);
+
+  if (!cases.length) return;
+
+  const pad = 24;
+  const xStep = (w - pad * 2) / Math.max(cases.length - 1, 1);
+
+  function line(getY, color){
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    cases.forEach((c, idx) => {
+      const x = pad + idx * xStep;
+      const y = getY(c);
+      if (idx === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+
+  line(c => h - pad - (c.total_score/100) * (h - pad*2), '#56c2ff');
+  line(c => h - pad - (c.bull_prob) * (h - pad*2), '#42d392');
+  line(c => h - pad - (c.bear_prob) * (h - pad*2), '#ff7d7d');
+
+  ctx.fillStyle = '#9fb2d9';
+  ctx.font = '11px Arial';
+  ctx.fillText('Score', 8, 14);
+  ctx.fillText('Bull', 56, 14);
+  ctx.fillText('Bear', 92, 14);
+}
+
+async function showCase(caseId){
+  const detail = await jsonFetch(`${api}/cases/${caseId}`);
+  const an = detail.analysis;
+  document.getElementById('regime').textContent = `${an.regime} (${an.regime_confidence})`;
+  document.getElementById('score').textContent = an.total_score;
+  document.getElementById('probs').textContent = `${an.bull_prob} / ${an.bear_prob}`;
+  document.getElementById('reasons').textContent = JSON.stringify(an.reason_codes, null, 2);
+  document.getElementById('macro').textContent = an.macro_context;
+  document.getElementById('event').textContent = an.event_risk;
+  const d = (an.derivatives_liquidations || []).join(' | ');
+  document.getElementById('derivatives').textContent = d || '-';
+  document.getElementById('scenarios').innerHTML = an.scenarios.map(s =>
+    `<div style="margin-top:8px"><b>${s.name}</b> (${s.bias}, p=${s.probability})<br/><small>${s.trigger}</small></div>`
+  ).join('');
+}
+
+async function refresh(){
+  const [cases, alerts, gate, health, snapshots, reconcile, verify, timeline] = await Promise.all([
+    jsonFetch(`${api}/cases?limit=16`),
+    jsonFetch(`${api}/alerts?limit=8`),
+    jsonFetch(`${api}/gates/status`),
+    jsonFetch(`${api}/health`),
+    jsonFetch(`${api}/raw_snapshots?limit=8`),
+    jsonFetch(`${api}/execution/reconcile`),
+    jsonFetch(`${api}/execution/verify`),
+    jsonFetch(`${api}/timeline/events?limit=8`)
+  ]);
+
+  stateCases = cases;
+  drawOverlay(stateCases.slice().reverse());
+
+  document.getElementById('gate').textContent = gate.gate_passed ? 'PASS' : 'BLOCKED';
+  document.getElementById('health').textContent = `${health.status} (exec=${health.execution_enabled})`;
+  document.getElementById('reconcile').textContent = `oo=${reconcile.open_orders_count} fills=${reconcile.fills_count} pos=${reconcile.position_count}`;
+  document.getElementById('verify').textContent = `${verify.reachable ? 'reachable' : 'unreachable'} (${(verify.checks||[]).join(',')||'-'})`;
+
+  const slider = document.getElementById('replaySlider');
+  slider.max = Math.max(0, stateCases.length - 1);
+  slider.value = 0;
+  if (stateCases.length){
+    document.getElementById('replayInfo').textContent = `Case #${stateCases[0].id} (${stateCases[0].created_at})`;
+  }
+
+  const tBody = document.getElementById('timeline'); tBody.innerHTML = '';
+  timeline.forEach(t => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${t.snapshot_id}</td><td>${t.event_severity}</td><td>${t.created_at}</td>`;
+    tBody.appendChild(tr);
+  });
+
+  const sBody = document.getElementById('snapshots'); sBody.innerHTML = '';
+  snapshots.forEach(sn => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${sn.id}</td><td>${sn.source}</td><td>${sn.symbol}</td><td>${sn.data_degraded}</td><td>${(sn.notes||[]).join(', ')}</td>`;
+    sBody.appendChild(tr);
+  });
+
+  const cBody = document.getElementById('cases'); cBody.innerHTML = '';
+  cases.forEach(c => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${c.id}</td><td>${c.symbol}</td><td>${c.regime}</td><td>${c.total_score}</td><td>${c.bull_prob}</td><td>${c.bear_prob}</td>`;
+    cBody.appendChild(tr);
+  });
+
+  const aBody = document.getElementById('alerts'); aBody.innerHTML = '';
+  alerts.forEach(a => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${a.id}</td><td>${a.alert_type}</td><td><span class="pill ${sevClass(a.severity)}">${a.severity}</span></td><td>${a.acknowledged ? "yes" : `<button data-ack="${a.id}">Ack</button>`}</td>`;
+    aBody.appendChild(tr);
+  });
+
+  if (cases.length) await showCase(cases[0].id);
+}
+
+document.getElementById('btnRefresh').onclick = refresh;
+document.getElementById('btnIngest').onclick = async () => {
+  await jsonFetch(`${api}/ingestion/snapshot?symbol=BTCUSDT&run_analysis=true`, { method:'POST' });
+  await refresh();
+};
+document.getElementById('btnReplayLatest').onclick = async () => {
+  if (!stateCases.length) return;
+  await showCase(stateCases[0].id);
+};
+document.getElementById('btnSetToken').onclick = () => {
+  const next = prompt('Set API write token for this browser session:', localStorage.getItem('apiWriteToken') || '');
+  if (next === null) return;
+  localStorage.setItem('apiWriteToken', next.trim());
+};
+document.getElementById('replaySlider').oninput = async (e) => {
+  const idx = Number(e.target.value || 0);
+  if (!stateCases.length || !stateCases[idx]) return;
+  const c = stateCases[idx];
+  document.getElementById('replayInfo').textContent = `Case #${c.id} (${c.created_at})`;
+  await showCase(c.id);
+};
+
+document.body.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-ack]');
+  if (!btn) return;
+  await jsonFetch(`${api}/alerts/${btn.getAttribute('data-ack')}/ack`, { method:'POST' });
+  await refresh();
+});
+
+refresh().catch(err => { console.error(err); alert('API unavailable yet'); });
+setInterval(() => refresh().catch(()=>{}), 10000);
+</script>
+</body>
+</html>

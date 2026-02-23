@@ -1,4 +1,4 @@
-# Calvin AI Trading Platform
+# Paragon AI Trading Platform
 
 An autonomous machine learning trading platform for Solana blockchain, featuring a powerful backend ML system and a modern frontend interface.
 

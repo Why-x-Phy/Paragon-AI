@@ -62,6 +62,20 @@ Private VPS-ready architecture for a BTC institutional analysis platform with ex
 - `GET /api/v1/timeline/events`
   - Event severity timeline derived from raw snapshots
 
+
+## Target State (What the app should do when finished)
+
+The end-state is a production-grade institutional BTC decision and execution platform with strong controls:
+
+- **Decision intelligence**: continuously ingest market/derivatives/macro/event data and produce explainable, probabilistic scenarios with reason codes.
+- **Full auditability**: every snapshot, feature set, scenario, simulation, and risk event is persisted and replayable.
+- **Safe execution rollout**: paper-first with hard readiness gates; live execution only enabled after policy/health/reconciliation checks pass.
+- **Risk-first operations**: pre-trade guardrails, kill-switch automation, reconciliation diagnostics, and incident-ready runbooks.
+- **Production operations**: TLS, token-protected mutating APIs, secret rotation via `*_FILE`, deep health probes, metrics, and external alerting.
+- **Operator UX**: dashboard for cases, scenarios, alerts, gate status, and event-risk timeline to support fast but controlled decisions.
+
+In short: a system that is not only accurate, but also explainable, reproducible, and operationally safe for institutional workflows.
+
 ## Provider configuration notes
 
 - `COINGLASS_API_KEY` enables real derivatives fan-in mapping (funding + open-interest change + liquidation totals).

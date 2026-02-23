@@ -2,6 +2,14 @@
 
 This file tracks major gaps to reach the full institutional target.
 
+
+## Definition of Done (institutional target)
+- [ ] End-to-end ingestion + analysis + persistence + replay works without degraded provider paths for normal operations.
+- [ ] Paper-to-live gates show green for a sustained burn-in period and are documented with owner sign-off.
+- [ ] Execution precheck/reconcile/verify and risk kill-switch are tested in staged incidents.
+- [ ] Production observability includes external dashboards and actionable alerts tied to runbooks.
+- [ ] Secret rotation process is exercised in production and evidence is captured in ops records.
+
 ## Data & Engines
 - [x] Real Coinglass integration baseline shipped: funding + OI + liquidation endpoints with retry/ratelimit degradation.
 - [x] Real economic calendar hardening shipped: multi-source coverage scoring, relevance filtering, and low-coverage degradation notes.
@@ -20,6 +28,11 @@ This file tracks major gaps to reach the full institutional target.
 - [x] TLS hardening complemented with backend write-token identity gate for mutating API routes.
 - [x] Secret management + key rotation playbook documented; runtime `*_FILE` secret loading baseline shipped.
 - [x] Structured request logs + metrics + deep health probes baseline implemented (external dashboards pending).
+
+## Open Follow-ups (current)
+- [ ] Provision external dashboards + alerting for the shipped metrics/health probes (Grafana/Datadog/etc.) and link runbooks.
+- [ ] Run the production secret-rotation checklist end-to-end and record the first verified rotation timestamp in operations docs.
+- [ ] Add a smoke check in CI that verifies `*_FILE` secret loading still works for deployment manifests.
 
 ## Frontend
 - [x] Frontend advanced chart depth shipped with additional market-structure overlays and replay continuity controls.
